@@ -1,0 +1,4 @@
+interface:
+  display_name: "Graph Giraffe Plugin System"
+  short_description: "Build stable semantic plugin boundaries"
+  default_prompt: "Use $graph-giraffe-plugin-system to design or implement this semantic plugin capability."

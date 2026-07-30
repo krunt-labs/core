@@ -1,0 +1,4 @@
+interface:
+  display_name: "Graph Giraffe Quality"
+  short_description: "Verify boundaries, determinism, and generated output"
+  default_prompt: "Use $graph-giraffe-quality to test or review this Graph Giraffe change across its architectural boundary."

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Graph Giraffe Editor"
+  short_description: "Build the domain-neutral visual graph editor"
+  default_prompt: "Use $graph-giraffe-editor to implement this editor behavior without duplicating domain semantics."

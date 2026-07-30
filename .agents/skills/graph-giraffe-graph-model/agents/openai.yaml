@@ -1,0 +1,4 @@
+interface:
+  display_name: "Graph Giraffe Graph Model"
+  short_description: "Build the domain-neutral structural graph core"
+  default_prompt: "Use $graph-giraffe-graph-model to implement this structural graph change without leaking domain semantics."

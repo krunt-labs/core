@@ -1,0 +1,4 @@
+interface:
+  display_name: "Graph Giraffe TypeScript Codegen"
+  short_description: "Generate readable deterministic TypeScript backends"
+  default_prompt: "Use $graph-giraffe-typescript-codegen to implement or review this generated TypeScript output."
