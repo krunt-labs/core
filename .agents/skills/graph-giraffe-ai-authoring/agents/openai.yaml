@@ -1,0 +1,4 @@
+interface:
+  display_name: "Graph Giraffe AI Authoring"
+  short_description: "Add safe AI-assisted graph authoring workflows"
+  default_prompt: "Use $graph-giraffe-ai-authoring to implement this AI graph-authoring feature without bypassing validation."

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Graph Giraffe Compiler"
+  short_description: "Build the deterministic Rust compiler pipeline"
+  default_prompt: "Use $graph-giraffe-compiler to implement or review this Rust compiler pipeline change."

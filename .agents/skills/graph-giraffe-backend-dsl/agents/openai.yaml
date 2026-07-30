@@ -1,0 +1,4 @@
+interface:
+  display_name: "Graph Giraffe Backend DSL"
+  short_description: "Build backend nodes, contracts, and lowering"
+  default_prompt: "Use $graph-giraffe-backend-dsl to implement this Backend DSL node or semantic rule."

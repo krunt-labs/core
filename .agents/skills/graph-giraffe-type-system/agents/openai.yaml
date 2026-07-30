@@ -1,0 +1,4 @@
+interface:
+  display_name: "Graph Giraffe Type System"
+  short_description: "Build graph typing, inference, and contracts"
+  default_prompt: "Use $graph-giraffe-type-system to implement this graph type or contract change."

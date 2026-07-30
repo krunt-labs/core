@@ -1,0 +1,4 @@
+interface:
+  display_name: "Graph Giraffe IR and Optimization"
+  short_description: "Build canonical IR and safe compiler passes"
+  default_prompt: "Use $graph-giraffe-ir-optimization to implement this IR or optimization pass safely."

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Graph Giraffe Development"
+  short_description: "Build Graph Giraffe with strict layer boundaries"
+  default_prompt: "Use $graph-giraffe-development to implement this Graph Giraffe change with the project architecture and separation-of-concerns rules."
