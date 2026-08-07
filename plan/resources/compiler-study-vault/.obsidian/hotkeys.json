@@ -1,0 +1,10 @@
+{
+  "obsidian-functionplot:insert-functionplot": [
+    {
+      "modifiers": [
+        "Shift"
+      ],
+      "key": "Enter"
+    }
+  ]
+}

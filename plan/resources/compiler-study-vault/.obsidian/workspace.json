@@ -1,0 +1,479 @@
+{
+  "main": {
+    "id": "adb9b7c0c246d30c",
+    "type": "split",
+    "children": [
+      {
+        "id": "80e7756d1eee6ce3",
+        "type": "tabs",
+        "children": [
+          {
+            "id": "c12d70feb7d46b6b",
+            "type": "leaf",
+            "state": {
+              "type": "markdown",
+              "state": {
+                "file": "Feature scaling.md",
+                "mode": "source",
+                "source": false
+              },
+              "icon": "lucide-file",
+              "title": "Feature scaling"
+            }
+          },
+          {
+            "id": "1b49ef02a507d66f",
+            "type": "leaf",
+            "state": {
+              "type": "markdown",
+              "state": {
+                "file": "Addressing overfitting & underfitting.md",
+                "mode": "source",
+                "source": false
+              },
+              "icon": "lucide-file",
+              "title": "Addressing overfitting & underfitting"
+            }
+          },
+          {
+            "id": "42099df40ff8bc58",
+            "type": "leaf",
+            "state": {
+              "type": "markdown",
+              "state": {
+                "file": "Neural network intuition.md",
+                "mode": "source",
+                "source": false
+              },
+              "icon": "lucide-file",
+              "title": "Neural network intuition"
+            }
+          },
+          {
+            "id": "6b6ad31e1a6a923d",
+            "type": "leaf",
+            "state": {
+              "type": "markdown",
+              "state": {
+                "file": "Forward propagation - Making inferences with neural nets.md",
+                "mode": "source",
+                "source": false
+              },
+              "icon": "lucide-file",
+              "title": "Forward propagation - Making inferences with neural nets"
+            }
+          },
+          {
+            "id": "da4c81e79800cd5d",
+            "type": "leaf",
+            "state": {
+              "type": "markdown",
+              "state": {
+                "file": "Vectorizing a neural network implementation.md",
+                "mode": "source",
+                "source": false
+              },
+              "icon": "lucide-file",
+              "title": "Vectorizing a neural network implementation"
+            }
+          },
+          {
+            "id": "7da6499f7acdd36c",
+            "type": "leaf",
+            "state": {
+              "type": "markdown",
+              "state": {
+                "file": "Neural networks and the brain.md",
+                "mode": "preview",
+                "source": false
+              },
+              "icon": "lucide-file",
+              "title": "Neural networks and the brain"
+            }
+          },
+          {
+            "id": "db62415e1a969d37",
+            "type": "leaf",
+            "state": {
+              "type": "markdown",
+              "state": {
+                "file": "Feature engineering.md",
+                "mode": "source",
+                "source": false
+              },
+              "icon": "lucide-file",
+              "title": "Feature engineering"
+            }
+          },
+          {
+            "id": "ab15ae07ede43cd4",
+            "type": "leaf",
+            "state": {
+              "type": "markdown",
+              "state": {
+                "file": "classification model.md",
+                "mode": "source",
+                "source": false
+              },
+              "icon": "lucide-file",
+              "title": "classification model"
+            }
+          },
+          {
+            "id": "fdf0c6eb005394a8",
+            "type": "leaf",
+            "state": {
+              "type": "markdown",
+              "state": {
+                "file": "logistic regression.md",
+                "mode": "source",
+                "source": false
+              },
+              "icon": "lucide-file",
+              "title": "logistic regression"
+            }
+          },
+          {
+            "id": "68380d59485eba85",
+            "type": "leaf",
+            "state": {
+              "type": "markdown",
+              "state": {
+                "file": "Addressing overfitting & underfitting.md",
+                "mode": "source",
+                "source": false
+              },
+              "icon": "lucide-file",
+              "title": "Addressing overfitting & underfitting"
+            }
+          },
+          {
+            "id": "08963d2a2cdac2ec",
+            "type": "leaf",
+            "state": {
+              "type": "markdown",
+              "state": {
+                "file": "Questions.md",
+                "mode": "source",
+                "source": false
+              },
+              "icon": "lucide-file",
+              "title": "Questions"
+            }
+          },
+          {
+            "id": "b9663273ee8b28f5",
+            "type": "leaf",
+            "state": {
+              "type": "markdown",
+              "state": {
+                "file": "Model Training Steps.md",
+                "mode": "source",
+                "source": false
+              },
+              "icon": "lucide-file",
+              "title": "Model Training Steps"
+            }
+          },
+          {
+            "id": "637b44f86d5a3218",
+            "type": "leaf",
+            "state": {
+              "type": "markdown",
+              "state": {
+                "file": "Alternatives to activation functions and intuition for choosing one.md",
+                "mode": "source",
+                "source": false
+              },
+              "icon": "lucide-file",
+              "title": "Alternatives to activation functions and intuition for choosing one"
+            }
+          },
+          {
+            "id": "cb196f66c6fc0eef",
+            "type": "leaf",
+            "state": {
+              "type": "markdown",
+              "state": {
+                "file": "Softmax Regression.md",
+                "mode": "source",
+                "source": false
+              },
+              "icon": "lucide-file",
+              "title": "Softmax Regression"
+            }
+          },
+          {
+            "id": "2feb3ae96fce6495",
+            "type": "leaf",
+            "state": {
+              "type": "markdown",
+              "state": {
+                "file": "Multi-label Classification.md",
+                "mode": "source",
+                "source": false
+              },
+              "icon": "lucide-file",
+              "title": "Multi-label Classification"
+            }
+          },
+          {
+            "id": "3f4608052b02842e",
+            "type": "leaf",
+            "state": {
+              "type": "markdown",
+              "state": {
+                "file": "images/Advanced Optimization With ADAM.md",
+                "mode": "source",
+                "source": false
+              },
+              "icon": "lucide-file",
+              "title": "Advanced Optimization With ADAM"
+            }
+          },
+          {
+            "id": "a95b55d0658a6ef7",
+            "type": "leaf",
+            "state": {
+              "type": "graph",
+              "state": {},
+              "icon": "lucide-git-fork",
+              "title": "Graph view"
+            }
+          }
+        ],
+        "currentTab": 16
+      }
+    ],
+    "direction": "vertical"
+  },
+  "left": {
+    "id": "14e69a332c841598",
+    "type": "split",
+    "children": [
+      {
+        "id": "289bbd5d37582ec2",
+        "type": "tabs",
+        "children": [
+          {
+            "id": "4b70555dd0890009",
+            "type": "leaf",
+            "state": {
+              "type": "file-explorer",
+              "state": {
+                "sortOrder": "byModifiedTimeReverse",
+                "autoReveal": false,
+                "showSearch": false,
+                "searchQuery": ""
+              },
+              "icon": "lucide-folder-closed",
+              "title": "Files"
+            }
+          },
+          {
+            "id": "960e3e5815e60833",
+            "type": "leaf",
+            "state": {
+              "type": "search",
+              "state": {
+                "query": "",
+                "matchingCase": false,
+                "explainSearch": false,
+                "collapseAll": false,
+                "extraContext": false,
+                "sortOrder": "alphabetical"
+              },
+              "icon": "lucide-search",
+              "title": "Search"
+            }
+          },
+          {
+            "id": "ccc4f223ea6d01df",
+            "type": "leaf",
+            "state": {
+              "type": "bookmarks",
+              "state": {},
+              "icon": "lucide-bookmark",
+              "title": "Bookmarks"
+            }
+          },
+          {
+            "id": "a3fdad4e45958eb4",
+            "type": "leaf",
+            "state": {
+              "type": "tagfolder-view",
+              "state": {},
+              "icon": "lucide-ghost",
+              "title": "tagfolder-view"
+            }
+          },
+          {
+            "id": "780252891b7920e3",
+            "type": "leaf",
+            "state": {
+              "type": "tagfolder-view",
+              "state": {},
+              "icon": "lucide-ghost",
+              "title": "tagfolder-view"
+            }
+          },
+          {
+            "id": "b44dab0863971edf",
+            "type": "leaf",
+            "state": {
+              "type": "tagfolder-view",
+              "state": {},
+              "icon": "stacked-levels",
+              "title": "Tag Folder"
+            }
+          }
+        ]
+      }
+    ],
+    "direction": "horizontal",
+    "width": 244.5110321044922
+  },
+  "right": {
+    "id": "5e66a44871de8fb1",
+    "type": "split",
+    "children": [
+      {
+        "id": "8543b2a970045790",
+        "type": "tabs",
+        "children": [
+          {
+            "id": "e8407752da61d8fd",
+            "type": "leaf",
+            "state": {
+              "type": "backlink",
+              "state": {
+                "file": "Excalidraw/sheet2.md",
+                "collapseAll": false,
+                "extraContext": false,
+                "sortOrder": "alphabetical",
+                "showSearch": false,
+                "searchQuery": "",
+                "backlinkCollapsed": false,
+                "unlinkedCollapsed": true
+              },
+              "icon": "links-coming-in",
+              "title": "Backlinks for sheet2"
+            }
+          },
+          {
+            "id": "5b4e51bf848f1262",
+            "type": "leaf",
+            "state": {
+              "type": "outgoing-link",
+              "state": {
+                "file": "Excalidraw/sheet2.md",
+                "linksCollapsed": false,
+                "unlinkedCollapsed": true
+              },
+              "icon": "links-going-out",
+              "title": "Outgoing links from sheet2"
+            }
+          },
+          {
+            "id": "35d40ec96bb4c3b3",
+            "type": "leaf",
+            "state": {
+              "type": "tag",
+              "state": {
+                "sortOrder": "frequency",
+                "useHierarchy": true
+              },
+              "icon": "lucide-tags",
+              "title": "Tags"
+            }
+          },
+          {
+            "id": "6f45173eb22aa017",
+            "type": "leaf",
+            "state": {
+              "type": "outline",
+              "state": {
+                "file": "Excalidraw/sheet2.md"
+              },
+              "icon": "lucide-list",
+              "title": "Outline of sheet2"
+            }
+          },
+          {
+            "id": "82386ecbbf668767",
+            "type": "leaf",
+            "state": {
+              "type": "all-properties",
+              "state": {
+                "sortOrder": "frequency",
+                "showSearch": false,
+                "searchQuery": ""
+              },
+              "icon": "lucide-archive",
+              "title": "All properties"
+            }
+          }
+        ]
+      }
+    ],
+    "direction": "horizontal",
+    "width": 300,
+    "collapsed": true
+  },
+  "left-ribbon": {
+    "hiddenItems": {
+      "bases:Create new base": false,
+      "switcher:Open quick switcher": false,
+      "graph:Open graph view": false,
+      "canvas:Create new canvas": false,
+      "daily-notes:Open today's daily note": false,
+      "templates:Insert template": false,
+      "command-palette:Open command palette": false,
+      "markdown-importer:Open format converter": false,
+      "obsidian-excalidraw-plugin:Create new drawing": false
+    }
+  },
+  "active": "a95b55d0658a6ef7",
+  "lastOpenFiles": [
+    "Additional Layer Types in an NN.md",
+    "images/convolutional-layer-10.jpg",
+    "images/convolutional-layer-9.jpg",
+    "images/convolutional-layer-8.jpg",
+    "images/convolutional-layer-7.jpg",
+    "images/convolutional-layer-6.jpg",
+    "images/convolutional-layer-5.jpg",
+    "images/convolutional-layer-4.jpg",
+    "images/convolutional-layer-3.jpg",
+    "images/convolutional-layer-2.jpg",
+    "images/convolutional-layer.jpg",
+    "images/Advanced Optimization With ADAM.md",
+    "Multi-label Classification.md",
+    "supervised learning.md",
+    "Softmax Regression.md",
+    "logistic regression.md",
+    "Multi-Class classification.md",
+    "Alternatives to activation functions and intuition for choosing one.md",
+    "Model Training Steps.md",
+    "Questions.md",
+    "Cost function with regularization.md",
+    "Vectorizing a neural network implementation.md",
+    "Forward propagation - Making inferences with neural nets.md",
+    "Neural network intuition.md",
+    "Untitled.base",
+    "Neural network layer.md",
+    "Neural networks and the brain.md",
+    "Addressing overfitting & underfitting.md",
+    "classification model.md",
+    "Feature engineering.md",
+    "Gradient descent.md",
+    "Feature scaling.md",
+    "Polynomial regression.md",
+    "Linear regression model.md",
+    "unsupervised learning.md",
+    "Excalidraw/Drawing 2026-01-22 13.13.45.excalidraw.md",
+    "Excalidraw",
+    "images",
+    "Untitled.canvas",
+    "submission plan.canvas"
+  ]
+}
