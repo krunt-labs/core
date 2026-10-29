@@ -303,8 +303,8 @@
             "state": {
               "type": "tagfolder-view",
               "state": {},
-              "icon": "lucide-ghost",
-              "title": "tagfolder-view"
+              "icon": "stacked-levels",
+              "title": "Tag Folder"
             }
           },
           {

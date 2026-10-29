@@ -63,7 +63,7 @@ Represent Transform through a constrained, typed expression model or supported d
 5. Implement semantic validation.
 6. Lower to validated IR without codegen knowledge.
 7. Add focused contract and lowering tests.
-8. Add a TypeScript generator golden case separately.
+8. Add a TypeScript generator golden case separately. (actually, don't do this. it should be agnostic at the backend as well. typescript is ust a starting point)
 9. Add one graph-level invalid fixture.
 
 ## Preserve backend coherence

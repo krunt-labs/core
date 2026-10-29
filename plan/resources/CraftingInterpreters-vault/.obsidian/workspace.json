@@ -222,9 +222,19 @@
               "icon": "lucide-git-fork",
               "title": "Graph view"
             }
+          },
+          {
+            "id": "f5b68fa50304d3a0",
+            "type": "leaf",
+            "state": {
+              "type": "graph",
+              "state": {},
+              "icon": "lucide-git-fork",
+              "title": "Graph view"
+            }
           }
         ],
-        "currentTab": 15
+        "currentTab": 16
       }
     ],
     "direction": "vertical"
@@ -313,7 +323,8 @@
       }
     ],
     "direction": "horizontal",
-    "width": 244.5110321044922
+    "width": 244.5110321044922,
+    "collapsed": true
   },
   "right": {
     "id": "5e66a44871de8fb1",
@@ -414,7 +425,7 @@
       "markdown-importer:Open format converter": false
     }
   },
-  "active": "36e6b0906cb2881c",
+  "active": "f5b68fa50304d3a0",
   "lastOpenFiles": [
     "00 MOC - Crafting Interpreters.md",
     "Untitled.md",

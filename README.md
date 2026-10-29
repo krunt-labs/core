@@ -163,6 +163,8 @@ These should be resolved deliberately through RFC or architecture-decision updat
 
 - [Platform architecture RFC](plan/architecture/RFC-001.md)
 - [Backend product requirements](plan/architecture/graph-giraffe-backend-tool-prd.pdf)
+- [Krunt feature plan](plan/krunt-feature-plan.md)
+- [Krunt reading list](plan/krunt-reading-list.md)
 - [AI agent instructions](AGENTS.md)
 - [Cross-layer development skill](.agents/skills/graph-giraffe-development/SKILL.md)
 
