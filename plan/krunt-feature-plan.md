@@ -100,7 +100,7 @@ Task 2 is implemented in `crates/plugin-api`:
 - [x] Define target-neutral semantic lowering results.
 - [x] Register and resolve plugins through an explicit deterministic registry.
 - [x] Reject duplicate plugin IDs and node-type ownership conflicts.
-- [ ] Connect the registry to compiler orchestration and backend diagnostics.
+- [x] Connect the registry to compiler orchestration and backend diagnostics.
 
 ## Phase 4 — Compiler and universal IR
 
@@ -135,8 +135,20 @@ Task 1 is implemented in `crates/diagnostics`:
 - [x] Link diagnostics to primary and related graph element IDs.
 - [x] Support renderer-neutral structured help and fix proposals.
 - [x] Canonically sort diagnostics and detect error-severity findings.
-- [ ] Aggregate diagnostics in compiler orchestration and block lowering on
+- [x] Aggregate diagnostics in compiler orchestration and block lowering on
       errors.
+
+### Compiler orchestration checkpoint
+
+Task 3 is implemented in `crates/compiler`:
+
+- [x] Resolve node types through an explicit plugin registry.
+- [x] Lower plugin operations into validated IR nodes with source mappings.
+- [x] Wire execution and data edges independently.
+- [x] Aggregate and canonically sort diagnostics.
+- [x] Block IR output when compilation has error-severity diagnostics.
+- [ ] Add the remaining semantic-analysis, type-analysis, and whole-graph
+      validation stages.
 
 **Exit criteria:** repeated compilation produces identical diagnostics and IR;
 invalid graphs never reach a generator.

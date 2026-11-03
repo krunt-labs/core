@@ -1,0 +1,12 @@
+[package]
+name = "krunt-compiler"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Deterministic graph-to-IR compiler orchestration for Krunt"
+
+[dependencies]
+krunt-diagnostics = { path = "../diagnostics" }
+krunt-graph-model = { path = "../graph-model" }
+krunt-ir = { path = "../ir" }
+krunt-plugin-api = { path = "../plugin-api" }
