@@ -31,7 +31,7 @@ Study stable identifiers, adjacency indexes, parent/child scene graphs, command
 history, event sourcing, controlled React state, projection versus source of
 truth, undo/redo, accessibility, and keyboard interaction.
 
-Review the existing Graph Giraffe material:
+Review the existing Graph Giraffe node-editor material:
 
 - `../graph-giraffe/architecture/architecture.txt`
 - `../graph-giraffe/.agents/rfc-replace-reactflow-with-graphgiraffe-0773830.md`

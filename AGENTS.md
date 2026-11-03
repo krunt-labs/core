@@ -23,3 +23,9 @@ For architectural or cross-layer work, also read both source documents completel
 - `plan/architecture/graph-giraffe-backend-tool-prd.pdf`
 
 Follow the user's explicit request when it overrides a draft document. Surface unresolved conflicts rather than silently establishing a new platform contract.
+
+## Rust coding convention
+
+- Enum variants use uppercase names such as `SYNC`, `ASYNC`, and `ENTRY`.
+- Struct fields use hard-tab indentation and tab-aligned field layout. The
+  repository's `rustfmt.toml` is the formatting authority for this convention.

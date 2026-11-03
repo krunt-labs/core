@@ -1,14 +1,14 @@
-# Graph Giraffe
+# Krunt
 
-Graph Giraffe is a graph compiler platform for visually authoring deterministic software systems.
+Krunt is a backend builder for visually authoring deterministic software systems. It is built on Graph Giraffe, the underlying domain-agnostic node editor library.
 
-The visual graph is source code—not a diagram layered over handwritten code. A Rust compiler validates and lowers that graph into production-grade artifacts. The first product target is a visual backend designer that generates a readable, deployable TypeScript/Node project.
+The visual graph is source code—not a diagram layered over handwritten code. A Rust compiler validates and lowers that graph into production-grade artifacts. Krunt's first target is a visual backend designer that generates a readable, deployable TypeScript/Node project.
 
-> **Project status:** Architecture and product definition. The compiler, editor, and Backend DSL implementation have not been scaffolded yet.
+> **Project status:** Architecture and product definition; implementation is beginning with the Rust IR crate.
 
 ## What we are building
 
-Graph Giraffe lets a user design a backend by connecting typed nodes for routes, data, control flow, persistence, effects, responses, and error handling.
+Krunt lets a user design a backend by connecting typed nodes for routes, data, control flow, persistence, effects, responses, and error handling in the Graph Giraffe editor.
 
 Users can:
 
@@ -18,13 +18,13 @@ Users can:
 - compile the graph deterministically;
 - export a human-readable backend codebase they own.
 
-Graph Giraffe is not a proprietary low-code runtime or a general-purpose visual scripting language. Generated code must remain useful outside the tool.
+Krunt is not a proprietary low-code runtime or a general-purpose visual scripting language. Generated code must remain useful outside the tool.
 
 ## Architecture
 
 ```mermaid
 flowchart TB
-    AI[AI-assisted authoring] <--> Editor[Domain-agnostic graph editor]
+    AI[AI-assisted authoring] <--> Editor[Graph Giraffe node editor]
     Editor <--> Graph[Versioned structural graph]
     Graph --> Semantics[Backend DSL semantic plugin]
     Semantics --> Compiler[Rust compiler analysis and validation]
@@ -109,7 +109,7 @@ crates/
   diagnostics/          Stable source-linked diagnostics
   semantic-api/         Contracts, capabilities, and plugin interfaces
   compiler-core/        Pipeline orchestration and analysis
-  compiler-ir/          Validated canonical IR
+  krunt-ir/             Validated canonical IR
   compiler-passes/      Deterministic optimization passes
   backend-dsl/          Backend semantics and lowering
   codegen-typescript/   TypeScript project generation

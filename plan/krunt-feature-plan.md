@@ -91,6 +91,19 @@ compiler interfaces without importing Backend DSL code.
   IR.
 - [ ] Block generation on error-severity diagnostics.
 
+### Implementation checkpoint
+
+The first IR slice now exists in `crates/ir`:
+
+- [x] Keep the IR independent of TypeScript, NestJS, and editor details.
+- [x] Represent separate control-flow and typed data-flow edges.
+- [x] Preserve source mappings to graph node, port, and edge IDs.
+- [x] Build immutable graphs through a validating builder.
+- [x] Produce deterministic node and edge ordering and JSON serialization.
+- [x] Reject duplicate nodes, dangling edges, invalid ports, and type mismatches.
+- [ ] Add compiler orchestration, diagnostics, cycle validation, and lowering
+      from the canonical graph model.
+
 **Exit criteria:** repeated compilation produces identical diagnostics and IR;
 invalid graphs never reach a generator.
 
