@@ -92,6 +92,16 @@ commands and supports the initial Backend DSL node set.
 **Exit criteria:** a synthetic second plugin can use the generic editor and
 compiler interfaces without importing Backend DSL code.
 
+### Implementation checkpoint
+
+Task 2 is implemented in `crates/plugin-api`:
+
+- [x] Define serializable plugin identity and supported node-type manifests.
+- [x] Define target-neutral semantic lowering results.
+- [x] Register and resolve plugins through an explicit deterministic registry.
+- [x] Reject duplicate plugin IDs and node-type ownership conflicts.
+- [ ] Connect the registry to compiler orchestration and backend diagnostics.
+
 ## Phase 4 — Compiler and universal IR
 
 - [ ] Implement Rust compiler orchestration.

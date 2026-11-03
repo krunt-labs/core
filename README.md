@@ -107,7 +107,7 @@ crates/
   graph-model/          Structural graph and serialization
   graph-types/          Type representation and inference
   diagnostics/          Stable source-linked diagnostics
-  semantic-api/         Contracts, capabilities, and plugin interfaces
+  plugin-api/           Contracts, capabilities, and plugin interfaces
   compiler-core/        Pipeline orchestration and analysis
   krunt-ir/             Validated canonical IR
   compiler-passes/      Deterministic optimization passes

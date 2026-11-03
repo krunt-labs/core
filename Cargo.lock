@@ -34,6 +34,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "krunt-plugin-api"
+version = "0.1.0"
+dependencies = [
+ "krunt-diagnostics",
+ "krunt-graph-model",
+ "krunt-ir",
+ "serde",
+]
+
+[[package]]
 name = "memchr"
 version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"

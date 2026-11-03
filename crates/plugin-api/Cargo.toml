@@ -1,0 +1,12 @@
+[package]
+name = "krunt-plugin-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Versioned semantic plugin and lowering interfaces for Krunt"
+
+[dependencies]
+krunt-diagnostics = { path = "../diagnostics" }
+krunt-graph-model = { path = "../graph-model" }
+krunt-ir = { path = "../ir" }
+serde = { version = "1", features = ["derive"] }
