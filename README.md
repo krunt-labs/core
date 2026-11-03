@@ -4,7 +4,7 @@ Krunt is a backend builder for visually authoring deterministic software systems
 
 The visual graph is source code—not a diagram layered over handwritten code. A Rust compiler validates and lowers that graph into production-grade artifacts. Krunt's first target is a visual backend designer that generates a readable, deployable TypeScript/Node project.
 
-> **Project status:** Architecture and product definition; implementation is beginning with the Rust IR crate.
+> **Project status:** Architecture and product definition; the structural graph model and Rust IR foundations are now implemented.
 
 ## What we are building
 

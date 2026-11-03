@@ -46,6 +46,19 @@ no React Flow node or edge object is used as compiler source.
 - [ ] Add structural validation for IDs, references, ports, and subgraphs.
 - [ ] Preserve source mappings for nodes, ports, and edges.
 
+### Implementation checkpoint
+
+The first structural graph-model slice now exists in
+`crates/graph-model`:
+
+- [x] Define typed graph, node, port, edge, group, and subgraph IDs.
+- [x] Represent explicit port direction and execution/data edge kinds.
+- [x] Keep node properties and namespaced extensions opaque to this layer.
+- [x] Validate references, directions, edge kinds, duplicate IDs, and schema
+      versions.
+- [x] Serialize and parse canonical graph documents deterministically.
+- [ ] Add migrations and connect structural documents to compiler lowering.
+
 **Exit criteria:** valid documents round-trip deterministically; malformed
 documents return structured diagnostics without panics.
 
