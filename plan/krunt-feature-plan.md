@@ -117,6 +117,17 @@ The first IR slice now exists in `crates/ir`:
 - [ ] Add compiler orchestration, diagnostics, cycle validation, and lowering
       from the canonical graph model.
 
+### Compiler-boundary checkpoint
+
+Task 1 is implemented in `crates/diagnostics`:
+
+- [x] Define stable diagnostic codes, severities, and compiler stages.
+- [x] Link diagnostics to primary and related graph element IDs.
+- [x] Support renderer-neutral structured help and fix proposals.
+- [x] Canonically sort diagnostics and detect error-severity findings.
+- [ ] Aggregate diagnostics in compiler orchestration and block lowering on
+      errors.
+
 **Exit criteria:** repeated compilation produces identical diagnostics and IR;
 invalid graphs never reach a generator.
 

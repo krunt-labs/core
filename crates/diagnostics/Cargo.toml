@@ -1,0 +1,13 @@
+[package]
+name = "krunt-diagnostics"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Stable, source-linked compiler diagnostics for Krunt"
+
+[dependencies]
+krunt-graph-model = { path = "../graph-model" }
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+serde_json = "1"
