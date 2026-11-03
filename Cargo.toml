@@ -6,6 +6,7 @@ members = [
 	"crates/diagnostics",
 	"crates/plugin-api",
 	"crates/compiler",
+	"crates/type-system",
 ]
 
 [workspace.package]

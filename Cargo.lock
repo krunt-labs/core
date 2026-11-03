@@ -16,6 +16,7 @@ dependencies = [
  "krunt-graph-model",
  "krunt-ir",
  "krunt-plugin-api",
+ "krunt-type-system",
 ]
 
 [[package]]
@@ -52,6 +53,10 @@ dependencies = [
  "krunt-ir",
  "serde",
 ]
+
+[[package]]
+name = "krunt-type-system"
+version = "0.1.0"
 
 [[package]]
 name = "memchr"

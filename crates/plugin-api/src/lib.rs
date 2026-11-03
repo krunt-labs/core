@@ -103,6 +103,10 @@ impl LoweredOperation {
 pub trait SemanticPlugin: Send + Sync {
 	fn manifest(&self) -> &PluginManifest;
 
+	fn analyze_node(&self, _node: &Node) -> Vec<Diagnostic> {
+		Vec::new()
+	}
+
 	fn lower_node(&self, node: &Node) -> Result<LoweredOperation, Vec<Diagnostic>>;
 }
 

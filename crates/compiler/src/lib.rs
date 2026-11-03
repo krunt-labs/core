@@ -4,7 +4,8 @@
 //! in plugins, while IR invariants stay in the IR crate.
 
 use krunt_diagnostics::{
-	CompilerStage, Diagnostic, DiagnosticCode, Diagnostics, GraphElementId, Severity,
+	CompilerStage, Diagnostic, DiagnosticCode, Diagnostics, GraphElementId, RelatedElement,
+	Severity,
 };
 use krunt_graph_model::{EdgeKind, GraphDocument, Node, PortDirection, PortId, PortKind};
 use krunt_ir::{
@@ -12,6 +13,7 @@ use krunt_ir::{
 	SourceMap,
 };
 use krunt_plugin_api::{LoweredOperation, PluginRegistry};
+use krunt_type_system::{check_assignable, Type};
 use std::collections::BTreeMap;
 
 /// Result of compiling a graph document.
@@ -42,14 +44,33 @@ impl CompilationResult {
 /// Compile a validated structural graph through semantic plugins into IR.
 pub fn compile(document: &GraphDocument, plugins: &PluginRegistry) -> CompilationResult {
 	let mut diagnostics = Diagnostics::new();
+
+	for node in document.nodes() {
+		let Some(plugin) = plugins.resolve(node.type_id()) else {
+			diagnostics.push(missing_plugin_diagnostic(node));
+			continue;
+		};
+		diagnostics.extend(plugin.analyze_node(node));
+	}
+
+	if !diagnostics.has_errors() {
+		analyze_data_types(document, &mut diagnostics);
+	}
+	if diagnostics.has_errors() {
+		diagnostics.sort_canonical();
+		return CompilationResult {
+			ir: None,
+			diagnostics,
+		};
+	}
+
 	let mut builder = IRBuilder::new();
 	let mut port_bindings = BTreeMap::new();
 
 	for (index, node) in document.nodes().iter().enumerate() {
 		let ir_id = krunt_ir::IrNodeId((index + 1) as u32);
 		let Some(plugin) = plugins.resolve(node.type_id()) else {
-			diagnostics.push(missing_plugin_diagnostic(node));
-			continue;
+			unreachable!("plugin resolution was completed during semantic analysis");
 		};
 
 		match plugin.lower_node(node) {
@@ -110,6 +131,65 @@ pub fn compile(document: &GraphDocument, plugins: &PluginRegistry) -> Compilatio
 
 	diagnostics.sort_canonical();
 	CompilationResult { ir, diagnostics }
+}
+
+#[derive(Clone)]
+struct GraphPortType {
+	kind: PortKind,
+	type_reference: Option<Type>,
+}
+
+fn analyze_data_types(document: &GraphDocument, diagnostics: &mut Diagnostics) {
+	let mut port_types = BTreeMap::new();
+	for node in document.nodes() {
+		for port in node.ports() {
+			let type_reference = port.type_reference().map(|reference| {
+				Type::named(reference.as_str()).unwrap_or_else(|_| {
+					unreachable!("validated graph type references cannot be empty")
+				})
+			});
+			port_types.insert(
+				port.id(),
+				GraphPortType {
+					kind: port.kind(),
+					type_reference,
+				},
+			);
+		}
+	}
+
+	for edge in document
+		.edges()
+		.iter()
+		.filter(|edge| edge.kind() == EdgeKind::DATA)
+	{
+		let (Some(from), Some(to)) = (port_types.get(&edge.from()), port_types.get(&edge.to()))
+		else {
+			continue;
+		};
+		if from.kind != PortKind::DATA || to.kind != PortKind::DATA {
+			continue;
+		}
+
+		let Some(from_type) = from.type_reference.as_ref() else {
+			diagnostics.push(missing_type_reference_diagnostic(edge.from(), edge.id()));
+			continue;
+		};
+		let Some(to_type) = to.type_reference.as_ref() else {
+			diagnostics.push(missing_type_reference_diagnostic(edge.to(), edge.id()));
+			continue;
+		};
+
+		if check_assignable(from_type, to_type).is_err() {
+			diagnostics.push(type_mismatch_diagnostic(
+				edge.from(),
+				edge.to(),
+				edge.id(),
+				from_type,
+				to_type,
+			));
+		}
+	}
 }
 
 #[derive(Clone, Copy)]
@@ -286,6 +366,41 @@ fn missing_port_diagnostic(port: PortId) -> Diagnostic {
 	.unwrap()
 }
 
+fn missing_type_reference_diagnostic(port: PortId, edge: krunt_graph_model::EdgeId) -> Diagnostic {
+	Diagnostic::new(
+		DiagnosticCode::new("TYPE.MISSING_REFERENCE").unwrap(),
+		Severity::ERROR,
+		CompilerStage::TYPE_ANALYSIS,
+		"A data port connected by this edge is missing a type reference.",
+		GraphElementId::PORT(port),
+	)
+	.unwrap()
+	.with_related([RelatedElement::new(GraphElementId::EDGE(edge))])
+}
+
+fn type_mismatch_diagnostic(
+	from_port: PortId,
+	to_port: PortId,
+	edge: krunt_graph_model::EdgeId,
+	from_type: &Type,
+	to_type: &Type,
+) -> Diagnostic {
+	let from_name = from_type.as_name().unwrap_or("any");
+	let to_name = to_type.as_name().unwrap_or("any");
+	Diagnostic::new(
+		DiagnosticCode::new("TYPE.MISMATCH").unwrap(),
+		Severity::ERROR,
+		CompilerStage::TYPE_ANALYSIS,
+		format!("Cannot connect data type '{from_name}' to incompatible type '{to_name}'."),
+		GraphElementId::PORT(to_port),
+	)
+	.unwrap()
+	.with_related([
+		RelatedElement::new(GraphElementId::PORT(from_port)),
+		RelatedElement::new(GraphElementId::EDGE(edge)),
+	])
+}
+
 fn ir_build_diagnostic(primary: GraphElementId, error: BuildError) -> Diagnostic {
 	Diagnostic::new(
 		DiagnosticCode::new("LOWERING.INVALID_IR").unwrap(),
@@ -308,11 +423,28 @@ mod tests {
 
 	struct BackendTestPlugin {
 		manifest: PluginManifest,
+		semantic_error: bool,
 	}
 
 	impl SemanticPlugin for BackendTestPlugin {
 		fn manifest(&self) -> &PluginManifest {
 			&self.manifest
+		}
+
+		fn analyze_node(&self, node: &Node) -> Vec<Diagnostic> {
+			if self.semantic_error {
+				return vec![Diagnostic::new(
+					DiagnosticCode::new("SEMANTIC.TEST_FAILURE").unwrap(),
+					Severity::ERROR,
+					CompilerStage::SEMANTIC_ANALYSIS,
+					"The test plugin rejected this node during semantic analysis.",
+					GraphElementId::NODE(
+						krunt_graph_model::NodeId::new(node.id().as_u64()).unwrap(),
+					),
+				)
+				.unwrap()];
+			}
+			Vec::new()
 		}
 
 		fn lower_node(&self, node: &Node) -> Result<LoweredOperation, Vec<Diagnostic>> {
@@ -332,6 +464,10 @@ mod tests {
 	}
 
 	fn document() -> GraphDocument {
+		document_with_response_type(Some("Request"))
+	}
+
+	fn document_with_response_type(response_type: Option<&str>) -> GraphDocument {
 		let metadata =
 			GraphMetadata::new(GraphId::new(1).unwrap(), "backend-v1", "krunt-dev").unwrap();
 		let mut route = Node::new(
@@ -366,16 +502,18 @@ mod tests {
 				PortKind::EXECUTION,
 			))
 			.unwrap();
-		response
-			.add_port(
-				Port::new(
-					PortId::new(22).unwrap(),
-					PortDirection::INPUT,
-					PortKind::DATA,
-				)
-				.with_type_reference(TypeReference::new("Request").unwrap()),
-			)
-			.unwrap();
+		let response_port = Port::new(
+			PortId::new(22).unwrap(),
+			PortDirection::INPUT,
+			PortKind::DATA,
+		);
+		let response_port = match response_type {
+			Some(type_name) => {
+				response_port.with_type_reference(TypeReference::new(type_name).unwrap())
+			}
+			None => response_port,
+		};
+		response.add_port(response_port).unwrap();
 		let mut builder = krunt_graph_model::GraphBuilder::new(metadata);
 		builder.add_node(route).unwrap();
 		builder.add_node(response).unwrap();
@@ -399,6 +537,10 @@ mod tests {
 	}
 
 	fn registry() -> PluginRegistry {
+		registry_with_semantic_error(false)
+	}
+
+	fn registry_with_semantic_error(semantic_error: bool) -> PluginRegistry {
 		let manifest = PluginManifest::new(
 			PluginReference::new("test-backend", "0.1.0").unwrap(),
 			[
@@ -409,7 +551,10 @@ mod tests {
 		.unwrap();
 		let mut registry = PluginRegistry::new();
 		registry
-			.register(Box::new(BackendTestPlugin { manifest }))
+			.register(Box::new(BackendTestPlugin {
+				manifest,
+				semantic_error,
+			}))
 			.unwrap();
 		registry
 	}
@@ -434,6 +579,50 @@ mod tests {
 		assert_eq!(
 			result.diagnostics().as_slice()[0].code().as_str(),
 			"PLUGIN.MISSING_NODE_TYPE"
+		);
+	}
+
+	#[test]
+	fn semantic_plugin_diagnostics_block_ir_generation() {
+		let result = compile(&document(), &registry_with_semantic_error(true));
+
+		assert!(result.has_errors());
+		assert!(result.ir().is_none());
+		assert_eq!(
+			result.diagnostics().as_slice()[0].code().as_str(),
+			"SEMANTIC.TEST_FAILURE"
+		);
+		assert_eq!(
+			result.diagnostics().as_slice()[0].stage(),
+			CompilerStage::SEMANTIC_ANALYSIS
+		);
+	}
+
+	#[test]
+	fn incompatible_data_types_block_ir_generation_with_related_sources() {
+		let result = compile(&document_with_response_type(Some("Response")), &registry());
+
+		assert!(result.has_errors());
+		assert!(result.ir().is_none());
+		let diagnostic = &result.diagnostics().as_slice()[0];
+		assert_eq!(diagnostic.code().as_str(), "TYPE.MISMATCH");
+		assert_eq!(diagnostic.stage(), CompilerStage::TYPE_ANALYSIS);
+		assert_eq!(
+			diagnostic.primary(),
+			GraphElementId::PORT(PortId::new(22).unwrap())
+		);
+		assert_eq!(diagnostic.related().len(), 2);
+	}
+
+	#[test]
+	fn missing_data_type_reference_blocks_ir_generation() {
+		let result = compile(&document_with_response_type(None), &registry());
+
+		assert!(result.has_errors());
+		assert!(result.ir().is_none());
+		assert_eq!(
+			result.diagnostics().as_slice()[0].code().as_str(),
+			"TYPE.MISSING_REFERENCE"
 		);
 	}
 

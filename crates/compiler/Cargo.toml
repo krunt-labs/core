@@ -10,3 +10,4 @@ krunt-diagnostics = { path = "../diagnostics" }
 krunt-graph-model = { path = "../graph-model" }
 krunt-ir = { path = "../ir" }
 krunt-plugin-api = { path = "../plugin-api" }
+krunt-type-system = { path = "../type-system" }

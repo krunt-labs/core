@@ -102,6 +102,13 @@ Task 2 is implemented in `crates/plugin-api`:
 - [x] Reject duplicate plugin IDs and node-type ownership conflicts.
 - [x] Connect the registry to compiler orchestration and backend diagnostics.
 
+Task 4's initial type-system slice is implemented in `crates/type-system`:
+
+- [x] Keep the initial type relation independent of Backend DSL semantics.
+- [x] Represent named types and an explicit `ANY` target relation.
+- [x] Reject incompatible named data connections before IR lowering.
+- [ ] Add composite types, generics, inference, and richer constraints.
+
 ## Phase 4 — Compiler and universal IR
 
 - [ ] Implement Rust compiler orchestration.
@@ -147,8 +154,9 @@ Task 3 is implemented in `crates/compiler`:
 - [x] Wire execution and data edges independently.
 - [x] Aggregate and canonically sort diagnostics.
 - [x] Block IR output when compilation has error-severity diagnostics.
-- [ ] Add the remaining semantic-analysis, type-analysis, and whole-graph
-      validation stages.
+- [x] Run plugin semantic analysis before lowering.
+- [x] Run initial data-edge type analysis before lowering.
+- [ ] Add contract validation, capability checks, and whole-graph validation.
 
 **Exit criteria:** repeated compilation produces identical diagnostics and IR;
 invalid graphs never reach a generator.
