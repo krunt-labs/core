@@ -464,6 +464,7 @@ fn validate_whole_graph(
 		};
 		adjacency.entry(*from).or_default().insert(*to);
 	}
+	validate_input_dependencies(document, contracts, diagnostics);
 
 	let entry_nodes: Vec<_> = document
 		.nodes()
@@ -518,27 +519,61 @@ fn validate_whole_graph(
 
 	let mut states = BTreeMap::new();
 	let mut stack = Vec::new();
-	let mut cycle_nodes = BTreeSet::new();
+	let mut cycles = BTreeSet::new();
 	for node in document.nodes() {
-		visit_execution_node(
-			node.id(),
-			&adjacency,
-			&mut states,
-			&mut stack,
-			&mut cycle_nodes,
-		);
+		visit_execution_node(node.id(), &adjacency, &mut states, &mut stack, &mut cycles);
 	}
-	for node in cycle_nodes {
-		diagnostics.push(
-			Diagnostic::new(
-				DiagnosticCode::new("GRAPH.EXECUTION_CYCLE").unwrap(),
-				Severity::ERROR,
-				CompilerStage::WHOLE_GRAPH_VALIDATION,
-				"Arbitrary execution cycles are not allowed; use a structured Loop node.",
-				GraphElementId::NODE(node),
-			)
-			.unwrap(),
-		);
+	for cycle in cycles {
+		let structured = cycle
+			.iter()
+			.any(|node| contracts.get(node).is_some_and(NodeContract::is_loop));
+		if structured {
+			continue;
+		}
+		for node in cycle {
+			diagnostics.push(
+				Diagnostic::new(
+					DiagnosticCode::new("GRAPH.EXECUTION_CYCLE").unwrap(),
+					Severity::ERROR,
+					CompilerStage::WHOLE_GRAPH_VALIDATION,
+					"Arbitrary execution cycles are not allowed; use a structured Loop node.",
+					GraphElementId::NODE(node),
+				)
+				.unwrap(),
+			);
+		}
+	}
+}
+
+fn validate_input_dependencies(
+	document: &GraphDocument,
+	contracts: &BTreeMap<krunt_graph_model::NodeId, NodeContract>,
+	diagnostics: &mut Diagnostics,
+) {
+	let incoming_ports: BTreeSet<_> = document.edges().iter().map(|edge| edge.to()).collect();
+	for node in document.nodes() {
+		let Some(contract) = contracts.get(&node.id()) else {
+			continue;
+		};
+		let inputs: Vec<_> = node
+			.ports()
+			.iter()
+			.filter(|port| port.direction() == PortDirection::INPUT)
+			.collect();
+		for (port, expected) in inputs.iter().zip(contract.inputs()) {
+			if expected.required() && !incoming_ports.contains(&port.id()) {
+				diagnostics.push(
+					Diagnostic::new(
+						DiagnosticCode::new("GRAPH.MISSING_DEPENDENCY").unwrap(),
+						Severity::ERROR,
+						CompilerStage::WHOLE_GRAPH_VALIDATION,
+						"A required input port has no incoming dependency edge.",
+						GraphElementId::PORT(port.id()),
+					)
+					.unwrap(),
+				);
+			}
+		}
 	}
 }
 
@@ -555,12 +590,12 @@ fn visit_execution_node(
 	adjacency: &BTreeMap<krunt_graph_model::NodeId, BTreeSet<krunt_graph_model::NodeId>>,
 	states: &mut BTreeMap<krunt_graph_model::NodeId, ExecutionVisitState>,
 	stack: &mut Vec<krunt_graph_model::NodeId>,
-	cycle_nodes: &mut BTreeSet<krunt_graph_model::NodeId>,
+	cycles: &mut BTreeSet<BTreeSet<krunt_graph_model::NodeId>>,
 ) {
 	match states.get(&node) {
 		Some(ExecutionVisitState::VISITING) => {
 			if let Some(start) = stack.iter().position(|current| *current == node) {
-				cycle_nodes.extend(stack[start..].iter().copied());
+				cycles.insert(stack[start..].iter().copied().collect());
 			}
 			return;
 		}
@@ -572,7 +607,7 @@ fn visit_execution_node(
 	stack.push(node);
 	if let Some(successors) = adjacency.get(&node) {
 		for successor in successors {
-			visit_execution_node(*successor, adjacency, states, stack, cycle_nodes);
+			visit_execution_node(*successor, adjacency, states, stack, cycles);
 		}
 	}
 	stack.pop();
@@ -919,6 +954,17 @@ mod tests {
 	}
 
 	fn document_with_response_type(response_type: Option<&str>) -> GraphDocument {
+		document_with_options(response_type, true)
+	}
+
+	fn document_without_data_dependency() -> GraphDocument {
+		document_with_options(Some("Request"), false)
+	}
+
+	fn document_with_options(
+		response_type: Option<&str>,
+		include_data_edge: bool,
+	) -> GraphDocument {
 		let metadata =
 			GraphMetadata::new(GraphId::new(1).unwrap(), "backend-v1", "krunt-dev").unwrap();
 		let mut route = Node::new(
@@ -976,14 +1022,16 @@ mod tests {
 				EdgeKind::EXECUTION,
 			))
 			.unwrap();
-		builder
-			.add_edge(krunt_graph_model::Edge::new(
-				krunt_graph_model::EdgeId::new(32).unwrap(),
-				PortId::new(12).unwrap(),
-				PortId::new(22).unwrap(),
-				EdgeKind::DATA,
-			))
-			.unwrap();
+		if include_data_edge {
+			builder
+				.add_edge(krunt_graph_model::Edge::new(
+					krunt_graph_model::EdgeId::new(32).unwrap(),
+					PortId::new(12).unwrap(),
+					PortId::new(22).unwrap(),
+					EdgeKind::DATA,
+				))
+				.unwrap();
+		}
 		builder.build().unwrap()
 	}
 
@@ -1208,13 +1256,51 @@ mod tests {
 	}
 
 	#[test]
+	fn required_input_dependencies_must_be_connected() {
+		let result = compile(&document_without_data_dependency(), &registry());
+
+		assert!(result.has_errors());
+		assert!(result.ir().is_none());
+		assert_eq!(
+			result.diagnostics().as_slice()[0].code().as_str(),
+			"GRAPH.MISSING_DEPENDENCY"
+		);
+		assert_eq!(
+			result.diagnostics().as_slice()[0].primary(),
+			GraphElementId::PORT(PortId::new(22).unwrap())
+		);
+	}
+
+	#[test]
 	fn arbitrary_execution_cycles_are_rejected() {
 		let document = cyclic_execution_document();
-		let contracts = std::collections::BTreeMap::from([
+		let contracts = cyclic_contracts(false);
+		let mut diagnostics = Diagnostics::new();
+		validate_whole_graph(&document, &contracts, &mut diagnostics);
+
+		assert_eq!(diagnostics.as_slice().len(), 2);
+		assert!(diagnostics
+			.as_slice()
+			.iter()
+			.all(|diagnostic| diagnostic.code().as_str() == "GRAPH.EXECUTION_CYCLE"));
+	}
+
+	#[test]
+	fn structured_loop_contracts_allow_execution_cycles() {
+		let document = cyclic_execution_document();
+		let contracts = cyclic_contracts(true);
+		let mut diagnostics = Diagnostics::new();
+		validate_whole_graph(&document, &contracts, &mut diagnostics);
+
+		assert!(diagnostics.is_empty());
+	}
+
+	fn cyclic_contracts(loop_node: bool) -> std::collections::BTreeMap<NodeId, NodeContract> {
+		std::collections::BTreeMap::from([
 			(
 				NodeId::new(1).unwrap(),
 				NodeContract::new(
-					[],
+					[PortContract::new(PortKind::EXECUTION, None, true)],
 					[PortContract::new(PortKind::EXECUTION, None, true)],
 					[],
 					[],
@@ -1222,7 +1308,8 @@ mod tests {
 					AsyncKind::SYNC,
 					[],
 				)
-				.with_entry(true),
+				.with_entry(true)
+				.with_loop(loop_node),
 			),
 			(
 				NodeId::new(2).unwrap(),
@@ -1236,15 +1323,7 @@ mod tests {
 					[],
 				),
 			),
-		]);
-		let mut diagnostics = Diagnostics::new();
-		validate_whole_graph(&document, &contracts, &mut diagnostics);
-
-		assert_eq!(diagnostics.as_slice().len(), 2);
-		assert!(diagnostics
-			.as_slice()
-			.iter()
-			.all(|diagnostic| diagnostic.code().as_str() == "GRAPH.EXECUTION_CYCLE"));
+		])
 	}
 
 	#[test]

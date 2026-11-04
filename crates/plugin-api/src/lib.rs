@@ -158,6 +158,7 @@ pub struct NodeContract {
 	async_kind: AsyncKind,
 	effects: Vec<EffectId>,
 	entry: bool,
+	loop_node: bool,
 }
 
 impl NodeContract {
@@ -191,6 +192,7 @@ impl NodeContract {
 			async_kind,
 			effects,
 			entry: false,
+			loop_node: false,
 		}
 	}
 
@@ -229,6 +231,15 @@ impl NodeContract {
 
 	pub fn is_entry(&self) -> bool {
 		self.entry
+	}
+
+	pub fn with_loop(mut self, loop_node: bool) -> Self {
+		self.loop_node = loop_node;
+		self
+	}
+
+	pub fn is_loop(&self) -> bool {
+		self.loop_node
 	}
 }
 
@@ -403,12 +414,16 @@ mod tests {
 				EffectId::new("database.read").unwrap(),
 				EffectId::new("database.read").unwrap(),
 			],
-		);
+		)
+		.with_entry(true)
+		.with_loop(true);
 
 		assert_eq!(contract.inputs().len(), 1);
 		assert_eq!(contract.requirements().len(), 2);
 		assert_eq!(contract.capabilities().len(), 1);
 		assert_eq!(contract.effects().len(), 1);
+		assert!(contract.is_entry());
+		assert!(contract.is_loop());
 	}
 
 	#[test]

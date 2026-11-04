@@ -158,7 +158,8 @@ Task 3 is implemented in `crates/compiler`:
 - [x] Run initial data-edge type analysis before lowering.
 - [x] Add initial contract validation before IR construction.
 - [x] Add capability resolution and initial whole-graph validation.
-- [ ] Add dependency validation and structured Loop cycle semantics.
+- [x] Add required-input dependency validation and structured Loop cycle
+      semantics.
 
 ### Contract-validation checkpoint
 
@@ -174,7 +175,8 @@ The first target-neutral contract slice is implemented across
 - [x] Resolve capabilities and requirements across directly connected nodes.
 - [x] Add explicit entry points, execution reachability, and arbitrary-cycle
       diagnostics.
-- [ ] Add dependency validation and structured Loop cycle semantics.
+- [x] Validate required input dependencies before lowering.
+- [x] Allow cycles only when an explicit Loop contract participates in them.
 
 **Exit criteria:** repeated compilation produces identical diagnostics and IR;
 invalid graphs never reach a generator.
