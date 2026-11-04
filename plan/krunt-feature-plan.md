@@ -157,7 +157,8 @@ Task 3 is implemented in `crates/compiler`:
 - [x] Run plugin semantic analysis before lowering.
 - [x] Run initial data-edge type analysis before lowering.
 - [x] Add initial contract validation before IR construction.
-- [ ] Add capability resolution and whole-graph validation.
+- [x] Add capability resolution and initial whole-graph validation.
+- [ ] Add dependency validation and structured Loop cycle semantics.
 
 ### Contract-validation checkpoint
 
@@ -171,7 +172,9 @@ The first target-neutral contract slice is implemented across
 - [x] Validate lowered data types, async semantics, and effects against the
       declared contract before IR construction.
 - [x] Resolve capabilities and requirements across directly connected nodes.
-- [ ] Add whole-graph reachability, dependency, and cycle validation.
+- [x] Add explicit entry points, execution reachability, and arbitrary-cycle
+      diagnostics.
+- [ ] Add dependency validation and structured Loop cycle semantics.
 
 **Exit criteria:** repeated compilation produces identical diagnostics and IR;
 invalid graphs never reach a generator.

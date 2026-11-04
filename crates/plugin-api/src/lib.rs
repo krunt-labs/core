@@ -157,6 +157,7 @@ pub struct NodeContract {
 	guarantees: Vec<CapabilityId>,
 	async_kind: AsyncKind,
 	effects: Vec<EffectId>,
+	entry: bool,
 }
 
 impl NodeContract {
@@ -189,7 +190,13 @@ impl NodeContract {
 			guarantees,
 			async_kind,
 			effects,
+			entry: false,
 		}
+	}
+
+	pub fn with_entry(mut self, entry: bool) -> Self {
+		self.entry = entry;
+		self
 	}
 
 	pub fn inputs(&self) -> &[PortContract] {
@@ -218,6 +225,10 @@ impl NodeContract {
 
 	pub fn effects(&self) -> &[EffectId] {
 		&self.effects
+	}
+
+	pub fn is_entry(&self) -> bool {
+		self.entry
 	}
 }
 

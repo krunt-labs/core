@@ -14,7 +14,7 @@ use krunt_ir::{
 };
 use krunt_plugin_api::{CapabilityId, LoweredOperation, NodeContract, PluginRegistry};
 use krunt_type_system::{check_assignable, Type};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 /// Result of compiling a graph document.
 #[derive(Debug)]
@@ -62,6 +62,9 @@ pub fn compile(document: &GraphDocument, plugins: &PluginRegistry) -> Compilatio
 	}
 	if !diagnostics.has_errors() {
 		resolve_capabilities(document, &contracts, &mut diagnostics);
+	}
+	if !diagnostics.has_errors() {
+		validate_whole_graph(document, &contracts, &mut diagnostics);
 	}
 	if diagnostics.has_errors() {
 		diagnostics.sort_canonical();
@@ -430,6 +433,152 @@ fn add_capabilities(contract: &NodeContract, available: &mut BTreeSet<Capability
 	available.extend(contract.guarantees().iter().cloned());
 }
 
+fn validate_whole_graph(
+	document: &GraphDocument,
+	contracts: &BTreeMap<krunt_graph_model::NodeId, NodeContract>,
+	diagnostics: &mut Diagnostics,
+) {
+	if document.nodes().is_empty() {
+		return;
+	}
+
+	let mut port_owners = BTreeMap::new();
+	for node in document.nodes() {
+		for port in node.ports() {
+			port_owners.insert(port.id(), node.id());
+		}
+	}
+
+	let mut adjacency: BTreeMap<krunt_graph_model::NodeId, BTreeSet<_>> = BTreeMap::new();
+	for node in document.nodes() {
+		adjacency.entry(node.id()).or_default();
+	}
+	for edge in document
+		.edges()
+		.iter()
+		.filter(|edge| edge.kind() == EdgeKind::EXECUTION)
+	{
+		let (Some(from), Some(to)) = (port_owners.get(&edge.from()), port_owners.get(&edge.to()))
+		else {
+			continue;
+		};
+		adjacency.entry(*from).or_default().insert(*to);
+	}
+
+	let entry_nodes: Vec<_> = document
+		.nodes()
+		.iter()
+		.filter(|node| {
+			contracts
+				.get(&node.id())
+				.is_some_and(NodeContract::is_entry)
+		})
+		.map(Node::id)
+		.collect();
+	if entry_nodes.is_empty() {
+		diagnostics.push(
+			Diagnostic::new(
+				DiagnosticCode::new("GRAPH.NO_ENTRY_POINT").unwrap(),
+				Severity::ERROR,
+				CompilerStage::WHOLE_GRAPH_VALIDATION,
+				"The graph has no semantic entry point.",
+				GraphElementId::GRAPH(
+					krunt_graph_model::GraphId::new(document.metadata().graph_id().as_u64())
+						.unwrap(),
+				),
+			)
+			.unwrap(),
+		);
+	} else {
+		let mut reachable = BTreeSet::new();
+		let mut queue = VecDeque::from(entry_nodes);
+		while let Some(node) = queue.pop_front() {
+			if !reachable.insert(node) {
+				continue;
+			}
+			if let Some(successors) = adjacency.get(&node) {
+				queue.extend(successors.iter().copied());
+			}
+		}
+		for node in document.nodes() {
+			if !reachable.contains(&node.id()) {
+				diagnostics.push(
+					Diagnostic::new(
+						DiagnosticCode::new("GRAPH.UNREACHABLE_NODE").unwrap(),
+						Severity::ERROR,
+						CompilerStage::WHOLE_GRAPH_VALIDATION,
+						"This node is not reachable from any semantic entry point.",
+						GraphElementId::NODE(node.id()),
+					)
+					.unwrap(),
+				);
+			}
+		}
+	}
+
+	let mut states = BTreeMap::new();
+	let mut stack = Vec::new();
+	let mut cycle_nodes = BTreeSet::new();
+	for node in document.nodes() {
+		visit_execution_node(
+			node.id(),
+			&adjacency,
+			&mut states,
+			&mut stack,
+			&mut cycle_nodes,
+		);
+	}
+	for node in cycle_nodes {
+		diagnostics.push(
+			Diagnostic::new(
+				DiagnosticCode::new("GRAPH.EXECUTION_CYCLE").unwrap(),
+				Severity::ERROR,
+				CompilerStage::WHOLE_GRAPH_VALIDATION,
+				"Arbitrary execution cycles are not allowed; use a structured Loop node.",
+				GraphElementId::NODE(node),
+			)
+			.unwrap(),
+		);
+	}
+}
+
+#[allow(non_camel_case_types)]
+#[allow(clippy::upper_case_acronyms)]
+#[derive(Clone, Copy)]
+enum ExecutionVisitState {
+	VISITING,
+	VISITED,
+}
+
+fn visit_execution_node(
+	node: krunt_graph_model::NodeId,
+	adjacency: &BTreeMap<krunt_graph_model::NodeId, BTreeSet<krunt_graph_model::NodeId>>,
+	states: &mut BTreeMap<krunt_graph_model::NodeId, ExecutionVisitState>,
+	stack: &mut Vec<krunt_graph_model::NodeId>,
+	cycle_nodes: &mut BTreeSet<krunt_graph_model::NodeId>,
+) {
+	match states.get(&node) {
+		Some(ExecutionVisitState::VISITING) => {
+			if let Some(start) = stack.iter().position(|current| *current == node) {
+				cycle_nodes.extend(stack[start..].iter().copied());
+			}
+			return;
+		}
+		Some(ExecutionVisitState::VISITED) => return,
+		None => {}
+	}
+
+	states.insert(node, ExecutionVisitState::VISITING);
+	stack.push(node);
+	if let Some(successors) = adjacency.get(&node) {
+		for successor in successors {
+			visit_execution_node(*successor, adjacency, states, stack, cycle_nodes);
+		}
+	}
+	stack.pop();
+	states.insert(node, ExecutionVisitState::VISITED);
+}
+
 #[derive(Clone, Copy)]
 struct PortBinding {
 	source_port: PortId,
@@ -679,6 +828,7 @@ mod tests {
 		lowered_type_mismatch: bool,
 		capability_provider: bool,
 		capability_requirement: bool,
+		route_entry: bool,
 	}
 
 	impl SemanticPlugin for BackendTestPlugin {
@@ -708,6 +858,7 @@ mod tests {
 					Vec::new()
 				};
 				NodeContract::new([], outputs, [], capabilities, [], AsyncKind::SYNC, [])
+					.with_entry(self.route_entry)
 			} else {
 				let requirements = if self.capability_requirement {
 					vec![capability()]
@@ -836,16 +987,77 @@ mod tests {
 		builder.build().unwrap()
 	}
 
+	fn cyclic_execution_document() -> GraphDocument {
+		let metadata =
+			GraphMetadata::new(GraphId::new(2).unwrap(), "backend-v1", "krunt-dev").unwrap();
+		let mut first = Node::new(
+			NodeId::new(1).unwrap(),
+			NodeTypeId::new("test.route").unwrap(),
+		);
+		first
+			.add_port(Port::new(
+				PortId::new(101).unwrap(),
+				PortDirection::INPUT,
+				PortKind::EXECUTION,
+			))
+			.unwrap();
+		first
+			.add_port(Port::new(
+				PortId::new(102).unwrap(),
+				PortDirection::OUTPUT,
+				PortKind::EXECUTION,
+			))
+			.unwrap();
+		let mut second = Node::new(
+			NodeId::new(2).unwrap(),
+			NodeTypeId::new("test.response").unwrap(),
+		);
+		second
+			.add_port(Port::new(
+				PortId::new(201).unwrap(),
+				PortDirection::INPUT,
+				PortKind::EXECUTION,
+			))
+			.unwrap();
+		second
+			.add_port(Port::new(
+				PortId::new(202).unwrap(),
+				PortDirection::OUTPUT,
+				PortKind::EXECUTION,
+			))
+			.unwrap();
+		let mut builder = krunt_graph_model::GraphBuilder::new(metadata);
+		builder.add_node(first).unwrap();
+		builder.add_node(second).unwrap();
+		builder
+			.add_edge(krunt_graph_model::Edge::new(
+				krunt_graph_model::EdgeId::new(301).unwrap(),
+				PortId::new(102).unwrap(),
+				PortId::new(201).unwrap(),
+				EdgeKind::EXECUTION,
+			))
+			.unwrap();
+		builder
+			.add_edge(krunt_graph_model::Edge::new(
+				krunt_graph_model::EdgeId::new(302).unwrap(),
+				PortId::new(202).unwrap(),
+				PortId::new(101).unwrap(),
+				EdgeKind::EXECUTION,
+			))
+			.unwrap();
+		builder.build().unwrap()
+	}
+
 	fn registry() -> PluginRegistry {
-		registry_with_options(false, false, false, false, false)
+		registry_with_options(false, false, false, false, false, true)
 	}
 
 	fn registry_with_semantic_error(semantic_error: bool) -> PluginRegistry {
-		registry_with_options(semantic_error, false, false, false, false)
+		registry_with_options(semantic_error, false, false, false, false, true)
 	}
 
 	fn registry_with_capabilities(provider: bool, requirement: bool) -> PluginRegistry {
-		registry_with_options(false, false, false, provider, requirement)
+		registry_with_options(false, false, false, provider, requirement, true)
 	}
 
 	fn registry_with_options(
@@ -854,6 +1066,7 @@ mod tests {
 		lowered_type_mismatch: bool,
 		capability_provider: bool,
 		capability_requirement: bool,
+		route_entry: bool,
 	) -> PluginRegistry {
 		let manifest = PluginManifest::new(
 			PluginReference::new("test-backend", "0.1.0").unwrap(),
@@ -872,6 +1085,7 @@ mod tests {
 				lowered_type_mismatch,
 				capability_provider,
 				capability_requirement,
+				route_entry,
 			}))
 			.unwrap();
 		registry
@@ -920,7 +1134,7 @@ mod tests {
 	fn graph_contract_violations_block_ir_generation() {
 		let result = compile(
 			&document(),
-			&registry_with_options(false, true, false, false, false),
+			&registry_with_options(false, true, false, false, false, true),
 		);
 
 		assert!(result.has_errors());
@@ -939,7 +1153,7 @@ mod tests {
 	fn lowered_operation_contract_violations_block_ir_generation() {
 		let result = compile(
 			&document(),
-			&registry_with_options(false, false, true, false, false),
+			&registry_with_options(false, false, true, false, false, true),
 		);
 
 		assert!(result.has_errors());
@@ -972,6 +1186,65 @@ mod tests {
 
 		assert!(!result.has_errors());
 		assert!(result.ir().is_some());
+	}
+
+	#[test]
+	fn graphs_without_entry_points_block_ir_generation() {
+		let result = compile(
+			&document(),
+			&registry_with_options(false, false, false, false, false, false),
+		);
+
+		assert!(result.has_errors());
+		assert!(result.ir().is_none());
+		assert_eq!(
+			result.diagnostics().as_slice()[0].code().as_str(),
+			"GRAPH.NO_ENTRY_POINT"
+		);
+		assert_eq!(
+			result.diagnostics().as_slice()[0].stage(),
+			CompilerStage::WHOLE_GRAPH_VALIDATION
+		);
+	}
+
+	#[test]
+	fn arbitrary_execution_cycles_are_rejected() {
+		let document = cyclic_execution_document();
+		let contracts = std::collections::BTreeMap::from([
+			(
+				NodeId::new(1).unwrap(),
+				NodeContract::new(
+					[],
+					[PortContract::new(PortKind::EXECUTION, None, true)],
+					[],
+					[],
+					[],
+					AsyncKind::SYNC,
+					[],
+				)
+				.with_entry(true),
+			),
+			(
+				NodeId::new(2).unwrap(),
+				NodeContract::new(
+					[PortContract::new(PortKind::EXECUTION, None, true)],
+					[PortContract::new(PortKind::EXECUTION, None, true)],
+					[],
+					[],
+					[],
+					AsyncKind::SYNC,
+					[],
+				),
+			),
+		]);
+		let mut diagnostics = Diagnostics::new();
+		validate_whole_graph(&document, &contracts, &mut diagnostics);
+
+		assert_eq!(diagnostics.as_slice().len(), 2);
+		assert!(diagnostics
+			.as_slice()
+			.iter()
+			.all(|diagnostic| diagnostic.code().as_str() == "GRAPH.EXECUTION_CYCLE"));
 	}
 
 	#[test]
