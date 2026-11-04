@@ -170,7 +170,7 @@ The first target-neutral contract slice is implemented across
 - [x] Validate graph port counts and kinds before lowering.
 - [x] Validate lowered data types, async semantics, and effects against the
       declared contract before IR construction.
-- [ ] Resolve capabilities and requirements across connected nodes.
+- [x] Resolve capabilities and requirements across directly connected nodes.
 - [ ] Add whole-graph reachability, dependency, and cycle validation.
 
 **Exit criteria:** repeated compilation produces identical diagnostics and IR;

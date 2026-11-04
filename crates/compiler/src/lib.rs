@@ -12,9 +12,9 @@ use krunt_ir::{
 	BuildError, ControlEdge, DataEdge, GraphNodeId, IRBuilder, IRGraph, IRNode, IROp, PortRef,
 	SourceMap,
 };
-use krunt_plugin_api::{LoweredOperation, NodeContract, PluginRegistry};
+use krunt_plugin_api::{CapabilityId, LoweredOperation, NodeContract, PluginRegistry};
 use krunt_type_system::{check_assignable, Type};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Result of compiling a graph document.
 #[derive(Debug)]
@@ -44,6 +44,7 @@ impl CompilationResult {
 /// Compile a validated structural graph through semantic plugins into IR.
 pub fn compile(document: &GraphDocument, plugins: &PluginRegistry) -> CompilationResult {
 	let mut diagnostics = Diagnostics::new();
+	let mut contracts = BTreeMap::new();
 
 	for node in document.nodes() {
 		let Some(plugin) = plugins.resolve(node.type_id()) else {
@@ -51,11 +52,16 @@ pub fn compile(document: &GraphDocument, plugins: &PluginRegistry) -> Compilatio
 			continue;
 		};
 		diagnostics.extend(plugin.analyze_node(node));
-		validate_node_contract(node, &plugin.contract(node), &mut diagnostics);
+		let contract = plugin.contract(node);
+		validate_node_contract(node, &contract, &mut diagnostics);
+		contracts.insert(node.id(), contract);
 	}
 
 	if !diagnostics.has_errors() {
 		analyze_data_types(document, &mut diagnostics);
+	}
+	if !diagnostics.has_errors() {
+		resolve_capabilities(document, &contracts, &mut diagnostics);
 	}
 	if diagnostics.has_errors() {
 		diagnostics.sort_canonical();
@@ -73,15 +79,13 @@ pub fn compile(document: &GraphDocument, plugins: &PluginRegistry) -> Compilatio
 		let Some(plugin) = plugins.resolve(node.type_id()) else {
 			unreachable!("plugin resolution was completed during semantic analysis");
 		};
+		let contract = contracts
+			.get(&node.id())
+			.expect("contracts were collected during semantic analysis");
 
 		match plugin.lower_node(node) {
 			Ok(lowered) => {
-				if !validate_lowered_operation(
-					node,
-					&plugin.contract(node),
-					&lowered,
-					&mut diagnostics,
-				) {
+				if !validate_lowered_operation(node, contract, &lowered, &mut diagnostics) {
 					continue;
 				}
 				register_port_bindings(node, ir_id, &mut port_bindings, &mut diagnostics);
@@ -356,6 +360,76 @@ fn analyze_data_types(document: &GraphDocument, diagnostics: &mut Diagnostics) {
 	}
 }
 
+fn resolve_capabilities(
+	document: &GraphDocument,
+	contracts: &BTreeMap<krunt_graph_model::NodeId, NodeContract>,
+	diagnostics: &mut Diagnostics,
+) {
+	let mut port_owners = BTreeMap::new();
+	for node in document.nodes() {
+		for port in node.ports() {
+			port_owners.insert(port.id(), node.id());
+		}
+	}
+
+	let mut predecessors: BTreeMap<krunt_graph_model::NodeId, BTreeSet<_>> = BTreeMap::new();
+	for edge in document.edges() {
+		let (Some(from), Some(to)) = (port_owners.get(&edge.from()), port_owners.get(&edge.to()))
+		else {
+			continue;
+		};
+		if from != to {
+			predecessors.entry(*to).or_default().insert(*from);
+		}
+	}
+
+	for node in document.nodes() {
+		let Some(contract) = contracts.get(&node.id()) else {
+			continue;
+		};
+		let mut available = BTreeSet::new();
+		add_capabilities(contract, &mut available);
+		if let Some(node_predecessors) = predecessors.get(&node.id()) {
+			for predecessor in node_predecessors {
+				if let Some(contract) = contracts.get(predecessor) {
+					add_capabilities(contract, &mut available);
+				}
+			}
+		}
+
+		for requirement in contract.requirements() {
+			if available.contains(requirement) {
+				continue;
+			}
+			let related = predecessors
+				.get(&node.id())
+				.into_iter()
+				.flatten()
+				.map(|predecessor| RelatedElement::new(GraphElementId::NODE(*predecessor)))
+				.collect::<Vec<_>>();
+			let diagnostic = Diagnostic::new(
+				DiagnosticCode::new("CAPABILITY.MISSING_REQUIREMENT").unwrap(),
+				Severity::ERROR,
+				CompilerStage::CAPABILITY_RESOLUTION,
+				format!(
+					"Node '{}' requires capability '{}', but no connected provider guarantees it.",
+					node.type_id().as_str(),
+					requirement.as_str(),
+				),
+				GraphElementId::NODE(node.id()),
+			)
+			.unwrap()
+			.with_related(related);
+			diagnostics.push(diagnostic);
+		}
+	}
+}
+
+fn add_capabilities(contract: &NodeContract, available: &mut BTreeSet<CapabilityId>) {
+	available.extend(contract.capabilities().iter().cloned());
+	available.extend(contract.guarantees().iter().cloned());
+}
+
 #[derive(Clone, Copy)]
 struct PortBinding {
 	source_port: PortId,
@@ -594,13 +668,17 @@ mod tests {
 		GraphId, GraphMetadata, NodeId, NodeTypeId, PluginReference, Port, TypeReference,
 	};
 	use krunt_ir::AsyncKind;
-	use krunt_plugin_api::{NodeContract, PluginManifest, PortContract, SemanticPlugin};
+	use krunt_plugin_api::{
+		CapabilityId, NodeContract, PluginManifest, PortContract, SemanticPlugin,
+	};
 
 	struct BackendTestPlugin {
 		manifest: PluginManifest,
 		semantic_error: bool,
 		contract_error: bool,
 		lowered_type_mismatch: bool,
+		capability_provider: bool,
+		capability_requirement: bool,
 	}
 
 	impl SemanticPlugin for BackendTestPlugin {
@@ -617,15 +695,34 @@ mod tests {
 					true,
 				)
 			};
+			let capability = || CapabilityId::new("request.source").unwrap();
 			if node.type_id().as_str() == "test.route" {
 				let outputs = if self.contract_error {
 					vec![execution()]
 				} else {
 					vec![execution(), data()]
 				};
-				NodeContract::new([], outputs, [], [], [], AsyncKind::SYNC, [])
+				let capabilities = if self.capability_provider {
+					vec![capability()]
+				} else {
+					Vec::new()
+				};
+				NodeContract::new([], outputs, [], capabilities, [], AsyncKind::SYNC, [])
 			} else {
-				NodeContract::new([execution(), data()], [], [], [], [], AsyncKind::SYNC, [])
+				let requirements = if self.capability_requirement {
+					vec![capability()]
+				} else {
+					Vec::new()
+				};
+				NodeContract::new(
+					[execution(), data()],
+					[],
+					requirements,
+					[],
+					[],
+					AsyncKind::SYNC,
+					[],
+				)
 			}
 		}
 
@@ -740,17 +837,23 @@ mod tests {
 	}
 
 	fn registry() -> PluginRegistry {
-		registry_with_options(false, false, false)
+		registry_with_options(false, false, false, false, false)
 	}
 
 	fn registry_with_semantic_error(semantic_error: bool) -> PluginRegistry {
-		registry_with_options(semantic_error, false, false)
+		registry_with_options(semantic_error, false, false, false, false)
+	}
+
+	fn registry_with_capabilities(provider: bool, requirement: bool) -> PluginRegistry {
+		registry_with_options(false, false, false, provider, requirement)
 	}
 
 	fn registry_with_options(
 		semantic_error: bool,
 		contract_error: bool,
 		lowered_type_mismatch: bool,
+		capability_provider: bool,
+		capability_requirement: bool,
 	) -> PluginRegistry {
 		let manifest = PluginManifest::new(
 			PluginReference::new("test-backend", "0.1.0").unwrap(),
@@ -767,6 +870,8 @@ mod tests {
 				semantic_error,
 				contract_error,
 				lowered_type_mismatch,
+				capability_provider,
+				capability_requirement,
 			}))
 			.unwrap();
 		registry
@@ -813,7 +918,10 @@ mod tests {
 
 	#[test]
 	fn graph_contract_violations_block_ir_generation() {
-		let result = compile(&document(), &registry_with_options(false, true, false));
+		let result = compile(
+			&document(),
+			&registry_with_options(false, true, false, false, false),
+		);
 
 		assert!(result.has_errors());
 		assert!(result.ir().is_none());
@@ -829,7 +937,10 @@ mod tests {
 
 	#[test]
 	fn lowered_operation_contract_violations_block_ir_generation() {
-		let result = compile(&document(), &registry_with_options(false, false, true));
+		let result = compile(
+			&document(),
+			&registry_with_options(false, false, true, false, false),
+		);
 
 		assert!(result.has_errors());
 		assert!(result.ir().is_none());
@@ -841,6 +952,26 @@ mod tests {
 			result.diagnostics().as_slice()[0].primary(),
 			GraphElementId::NODE(krunt_graph_model::NodeId::new(1).unwrap())
 		);
+	}
+
+	#[test]
+	fn missing_capability_requirements_block_ir_generation() {
+		let result = compile(&document(), &registry_with_capabilities(false, true));
+
+		assert!(result.has_errors());
+		assert!(result.ir().is_none());
+		let diagnostic = &result.diagnostics().as_slice()[0];
+		assert_eq!(diagnostic.code().as_str(), "CAPABILITY.MISSING_REQUIREMENT");
+		assert_eq!(diagnostic.stage(), CompilerStage::CAPABILITY_RESOLUTION);
+		assert_eq!(diagnostic.related().len(), 1);
+	}
+
+	#[test]
+	fn directly_connected_capabilities_satisfy_requirements() {
+		let result = compile(&document(), &registry_with_capabilities(true, true));
+
+		assert!(!result.has_errors());
+		assert!(result.ir().is_some());
 	}
 
 	#[test]
