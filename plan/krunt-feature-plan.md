@@ -131,8 +131,10 @@ The first IR slice now exists in `crates/ir`:
 - [x] Build immutable graphs through a validating builder.
 - [x] Produce deterministic node and edge ordering and JSON serialization.
 - [x] Reject duplicate nodes, dangling edges, invalid ports, and type mismatches.
-- [ ] Add compiler orchestration, diagnostics, cycle validation, and lowering
-      from the canonical graph model.
+- [x] Mark semantic entry nodes and run deterministic unreachable-operation
+      elimination while preserving live data producers.
+- [ ] Add constant folding, dependency pruning, and further semantic-preserving
+      optimization passes.
 
 ### Compiler-boundary checkpoint
 
@@ -160,6 +162,7 @@ Task 3 is implemented in `crates/compiler`:
 - [x] Add capability resolution and initial whole-graph validation.
 - [x] Add required-input dependency validation and structured Loop cycle
       semantics.
+- [x] Invoke the initial deterministic IR optimization pass.
 
 ### Contract-validation checkpoint
 

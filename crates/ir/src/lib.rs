@@ -309,6 +309,90 @@ impl IRBuilder {
 	}
 }
 
+/// Report from deterministic IR reachability elimination.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct OptimizationReport {
+	removed_nodes: Vec<IrNodeId>,
+}
+
+impl OptimizationReport {
+	pub fn removed_nodes(&self) -> &[IrNodeId] {
+		&self.removed_nodes
+	}
+}
+
+/// Remove IR operations that cannot contribute to an explicit entry operation.
+///
+/// The pass preserves control-reachable operations and recursively preserves
+/// producers of data consumed by those operations. If the graph has no ENTRY
+/// operation, it is returned unchanged because the optimizer cannot establish
+/// a safe execution root.
+pub fn eliminate_unreachable_nodes(
+	graph: IRGraph,
+) -> Result<(IRGraph, OptimizationReport), BuildError> {
+	let entry_nodes: Vec<_> = graph
+		.nodes
+		.iter()
+		.filter(|node| matches!(&node.op, IROp::ENTRY { .. }))
+		.map(|node| node.id)
+		.collect();
+	if entry_nodes.is_empty() {
+		return Ok((
+			graph,
+			OptimizationReport {
+				removed_nodes: Vec::new(),
+			},
+		));
+	}
+
+	let mut reachable = BTreeMap::new();
+	let mut worklist = entry_nodes;
+	while let Some(node) = worklist.pop() {
+		if reachable.insert(node, ()).is_some() {
+			continue;
+		}
+		for edge in &graph.control_edges {
+			if edge.from == node {
+				worklist.push(edge.to);
+			}
+		}
+		for edge in &graph.data_edges {
+			if edge.to.node == node {
+				worklist.push(edge.from.node);
+			}
+		}
+	}
+
+	let removed_nodes: Vec<_> = graph
+		.nodes
+		.iter()
+		.filter(|node| !reachable.contains_key(&node.id))
+		.map(|node| node.id)
+		.collect();
+	if removed_nodes.is_empty() {
+		return Ok((graph, OptimizationReport { removed_nodes }));
+	}
+
+	let mut builder = IRBuilder::new();
+	for node in &graph.nodes {
+		if reachable.contains_key(&node.id) {
+			builder.add_node(node.clone())?;
+		}
+	}
+	for edge in &graph.control_edges {
+		if reachable.contains_key(&edge.from) && reachable.contains_key(&edge.to) {
+			builder.add_control_edge(*edge)?;
+		}
+	}
+	for edge in &graph.data_edges {
+		if reachable.contains_key(&edge.from.node) && reachable.contains_key(&edge.to.node) {
+			builder.add_data_edge(*edge)?;
+		}
+	}
+
+	Ok((builder.build()?, OptimizationReport { removed_nodes }))
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -331,6 +415,14 @@ mod tests {
 			effects: Vec::new(),
 			source: SourceMap::node(GraphNodeId(source)),
 		}
+	}
+
+	fn entry_operation(name: &str, id: u32, source: u64) -> IRNode {
+		let mut node = operation(name, id, source, &[], &[]);
+		node.op = IROp::ENTRY {
+			name: OperationId::new(name).unwrap(),
+		};
+		node
 	}
 
 	#[test]
@@ -513,6 +605,92 @@ mod tests {
 			serde_json::to_string(&first).unwrap(),
 			serde_json::to_string(&second).unwrap()
 		);
+	}
+
+	#[test]
+	fn eliminates_unreachable_nodes_from_an_explicit_entry() {
+		let mut builder = IRBuilder::new();
+		builder.add_node(entry_operation("route", 1, 10)).unwrap();
+		builder
+			.add_node(operation("live", 2, 20, &[], &[]))
+			.unwrap();
+		builder
+			.add_node(operation("dead", 3, 30, &[], &[]))
+			.unwrap();
+		builder
+			.add_control_edge(ControlEdge {
+				from: IrNodeId(1),
+				to: IrNodeId(2),
+			})
+			.unwrap();
+
+		let graph = builder.build().unwrap();
+		let (optimized, report) = eliminate_unreachable_nodes(graph).unwrap();
+
+		assert_eq!(report.removed_nodes(), &[IrNodeId(3)]);
+		assert_eq!(optimized.nodes().len(), 2);
+		assert!(optimized.node(IrNodeId(1)).is_some());
+		assert!(optimized.node(IrNodeId(2)).is_some());
+		assert!(optimized.node(IrNodeId(3)).is_none());
+		assert_eq!(optimized.control_edges().len(), 1);
+		assert_eq!(
+			optimized.node(IrNodeId(2)).unwrap().source.primary,
+			GraphElementId::NODE(GraphNodeId(20))
+		);
+	}
+
+	#[test]
+	fn retains_data_producers_required_by_reachable_operations() {
+		let mut builder = IRBuilder::new();
+		builder.add_node(entry_operation("route", 1, 10)).unwrap();
+		builder
+			.add_node(operation("consumer", 2, 20, &["User"], &[]))
+			.unwrap();
+		builder
+			.add_node(operation("producer", 3, 30, &[], &["User"]))
+			.unwrap();
+		builder
+			.add_control_edge(ControlEdge {
+				from: IrNodeId(1),
+				to: IrNodeId(2),
+			})
+			.unwrap();
+		builder
+			.add_data_edge(DataEdge {
+				from: PortRef {
+					node: IrNodeId(3),
+					index: 0,
+				},
+				to: PortRef {
+					node: IrNodeId(2),
+					index: 0,
+				},
+			})
+			.unwrap();
+
+		let graph = builder.build().unwrap();
+		let (optimized, report) = eliminate_unreachable_nodes(graph).unwrap();
+
+		assert!(report.removed_nodes().is_empty());
+		assert_eq!(optimized.nodes().len(), 3);
+		assert_eq!(optimized.data_edges().len(), 1);
+	}
+
+	#[test]
+	fn graphs_without_explicit_entries_are_preserved_conservatively() {
+		let mut builder = IRBuilder::new();
+		builder
+			.add_node(operation("first", 1, 10, &[], &[]))
+			.unwrap();
+		builder
+			.add_node(operation("second", 2, 20, &[], &[]))
+			.unwrap();
+
+		let graph = builder.build().unwrap();
+		let (optimized, report) = eliminate_unreachable_nodes(graph.clone()).unwrap();
+
+		assert_eq!(optimized, graph);
+		assert!(report.removed_nodes().is_empty());
 	}
 
 	#[test]

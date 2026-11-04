@@ -9,8 +9,8 @@ use krunt_diagnostics::{
 };
 use krunt_graph_model::{EdgeKind, GraphDocument, Node, PortDirection, PortId, PortKind};
 use krunt_ir::{
-	BuildError, ControlEdge, DataEdge, GraphNodeId, IRBuilder, IRGraph, IRNode, IROp, PortRef,
-	SourceMap,
+	eliminate_unreachable_nodes, BuildError, ControlEdge, DataEdge, GraphNodeId, IRBuilder,
+	IRGraph, IRNode, IROp, PortRef, SourceMap,
 };
 use krunt_plugin_api::{CapabilityId, LoweredOperation, NodeContract, PluginRegistry};
 use krunt_type_system::{check_assignable, Type};
@@ -92,7 +92,7 @@ pub fn compile(document: &GraphDocument, plugins: &PluginRegistry) -> Compilatio
 					continue;
 				}
 				register_port_bindings(node, ir_id, &mut port_bindings, &mut diagnostics);
-				let ir_node = ir_node(node, ir_id, lowered);
+				let ir_node = ir_node(node, ir_id, lowered, contract);
 				if let Err(error) = builder.add_node(ir_node) {
 					diagnostics.push(ir_build_diagnostic(
 						GraphElementId::node(
@@ -131,7 +131,21 @@ pub fn compile(document: &GraphDocument, plugins: &PluginRegistry) -> Compilatio
 		None
 	} else {
 		match builder.build() {
-			Ok(ir) => Some(ir),
+			Ok(ir) => match eliminate_unreachable_nodes(ir) {
+				Ok((ir, _report)) => Some(ir),
+				Err(error) => {
+					diagnostics.push(optimization_diagnostic(
+						GraphElementId::GRAPH(
+							krunt_graph_model::GraphId::new(
+								document.metadata().graph_id().as_u64(),
+							)
+							.unwrap(),
+						),
+						error,
+					));
+					None
+				}
+			},
 			Err(error) => {
 				diagnostics.push(ir_build_diagnostic(
 					GraphElementId::GRAPH(
@@ -749,11 +763,22 @@ fn add_data_edge(
 	}
 }
 
-fn ir_node(node: &Node, id: krunt_ir::IrNodeId, lowered: LoweredOperation) -> IRNode {
+fn ir_node(
+	node: &Node,
+	id: krunt_ir::IrNodeId,
+	lowered: LoweredOperation,
+	contract: &NodeContract,
+) -> IRNode {
 	IRNode {
 		id,
-		op: IROp::OPERATION {
-			name: lowered.operation().clone(),
+		op: if contract.is_entry() {
+			IROp::ENTRY {
+				name: lowered.operation().clone(),
+			}
+		} else {
+			IROp::OPERATION {
+				name: lowered.operation().clone(),
+			}
 		},
 		input_types: lowered.input_types().to_vec(),
 		output_types: lowered.output_types().to_vec(),
@@ -840,6 +865,17 @@ fn ir_build_diagnostic(primary: GraphElementId, error: BuildError) -> Diagnostic
 		Severity::ERROR,
 		CompilerStage::LOWERING,
 		format!("The lowered operation violated an IR invariant: {error:?}."),
+		primary,
+	)
+	.unwrap()
+}
+
+fn optimization_diagnostic(primary: GraphElementId, error: BuildError) -> Diagnostic {
+	Diagnostic::new(
+		DiagnosticCode::new("OPTIMIZATION.INVALID_IR").unwrap(),
+		Severity::ERROR,
+		CompilerStage::OPTIMIZATION,
+		format!("The IR optimization pass found an invalid graph: {error:?}."),
 		primary,
 	)
 	.unwrap()
@@ -1148,6 +1184,10 @@ mod tests {
 		assert_eq!(result.ir().unwrap().nodes().len(), 2);
 		assert_eq!(result.ir().unwrap().control_edges().len(), 1);
 		assert_eq!(result.ir().unwrap().data_edges().len(), 1);
+		assert!(matches!(
+			result.ir().unwrap().node(krunt_ir::IrNodeId(1)).unwrap().op,
+			IROp::ENTRY { .. }
+		));
 	}
 
 	#[test]
