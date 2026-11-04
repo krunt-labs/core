@@ -12,7 +12,7 @@ use krunt_ir::{
 	BuildError, ControlEdge, DataEdge, GraphNodeId, IRBuilder, IRGraph, IRNode, IROp, PortRef,
 	SourceMap,
 };
-use krunt_plugin_api::{LoweredOperation, PluginRegistry};
+use krunt_plugin_api::{LoweredOperation, NodeContract, PluginRegistry};
 use krunt_type_system::{check_assignable, Type};
 use std::collections::BTreeMap;
 
@@ -51,6 +51,7 @@ pub fn compile(document: &GraphDocument, plugins: &PluginRegistry) -> Compilatio
 			continue;
 		};
 		diagnostics.extend(plugin.analyze_node(node));
+		validate_node_contract(node, &plugin.contract(node), &mut diagnostics);
 	}
 
 	if !diagnostics.has_errors() {
@@ -75,6 +76,14 @@ pub fn compile(document: &GraphDocument, plugins: &PluginRegistry) -> Compilatio
 
 		match plugin.lower_node(node) {
 			Ok(lowered) => {
+				if !validate_lowered_operation(
+					node,
+					&plugin.contract(node),
+					&lowered,
+					&mut diagnostics,
+				) {
+					continue;
+				}
 				register_port_bindings(node, ir_id, &mut port_bindings, &mut diagnostics);
 				let ir_node = ir_node(node, ir_id, lowered);
 				if let Err(error) = builder.add_node(ir_node) {
@@ -131,6 +140,161 @@ pub fn compile(document: &GraphDocument, plugins: &PluginRegistry) -> Compilatio
 
 	diagnostics.sort_canonical();
 	CompilationResult { ir, diagnostics }
+}
+
+fn validate_node_contract(node: &Node, contract: &NodeContract, diagnostics: &mut Diagnostics) {
+	let inputs: Vec<_> = node
+		.ports()
+		.iter()
+		.filter(|port| port.direction() == PortDirection::INPUT)
+		.collect();
+	let outputs: Vec<_> = node
+		.ports()
+		.iter()
+		.filter(|port| port.direction() == PortDirection::OUTPUT)
+		.collect();
+	validate_port_contracts(node, &inputs, contract.inputs(), "input", diagnostics);
+	validate_port_contracts(node, &outputs, contract.outputs(), "output", diagnostics);
+}
+
+fn validate_port_contracts(
+	node: &Node,
+	actual: &[&krunt_graph_model::Port],
+	expected: &[krunt_plugin_api::PortContract],
+	label: &str,
+	diagnostics: &mut Diagnostics,
+) {
+	let required_count = expected.iter().filter(|port| port.required()).count();
+	if actual.len() < required_count || actual.len() > expected.len() {
+		diagnostics.push(contract_diagnostic(
+			"CONTRACT.PORT_COUNT",
+			format!(
+				"Node '{}' has {} {label} ports, but its contract requires {} to {}.",
+				node.type_id().as_str(),
+				actual.len(),
+				required_count,
+				expected.len(),
+			),
+			GraphElementId::NODE(krunt_graph_model::NodeId::new(node.id().as_u64()).unwrap()),
+		));
+	}
+
+	for (actual_port, expected_port) in actual.iter().zip(expected) {
+		if actual_port.kind() != expected_port.kind() {
+			diagnostics.push(contract_diagnostic(
+				"CONTRACT.PORT_KIND",
+				format!(
+					"Port {} has kind {:?}, but its contract requires {:?}.",
+					actual_port.id().as_u64(),
+					actual_port.kind(),
+					expected_port.kind(),
+				),
+				GraphElementId::PORT(actual_port.id()),
+			));
+		}
+	}
+}
+
+fn validate_lowered_operation(
+	node: &Node,
+	contract: &NodeContract,
+	lowered: &LoweredOperation,
+	diagnostics: &mut Diagnostics,
+) -> bool {
+	let expected_inputs: Vec<_> = contract
+		.inputs()
+		.iter()
+		.filter(|port| port.kind() == PortKind::DATA)
+		.collect();
+	let expected_outputs: Vec<_> = contract
+		.outputs()
+		.iter()
+		.filter(|port| port.kind() == PortKind::DATA)
+		.collect();
+	let mut valid = true;
+
+	if lowered.input_types().len() != expected_inputs.len() {
+		valid = false;
+		diagnostics.push(contract_diagnostic(
+			"CONTRACT.LOWERED_INPUTS",
+			format!(
+				"Node '{}' lowered {} input types, but its contract declares {} data inputs.",
+				node.type_id().as_str(),
+				lowered.input_types().len(),
+				expected_inputs.len(),
+			),
+			GraphElementId::NODE(krunt_graph_model::NodeId::new(node.id().as_u64()).unwrap()),
+		));
+	}
+	if lowered.output_types().len() != expected_outputs.len() {
+		valid = false;
+		diagnostics.push(contract_diagnostic(
+			"CONTRACT.LOWERED_OUTPUTS",
+			format!(
+				"Node '{}' lowered {} output types, but its contract declares {} data outputs.",
+				node.type_id().as_str(),
+				lowered.output_types().len(),
+				expected_outputs.len(),
+			),
+			GraphElementId::NODE(krunt_graph_model::NodeId::new(node.id().as_u64()).unwrap()),
+		));
+	}
+
+	for (actual, expected) in lowered.input_types().iter().zip(expected_inputs) {
+		if expected
+			.type_id()
+			.is_some_and(|expected| expected != actual)
+		{
+			valid = false;
+			diagnostics.push(contract_diagnostic(
+				"CONTRACT.LOWERED_TYPE",
+				format!(
+					"Node '{}' lowered an input type inconsistent with its contract.",
+					node.type_id().as_str()
+				),
+				GraphElementId::NODE(krunt_graph_model::NodeId::new(node.id().as_u64()).unwrap()),
+			));
+		}
+	}
+	for (actual, expected) in lowered.output_types().iter().zip(expected_outputs) {
+		if expected
+			.type_id()
+			.is_some_and(|expected| expected != actual)
+		{
+			valid = false;
+			diagnostics.push(contract_diagnostic(
+				"CONTRACT.LOWERED_TYPE",
+				format!(
+					"Node '{}' lowered an output type inconsistent with its contract.",
+					node.type_id().as_str()
+				),
+				GraphElementId::NODE(krunt_graph_model::NodeId::new(node.id().as_u64()).unwrap()),
+			));
+		}
+	}
+	if lowered.async_kind() != contract.async_kind() {
+		valid = false;
+		diagnostics.push(contract_diagnostic(
+			"CONTRACT.ASYNC_KIND",
+			format!(
+				"Node '{}' lowered execution semantics inconsistent with its contract.",
+				node.type_id().as_str()
+			),
+			GraphElementId::NODE(krunt_graph_model::NodeId::new(node.id().as_u64()).unwrap()),
+		));
+	}
+	if lowered.effects() != contract.effects() {
+		valid = false;
+		diagnostics.push(contract_diagnostic(
+			"CONTRACT.EFFECTS",
+			format!(
+				"Node '{}' lowered side effects inconsistent with its contract.",
+				node.type_id().as_str()
+			),
+			GraphElementId::NODE(krunt_graph_model::NodeId::new(node.id().as_u64()).unwrap()),
+		));
+	}
+	valid
 }
 
 #[derive(Clone)]
@@ -355,6 +519,17 @@ fn missing_plugin_diagnostic(node: &Node) -> Diagnostic {
 	.unwrap()
 }
 
+fn contract_diagnostic(code: &str, message: String, primary: GraphElementId) -> Diagnostic {
+	Diagnostic::new(
+		DiagnosticCode::new(code).unwrap(),
+		Severity::ERROR,
+		CompilerStage::CONTRACT_VALIDATION,
+		message,
+		primary,
+	)
+	.unwrap()
+}
+
 fn missing_port_diagnostic(port: PortId) -> Diagnostic {
 	Diagnostic::new(
 		DiagnosticCode::new("LOWERING.MISSING_PORT").unwrap(),
@@ -419,16 +594,39 @@ mod tests {
 		GraphId, GraphMetadata, NodeId, NodeTypeId, PluginReference, Port, TypeReference,
 	};
 	use krunt_ir::AsyncKind;
-	use krunt_plugin_api::{PluginManifest, SemanticPlugin};
+	use krunt_plugin_api::{NodeContract, PluginManifest, PortContract, SemanticPlugin};
 
 	struct BackendTestPlugin {
 		manifest: PluginManifest,
 		semantic_error: bool,
+		contract_error: bool,
+		lowered_type_mismatch: bool,
 	}
 
 	impl SemanticPlugin for BackendTestPlugin {
 		fn manifest(&self) -> &PluginManifest {
 			&self.manifest
+		}
+
+		fn contract(&self, node: &Node) -> NodeContract {
+			let execution = || PortContract::new(PortKind::EXECUTION, None, true);
+			let data = || {
+				PortContract::new(
+					PortKind::DATA,
+					Some(krunt_ir::TypeId::new("Request").unwrap()),
+					true,
+				)
+			};
+			if node.type_id().as_str() == "test.route" {
+				let outputs = if self.contract_error {
+					vec![execution()]
+				} else {
+					vec![execution(), data()]
+				};
+				NodeContract::new([], outputs, [], [], [], AsyncKind::SYNC, [])
+			} else {
+				NodeContract::new([execution(), data()], [], [], [], [], AsyncKind::SYNC, [])
+			}
 		}
 
 		fn analyze_node(&self, node: &Node) -> Vec<Diagnostic> {
@@ -449,7 +647,12 @@ mod tests {
 
 		fn lower_node(&self, node: &Node) -> Result<LoweredOperation, Vec<Diagnostic>> {
 			let (inputs, outputs) = if node.type_id().as_str() == "test.route" {
-				(vec![], vec![krunt_ir::TypeId::new("Request").unwrap()])
+				let output_type = if self.lowered_type_mismatch {
+					"Response"
+				} else {
+					"Request"
+				};
+				(vec![], vec![krunt_ir::TypeId::new(output_type).unwrap()])
 			} else {
 				(vec![krunt_ir::TypeId::new("Request").unwrap()], vec![])
 			};
@@ -537,10 +740,18 @@ mod tests {
 	}
 
 	fn registry() -> PluginRegistry {
-		registry_with_semantic_error(false)
+		registry_with_options(false, false, false)
 	}
 
 	fn registry_with_semantic_error(semantic_error: bool) -> PluginRegistry {
+		registry_with_options(semantic_error, false, false)
+	}
+
+	fn registry_with_options(
+		semantic_error: bool,
+		contract_error: bool,
+		lowered_type_mismatch: bool,
+	) -> PluginRegistry {
 		let manifest = PluginManifest::new(
 			PluginReference::new("test-backend", "0.1.0").unwrap(),
 			[
@@ -554,6 +765,8 @@ mod tests {
 			.register(Box::new(BackendTestPlugin {
 				manifest,
 				semantic_error,
+				contract_error,
+				lowered_type_mismatch,
 			}))
 			.unwrap();
 		registry
@@ -595,6 +808,38 @@ mod tests {
 		assert_eq!(
 			result.diagnostics().as_slice()[0].stage(),
 			CompilerStage::SEMANTIC_ANALYSIS
+		);
+	}
+
+	#[test]
+	fn graph_contract_violations_block_ir_generation() {
+		let result = compile(&document(), &registry_with_options(false, true, false));
+
+		assert!(result.has_errors());
+		assert!(result.ir().is_none());
+		assert_eq!(
+			result.diagnostics().as_slice()[0].code().as_str(),
+			"CONTRACT.PORT_COUNT"
+		);
+		assert_eq!(
+			result.diagnostics().as_slice()[0].stage(),
+			CompilerStage::CONTRACT_VALIDATION
+		);
+	}
+
+	#[test]
+	fn lowered_operation_contract_violations_block_ir_generation() {
+		let result = compile(&document(), &registry_with_options(false, false, true));
+
+		assert!(result.has_errors());
+		assert!(result.ir().is_none());
+		assert_eq!(
+			result.diagnostics().as_slice()[0].code().as_str(),
+			"CONTRACT.LOWERED_TYPE"
+		);
+		assert_eq!(
+			result.diagnostics().as_slice()[0].primary(),
+			GraphElementId::NODE(krunt_graph_model::NodeId::new(1).unwrap())
 		);
 	}
 

@@ -156,7 +156,22 @@ Task 3 is implemented in `crates/compiler`:
 - [x] Block IR output when compilation has error-severity diagnostics.
 - [x] Run plugin semantic analysis before lowering.
 - [x] Run initial data-edge type analysis before lowering.
-- [ ] Add contract validation, capability checks, and whole-graph validation.
+- [x] Add initial contract validation before IR construction.
+- [ ] Add capability resolution and whole-graph validation.
+
+### Contract-validation checkpoint
+
+The first target-neutral contract slice is implemented across
+`crates/plugin-api` and `crates/compiler`:
+
+- [x] Declare input and output port shapes in semantic plugins.
+- [x] Declare requirements, capabilities, guarantees, execution semantics, and
+      side effects in node contracts.
+- [x] Validate graph port counts and kinds before lowering.
+- [x] Validate lowered data types, async semantics, and effects against the
+      declared contract before IR construction.
+- [ ] Resolve capabilities and requirements across connected nodes.
+- [ ] Add whole-graph reachability, dependency, and cycle validation.
 
 **Exit criteria:** repeated compilation produces identical diagnostics and IR;
 invalid graphs never reach a generator.

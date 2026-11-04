@@ -5,7 +5,7 @@
 //! generated files, or a specific framework.
 
 use krunt_diagnostics::Diagnostic;
-use krunt_graph_model::{Node, NodeTypeId, PluginReference};
+use krunt_graph_model::{Node, NodeTypeId, PluginReference, PortKind};
 use krunt_ir::{AsyncKind, EffectId, OperationId, TypeId};
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -99,9 +99,133 @@ impl LoweredOperation {
 	}
 }
 
+/// A capability or guarantee declared by a semantic contract.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+pub struct CapabilityId(String);
+
+impl CapabilityId {
+	pub fn new(value: impl Into<String>) -> Result<Self, ContractError> {
+		let value = value.into();
+		if value.trim().is_empty() {
+			return Err(ContractError::EMPTY_CAPABILITY);
+		}
+		Ok(Self(value))
+	}
+
+	pub fn as_str(&self) -> &str {
+		&self.0
+	}
+}
+
+/// The expected shape of one input or output port.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct PortContract {
+	kind: PortKind,
+	type_id: Option<TypeId>,
+	required: bool,
+}
+
+impl PortContract {
+	pub fn new(kind: PortKind, type_id: Option<TypeId>, required: bool) -> Self {
+		Self {
+			kind,
+			type_id,
+			required,
+		}
+	}
+
+	pub fn kind(&self) -> PortKind {
+		self.kind
+	}
+
+	pub fn type_id(&self) -> Option<&TypeId> {
+		self.type_id.as_ref()
+	}
+
+	pub fn required(&self) -> bool {
+		self.required
+	}
+}
+
+/// Target-neutral semantic requirements and guarantees for one node type.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct NodeContract {
+	inputs: Vec<PortContract>,
+	outputs: Vec<PortContract>,
+	requirements: Vec<CapabilityId>,
+	capabilities: Vec<CapabilityId>,
+	guarantees: Vec<CapabilityId>,
+	async_kind: AsyncKind,
+	effects: Vec<EffectId>,
+}
+
+impl NodeContract {
+	pub fn new(
+		inputs: impl IntoIterator<Item = PortContract>,
+		outputs: impl IntoIterator<Item = PortContract>,
+		requirements: impl IntoIterator<Item = CapabilityId>,
+		capabilities: impl IntoIterator<Item = CapabilityId>,
+		guarantees: impl IntoIterator<Item = CapabilityId>,
+		async_kind: AsyncKind,
+		effects: impl IntoIterator<Item = EffectId>,
+	) -> Self {
+		let mut requirements: Vec<_> = requirements.into_iter().collect();
+		requirements.sort();
+		requirements.dedup();
+		let mut capabilities: Vec<_> = capabilities.into_iter().collect();
+		capabilities.sort();
+		capabilities.dedup();
+		let mut guarantees: Vec<_> = guarantees.into_iter().collect();
+		guarantees.sort();
+		guarantees.dedup();
+		let mut effects: Vec<_> = effects.into_iter().collect();
+		effects.sort();
+		effects.dedup();
+		Self {
+			inputs: inputs.into_iter().collect(),
+			outputs: outputs.into_iter().collect(),
+			requirements,
+			capabilities,
+			guarantees,
+			async_kind,
+			effects,
+		}
+	}
+
+	pub fn inputs(&self) -> &[PortContract] {
+		&self.inputs
+	}
+
+	pub fn outputs(&self) -> &[PortContract] {
+		&self.outputs
+	}
+
+	pub fn requirements(&self) -> &[CapabilityId] {
+		&self.requirements
+	}
+
+	pub fn capabilities(&self) -> &[CapabilityId] {
+		&self.capabilities
+	}
+
+	pub fn guarantees(&self) -> &[CapabilityId] {
+		&self.guarantees
+	}
+
+	pub fn async_kind(&self) -> AsyncKind {
+		self.async_kind
+	}
+
+	pub fn effects(&self) -> &[EffectId] {
+		&self.effects
+	}
+}
+
 /// Domain plugin implementation supplied to the compiler.
 pub trait SemanticPlugin: Send + Sync {
 	fn manifest(&self) -> &PluginManifest;
+
+	fn contract(&self, node: &Node) -> NodeContract;
 
 	fn analyze_node(&self, _node: &Node) -> Vec<Diagnostic> {
 		Vec::new()
@@ -171,6 +295,21 @@ pub enum PluginApiError {
 	},
 }
 
+/// Errors raised while defining a target-neutral node contract.
+#[allow(non_camel_case_types)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ContractError {
+	EMPTY_CAPABILITY,
+}
+
+impl fmt::Display for ContractError {
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+		write!(formatter, "{self:?}")
+	}
+}
+
+impl std::error::Error for ContractError {}
+
 impl fmt::Display for PluginApiError {
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		write!(formatter, "{self:?}")
@@ -192,6 +331,10 @@ mod tests {
 	impl SemanticPlugin for TestPlugin {
 		fn manifest(&self) -> &PluginManifest {
 			&self.manifest
+		}
+
+		fn contract(&self, _node: &Node) -> NodeContract {
+			NodeContract::new([], [], [], [], [], AsyncKind::SYNC, [])
 		}
 
 		fn lower_node(&self, _node: &Node) -> Result<LoweredOperation, Vec<Diagnostic>> {
@@ -227,6 +370,39 @@ mod tests {
 		.unwrap();
 
 		assert_eq!(manifest.supported_node_types()[0].as_str(), "backend.a");
+	}
+
+	#[test]
+	fn contracts_canonicalize_capabilities_and_effects() {
+		let contract = NodeContract::new(
+			[PortContract::new(PortKind::DATA, None, true)],
+			[],
+			[
+				CapabilityId::new("storage.read").unwrap(),
+				CapabilityId::new("async").unwrap(),
+				CapabilityId::new("storage.read").unwrap(),
+			],
+			[
+				CapabilityId::new("pure").unwrap(),
+				CapabilityId::new("pure").unwrap(),
+			],
+			[],
+			AsyncKind::SYNC,
+			[
+				EffectId::new("database.read").unwrap(),
+				EffectId::new("database.read").unwrap(),
+			],
+		);
+
+		assert_eq!(contract.inputs().len(), 1);
+		assert_eq!(contract.requirements().len(), 2);
+		assert_eq!(contract.capabilities().len(), 1);
+		assert_eq!(contract.effects().len(), 1);
+	}
+
+	#[test]
+	fn empty_capability_ids_are_rejected() {
+		assert_eq!(CapabilityId::new(" "), Err(ContractError::EMPTY_CAPABILITY));
 	}
 
 	#[test]
