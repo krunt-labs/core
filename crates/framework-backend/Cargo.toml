@@ -1,0 +1,6 @@
+[package]
+name = "krunt-framework-backend"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Pluggable framework-backend contracts and generated project output for Krunt"

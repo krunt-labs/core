@@ -9,6 +9,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
+name = "krunt-codegen-nestjs"
+version = "0.1.0"
+dependencies = [
+ "krunt-codegen-typescript",
+ "krunt-framework-backend",
+ "krunt-ir",
+ "serde_json",
+]
+
+[[package]]
+name = "krunt-codegen-typescript"
+version = "0.1.0"
+dependencies = [
+ "krunt-ir",
+ "krunt-language-backend",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "krunt-compiler"
 version = "0.1.0"
 dependencies = [
@@ -29,6 +49,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "krunt-framework-backend"
+version = "0.1.0"
+
+[[package]]
 name = "krunt-graph-model"
 version = "0.1.0"
 dependencies = [
@@ -42,6 +66,13 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "krunt-language-backend"
+version = "0.1.0"
+dependencies = [
+ "krunt-ir",
 ]
 
 [[package]]

@@ -7,6 +7,10 @@ members = [
 	"crates/plugin-api",
 	"crates/compiler",
 	"crates/type-system",
+	"crates/language-backend",
+	"crates/codegen-typescript",
+	"crates/framework-backend",
+	"crates/codegen-nestjs",
 ]
 
 [workspace.package]

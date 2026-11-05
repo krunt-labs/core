@@ -1,0 +1,14 @@
+[package]
+name = "krunt-codegen-nestjs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Deterministic NestJS framework backend for Krunt"
+
+[dependencies]
+krunt-codegen-typescript = { path = "../codegen-typescript" }
+krunt-framework-backend = { path = "../framework-backend" }
+
+[dev-dependencies]
+krunt-ir = { path = "../ir" }
+serde_json = "1"

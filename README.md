@@ -65,7 +65,9 @@ Versioned graph document
 → whole-graph validation
 → canonical IR lowering
 → optimization
-→ TypeScript generation
+→ TypeScript language IR
+→ TypeScript source rendering
+→ NestJS framework lowering
 → generated project
 ```
 
@@ -112,7 +114,10 @@ crates/
   krunt-ir/             Validated canonical IR
   compiler-passes/      Deterministic optimization passes
   backend-dsl/          Backend semantics and lowering
-  codegen-typescript/   TypeScript project generation
+  language-backend/     Pluggable language-backend contract
+  codegen-typescript/   TypeScript language IR and project generation
+  framework-backend/    Generated-project contract and file ownership
+  codegen-nestjs/       NestJS project scaffold and framework adapter
   compiler-cli/         Command-line adapter
   compiler-wasm/        Optional browser validation adapter
 ```

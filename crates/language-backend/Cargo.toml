@@ -1,0 +1,9 @@
+[package]
+name = "krunt-language-backend"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Pluggable language-backend contracts for Krunt"
+
+[dependencies]
+krunt-ir = { path = "../ir" }
