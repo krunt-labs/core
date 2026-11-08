@@ -37,6 +37,17 @@ impl Type {
 		Ok(Self::NAMED(TypeName::new(value)?))
 	}
 
+	/// Parse a graph-facing type reference, including the open response-body
+	/// type used by nodes whose payload is supplied by the graph.
+	pub fn from_reference(value: impl Into<String>) -> Result<Self, TypeError> {
+		let value = value.into();
+		if value.eq_ignore_ascii_case("any") {
+			Ok(Self::ANY)
+		} else {
+			Self::named(value)
+		}
+	}
+
 	pub fn as_name(&self) -> Option<&str> {
 		match self {
 			Self::NAMED(name) => Some(name.as_str()),
@@ -123,5 +134,14 @@ mod tests {
 	#[test]
 	fn empty_type_names_are_rejected() {
 		assert_eq!(TypeName::new(" "), Err(TypeError::EMPTY_NAME));
+	}
+
+	#[test]
+	fn graph_references_parse_any_as_an_open_type() {
+		assert_eq!(Type::from_reference("ANY").unwrap(), Type::ANY);
+		assert_eq!(
+			Type::from_reference("User").unwrap(),
+			Type::named("User").unwrap()
+		);
 	}
 }

@@ -330,7 +330,7 @@ fn analyze_data_types(document: &GraphDocument, diagnostics: &mut Diagnostics) {
 	for node in document.nodes() {
 		for port in node.ports() {
 			let type_reference = port.type_reference().map(|reference| {
-				Type::named(reference.as_str()).unwrap_or_else(|_| {
+				Type::from_reference(reference.as_str()).unwrap_or_else(|_| {
 					unreachable!("validated graph type references cannot be empty")
 				})
 			});

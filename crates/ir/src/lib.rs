@@ -286,7 +286,7 @@ impl IRBuilder {
 				.input_types
 				.get(usize::from(edge.to.index))
 				.ok_or(BuildError::InvalidInputPort(edge.to))?;
-			if from_type != to_type {
+			if to_type.as_str() != "ANY" && from_type != to_type {
 				return Err(BuildError::TypeMismatch {
 					from: from_type.clone(),
 					to: to_type.clone(),
@@ -580,6 +580,31 @@ mod tests {
 			builder.build(),
 			Err(BuildError::TypeMismatch { .. })
 		));
+	}
+
+	#[test]
+	fn accepts_concrete_values_for_any_data_inputs() {
+		let mut builder = IRBuilder::new();
+		builder
+			.add_node(operation("route", 1, 10, &[], &["Request"]))
+			.unwrap();
+		builder
+			.add_node(operation("response", 2, 20, &["ANY"], &[]))
+			.unwrap();
+		builder
+			.add_data_edge(DataEdge {
+				from: PortRef {
+					node: IrNodeId(1),
+					index: 0,
+				},
+				to: PortRef {
+					node: IrNodeId(2),
+					index: 0,
+				},
+			})
+			.unwrap();
+
+		assert!(builder.build().is_ok());
 	}
 
 	#[test]

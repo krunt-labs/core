@@ -22,6 +22,7 @@ pub const BACKEND_DSL_VERSION: &str = "0.1.0";
 pub const HTTP_ROUTE_NODE_TYPE: &str = "backend.http_route";
 pub const SUCCESS_RESPONSE_NODE_TYPE: &str = "backend.success_response";
 pub const HTTP_REQUEST_TYPE: &str = "HttpRequest";
+pub const RESPONSE_BODY_TYPE: &str = "ANY";
 
 const HTTP_METHODS: [&str; 7] = ["DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT"];
 
@@ -147,6 +148,7 @@ impl BackendDslPlugin {
 		let response_type =
 			NodeTypeId::new(SUCCESS_RESPONSE_NODE_TYPE).expect("static node type is valid");
 		let request_type = TypeId::new(HTTP_REQUEST_TYPE).expect("static type is valid");
+		let response_body_type = TypeId::new(RESPONSE_BODY_TYPE).expect("static type is valid");
 		let manifest = PluginManifest::new(
 			PluginReference::new(BACKEND_DSL_ID, BACKEND_DSL_VERSION)
 				.expect("static plugin identity is valid"),
@@ -193,10 +195,16 @@ impl BackendDslPlugin {
 				type_id: response_type,
 				label: "Success Response".to_string(),
 				category: "Response".to_string(),
-				inputs: vec![BackendPortDescriptor::new(
-					"in",
-					PortContract::new(PortKind::EXECUTION, None, true),
-				)],
+				inputs: vec![
+					BackendPortDescriptor::new(
+						"in",
+						PortContract::new(PortKind::EXECUTION, None, true),
+					),
+					BackendPortDescriptor::new(
+						"body",
+						PortContract::new(PortKind::DATA, Some(response_body_type), false),
+					),
+				],
 				outputs: Vec::new(),
 				properties: Vec::new(),
 			},
@@ -268,7 +276,7 @@ impl krunt_plugin_api::SemanticPlugin for BackendDslPlugin {
 			}
 			SUCCESS_RESPONSE_NODE_TYPE => Ok(LoweredOperation::new(
 				OperationId::new(SUCCESS_RESPONSE_NODE_TYPE).expect("static operation is valid"),
-				[],
+				[TypeId::new(RESPONSE_BODY_TYPE).expect("static type is valid")],
 				[],
 				AsyncKind::SYNC,
 				[],
@@ -304,7 +312,14 @@ fn route_contract(request_type: TypeId) -> NodeContract {
 
 fn response_contract() -> NodeContract {
 	NodeContract::new(
-		[PortContract::new(PortKind::EXECUTION, None, true)],
+		[
+			PortContract::new(PortKind::EXECUTION, None, true),
+			PortContract::new(
+				PortKind::DATA,
+				Some(TypeId::new(RESPONSE_BODY_TYPE).expect("static type is valid")),
+				false,
+			),
+		],
 		[],
 		[],
 		[],
@@ -483,6 +498,32 @@ mod tests {
 		assert_eq!(plugin.descriptors()[0].label(), "HTTP Route");
 		assert_eq!(plugin.descriptors()[0].properties().len(), 2);
 		assert_eq!(plugin.descriptors()[1].label(), "Success Response");
+		assert_eq!(plugin.descriptors()[1].inputs().len(), 2);
+		assert!(!plugin.descriptors()[1].inputs()[1].contract().required());
+		assert_eq!(
+			plugin.descriptors()[1].inputs()[1]
+				.contract()
+				.type_id()
+				.unwrap()
+				.as_str(),
+			RESPONSE_BODY_TYPE
+		);
+	}
+
+	#[test]
+	fn lowers_success_response_with_an_optional_body_input() {
+		let plugin = BackendDslPlugin::new();
+		let node = Node::new(
+			NodeId::new(2).unwrap(),
+			NodeTypeId::new(SUCCESS_RESPONSE_NODE_TYPE).unwrap(),
+		);
+		let lowered = plugin.lower_node(&node).unwrap();
+
+		assert_eq!(
+			lowered.input_types(),
+			&[TypeId::new(RESPONSE_BODY_TYPE).unwrap()]
+		);
+		assert!(lowered.returns());
 	}
 
 	#[test]

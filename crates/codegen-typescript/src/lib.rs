@@ -946,7 +946,7 @@ mod tests {
 						name: OperationId::new("backend.http_route").unwrap(),
 					},
 					input_types: Vec::new(),
-					output_types: vec![TypeId::new("HttpRequest").unwrap()],
+					output_types: vec![TypeId::new("ResponseBody").unwrap()],
 					async_kind: AsyncKind::SYNC,
 					effects: Vec::new(),
 					attributes,
@@ -958,7 +958,7 @@ mod tests {
 				.add_node(IRNode {
 					id: krunt_ir::IrNodeId(id + 1),
 					op: IROp::RETURN,
-					input_types: Vec::new(),
+					input_types: vec![TypeId::new("ResponseBody").unwrap()],
 					output_types: Vec::new(),
 					async_kind: AsyncKind::SYNC,
 					effects: Vec::new(),
@@ -971,6 +971,18 @@ mod tests {
 				.add_control_edge(ControlEdge {
 					from: krunt_ir::IrNodeId(id),
 					to: krunt_ir::IrNodeId(id + 1),
+				})
+				.unwrap();
+			builder
+				.add_data_edge(DataEdge {
+					from: PortRef {
+						node: krunt_ir::IrNodeId(id),
+						index: 0,
+					},
+					to: PortRef {
+						node: krunt_ir::IrNodeId(id + 1),
+						index: 0,
+					},
 				})
 				.unwrap();
 		}
@@ -988,6 +1000,8 @@ mod tests {
 		let source = generated.get("generated.ts").unwrap();
 		assert!(source.contains("export function execute_1(request: unknown = undefined): unknown"));
 		assert!(source.contains("export function execute_3(request: unknown = undefined): unknown"));
+		assert!(source.contains("return operation_1;"));
+		assert!(source.contains("return operation_3;"));
 		assert!(!source.contains("declare function krunt_backend_http_route"));
 	}
 }

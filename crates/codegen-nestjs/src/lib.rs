@@ -411,6 +411,16 @@ mod tests {
 				PortKind::EXECUTION,
 			))
 			.unwrap();
+		response
+			.add_port(
+				Port::new(
+					PortId::new(22).unwrap(),
+					PortDirection::INPUT,
+					PortKind::DATA,
+				)
+				.with_type_reference(TypeReference::new("ANY").unwrap()),
+			)
+			.unwrap();
 
 		builder.add_node(route).unwrap();
 		builder.add_node(response).unwrap();
@@ -420,6 +430,14 @@ mod tests {
 				PortId::new(11).unwrap(),
 				PortId::new(21).unwrap(),
 				EdgeKind::EXECUTION,
+			))
+			.unwrap();
+		builder
+			.add_edge(Edge::new(
+				EdgeId::new(32).unwrap(),
+				PortId::new(12).unwrap(),
+				PortId::new(22).unwrap(),
+				EdgeKind::DATA,
 			))
 			.unwrap();
 		let document = builder.build().unwrap();
@@ -513,6 +531,10 @@ mod tests {
 			.file("src/generated.ts")
 			.unwrap()
 			.contains("export function execute_1(request: unknown = undefined): unknown"));
+		assert!(project
+			.file("src/generated.ts")
+			.unwrap()
+			.contains("return operation_1;"));
 		assert!(!project
 			.file("src/generated.ts")
 			.unwrap()
