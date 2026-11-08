@@ -147,6 +147,8 @@ pub struct IRNode {
 	pub output_types: Vec<TypeId>,
 	pub async_kind: AsyncKind,
 	pub effects: Vec<EffectId>,
+	pub attributes: BTreeMap<String, String>,
+	pub returns: bool,
 	pub source: SourceMap,
 }
 
@@ -413,6 +415,8 @@ mod tests {
 				.collect(),
 			async_kind: AsyncKind::SYNC,
 			effects: Vec::new(),
+			attributes: BTreeMap::new(),
+			returns: false,
 			source: SourceMap::node(GraphNodeId(source)),
 		}
 	}

@@ -113,6 +113,7 @@ pub struct TypeScriptOperation {
 	output_types: Vec<TypeScriptType>,
 	async_kind: AsyncKind,
 	effects: Vec<EffectId>,
+	attributes: BTreeMap<String, String>,
 	source: SourceMap,
 }
 
@@ -139,6 +140,10 @@ impl TypeScriptOperation {
 
 	pub fn effects(&self) -> &[EffectId] {
 		&self.effects
+	}
+
+	pub fn attributes(&self) -> &BTreeMap<String, String> {
+		&self.attributes
 	}
 
 	pub fn source(&self) -> &SourceMap {
@@ -278,45 +283,39 @@ impl LanguageBackend for TypeScriptBackend {
 	}
 
 	fn lower(&self, graph: &IRGraph) -> Result<Self::Output, Self::Error> {
-		let operations = graph
+		let all_operations = graph
 			.nodes()
 			.iter()
 			.map(lower_operation)
 			.collect::<Result<Vec<_>, _>>()?;
-		let async_kind = if operations
+		let http_entries = all_operations
 			.iter()
-			.any(|operation| operation.async_kind == AsyncKind::ASYNC)
-		{
-			AsyncKind::ASYNC
+			.filter_map(|operation| {
+				if matches!(operation.kind(), TypeScriptOperationKind::ENTRY { .. })
+					&& is_http_entry(operation)
+				{
+					Some(operation.id)
+				} else {
+					None
+				}
+			})
+			.collect::<Vec<_>>();
+
+		let functions = if http_entries.is_empty() {
+			vec![lower_function("execute", graph, &all_operations)]
 		} else {
-			AsyncKind::SYNC
-		};
-		let function = TypeScriptFunction {
-			name: "execute".to_string(),
-			async_kind,
-			operations,
-			control_edges: graph
-				.control_edges()
-				.iter()
-				.map(|edge| TypeScriptControlEdge {
-					from: TypeScriptOperationId::new(edge.from.0),
-					to: TypeScriptOperationId::new(edge.to.0),
+			http_entries
+				.into_iter()
+				.map(|entry| {
+					let reachable = reachable_operations(graph, entry);
+					let operations = all_operations
+						.iter()
+						.filter(|operation| reachable.contains(&operation.id))
+						.cloned()
+						.collect::<Vec<_>>();
+					lower_function(&format!("execute_{}", entry.as_u32()), graph, &operations)
 				})
-				.collect(),
-			data_edges: graph
-				.data_edges()
-				.iter()
-				.map(|edge| TypeScriptDataEdge {
-					from: TypeScriptPortRef::new(
-						TypeScriptOperationId::new(edge.from.node.0),
-						edge.from.index,
-					),
-					to: TypeScriptPortRef::new(
-						TypeScriptOperationId::new(edge.to.node.0),
-						edge.to.index,
-					),
-				})
-				.collect(),
+				.collect()
 		};
 
 		Ok(TypeScriptProgram {
@@ -324,9 +323,89 @@ impl LanguageBackend for TypeScriptBackend {
 			modules: vec![TypeScriptModule {
 				path: "generated.ts".to_string(),
 				imports: Vec::new(),
-				functions: vec![function],
+				functions,
 			}],
 		})
+	}
+}
+
+fn is_http_entry(operation: &TypeScriptOperation) -> bool {
+	operation.attributes().contains_key("backend.http.method")
+		&& operation.attributes().contains_key("backend.http.path")
+}
+
+fn reachable_operations(
+	graph: &IRGraph,
+	entry: TypeScriptOperationId,
+) -> BTreeSet<TypeScriptOperationId> {
+	let mut reachable = BTreeSet::new();
+	let mut worklist = vec![entry];
+	while let Some(node) = worklist.pop() {
+		if !reachable.insert(node) {
+			continue;
+		}
+		for edge in graph.control_edges() {
+			if edge.from.0 == node.as_u32() {
+				worklist.push(TypeScriptOperationId::new(edge.to.0));
+			}
+		}
+		for edge in graph.data_edges() {
+			if edge.to.node.0 == node.as_u32() {
+				worklist.push(TypeScriptOperationId::new(edge.from.node.0));
+			}
+		}
+	}
+	reachable
+}
+
+fn lower_function(
+	name: &str,
+	graph: &IRGraph,
+	operations: &[TypeScriptOperation],
+) -> TypeScriptFunction {
+	let operation_ids: BTreeSet<_> = operations.iter().map(TypeScriptOperation::id).collect();
+	let async_kind = if operations
+		.iter()
+		.any(|operation| operation.async_kind == AsyncKind::ASYNC)
+	{
+		AsyncKind::ASYNC
+	} else {
+		AsyncKind::SYNC
+	};
+	TypeScriptFunction {
+		name: name.to_string(),
+		async_kind,
+		operations: operations.to_vec(),
+		control_edges: graph
+			.control_edges()
+			.iter()
+			.filter(|edge| {
+				operation_ids.contains(&TypeScriptOperationId::new(edge.from.0))
+					&& operation_ids.contains(&TypeScriptOperationId::new(edge.to.0))
+			})
+			.map(|edge| TypeScriptControlEdge {
+				from: TypeScriptOperationId::new(edge.from.0),
+				to: TypeScriptOperationId::new(edge.to.0),
+			})
+			.collect(),
+		data_edges: graph
+			.data_edges()
+			.iter()
+			.filter(|edge| {
+				operation_ids.contains(&TypeScriptOperationId::new(edge.from.node.0))
+					&& operation_ids.contains(&TypeScriptOperationId::new(edge.to.node.0))
+			})
+			.map(|edge| TypeScriptDataEdge {
+				from: TypeScriptPortRef::new(
+					TypeScriptOperationId::new(edge.from.node.0),
+					edge.from.index,
+				),
+				to: TypeScriptPortRef::new(
+					TypeScriptOperationId::new(edge.to.node.0),
+					edge.to.index,
+				),
+			})
+			.collect(),
 	}
 }
 
@@ -435,6 +514,7 @@ fn render_function(function: &TypeScriptFunction) -> String {
 	}
 
 	let function_name = sanitize_identifier(&function.name, "execute");
+	let accepts_request = function.operations.iter().any(is_http_entry);
 	let async_prefix = if function.async_kind == AsyncKind::ASYNC {
 		"async "
 	} else {
@@ -446,8 +526,15 @@ fn render_function(function: &TypeScriptFunction) -> String {
 		"unknown"
 	};
 	source.push_str(&format!(
-		"export {}function {}(): {} {{\n",
-		async_prefix, function_name, return_type
+		"export {}function {}({}): {} {{\n",
+		async_prefix,
+		function_name,
+		if accepts_request {
+			"request: unknown = undefined"
+		} else {
+			""
+		},
+		return_type,
 	));
 
 	let data_inputs = data_inputs(function);
@@ -471,7 +558,13 @@ fn render_function(function: &TypeScriptFunction) -> String {
 		match operation.kind() {
 			TypeScriptOperationKind::ENTRY { name }
 			| TypeScriptOperationKind::OPERATION { name } => {
-				render_named_operation(&mut source, operation, name, &data_inputs);
+				if is_http_entry(operation) {
+					source.push_str("  const ");
+					source.push_str(&operation_variable(operation.id));
+					source.push_str(" = request;\n");
+				} else {
+					render_named_operation(&mut source, operation, name, &data_inputs);
+				}
 			}
 			TypeScriptOperationKind::BRANCH
 			| TypeScriptOperationKind::MERGE
@@ -501,10 +594,14 @@ fn operation_declarations(function: &TypeScriptFunction) -> BTreeMap<String, Str
 		.iter()
 		.filter_map(|operation| match operation.kind() {
 			TypeScriptOperationKind::ENTRY { name }
-			| TypeScriptOperationKind::OPERATION { name } => Some((
-				operation.id.as_u32().to_string(),
-				operation_callee(operation.id, name),
-			)),
+			| TypeScriptOperationKind::OPERATION { name }
+				if !is_http_entry(operation) =>
+			{
+				Some((
+					operation.id.as_u32().to_string(),
+					operation_callee(operation.id, name),
+				))
+			}
 			_ => None,
 		})
 		.collect()
@@ -720,6 +817,7 @@ fn lower_operation(
 		output_types: node.output_types.iter().map(lower_type).collect(),
 		async_kind: node.async_kind,
 		effects: node.effects.clone(),
+		attributes: node.attributes.clone(),
 		source: node.source.clone(),
 	})
 }
@@ -753,6 +851,8 @@ mod tests {
 				output_types: vec![TypeId::new("Request").unwrap()],
 				async_kind: AsyncKind::SYNC,
 				effects: Vec::new(),
+				attributes: BTreeMap::new(),
+				returns: false,
 				source: SourceMap::node(GraphNodeId(10)),
 			})
 			.unwrap();
@@ -766,6 +866,8 @@ mod tests {
 				output_types: vec![TypeId::new("Response").unwrap()],
 				async_kind: AsyncKind::ASYNC,
 				effects: Vec::new(),
+				attributes: BTreeMap::new(),
+				returns: false,
 				source: SourceMap::node(GraphNodeId(20)),
 			})
 			.unwrap();
@@ -828,5 +930,64 @@ mod tests {
 		assert!(first.contains("generated.ts"));
 		assert!(first.contains("Request"));
 		assert!(first.contains("Response"));
+	}
+
+	#[test]
+	fn partitions_http_entries_into_deterministic_execution_functions() {
+		let mut builder = IRBuilder::new();
+		for (id, method, path) in [(1, "GET", "/users"), (3, "POST", "/posts")] {
+			let mut attributes = BTreeMap::new();
+			attributes.insert("backend.http.method".to_string(), method.to_string());
+			attributes.insert("backend.http.path".to_string(), path.to_string());
+			builder
+				.add_node(IRNode {
+					id: krunt_ir::IrNodeId(id),
+					op: IROp::ENTRY {
+						name: OperationId::new("backend.http_route").unwrap(),
+					},
+					input_types: Vec::new(),
+					output_types: vec![TypeId::new("HttpRequest").unwrap()],
+					async_kind: AsyncKind::SYNC,
+					effects: Vec::new(),
+					attributes,
+					returns: false,
+					source: SourceMap::node(GraphNodeId(id as u64)),
+				})
+				.unwrap();
+			builder
+				.add_node(IRNode {
+					id: krunt_ir::IrNodeId(id + 1),
+					op: IROp::RETURN,
+					input_types: Vec::new(),
+					output_types: Vec::new(),
+					async_kind: AsyncKind::SYNC,
+					effects: Vec::new(),
+					attributes: BTreeMap::new(),
+					returns: true,
+					source: SourceMap::node(GraphNodeId((id + 1) as u64)),
+				})
+				.unwrap();
+			builder
+				.add_control_edge(ControlEdge {
+					from: krunt_ir::IrNodeId(id),
+					to: krunt_ir::IrNodeId(id + 1),
+				})
+				.unwrap();
+		}
+
+		let program = TypeScriptBackend::lower_graph(&builder.build().unwrap()).unwrap();
+		assert_eq!(
+			program.modules()[0]
+				.functions()
+				.iter()
+				.map(TypeScriptFunction::name)
+				.collect::<Vec<_>>(),
+			["execute_1", "execute_3"]
+		);
+		let generated = TypeScriptSourceRenderer::render_program(&program).unwrap();
+		let source = generated.get("generated.ts").unwrap();
+		assert!(source.contains("export function execute_1(request: unknown = undefined): unknown"));
+		assert!(source.contains("export function execute_3(request: unknown = undefined): unknown"));
+		assert!(!source.contains("declare function krunt_backend_http_route"));
 	}
 }

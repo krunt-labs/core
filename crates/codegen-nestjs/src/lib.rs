@@ -6,9 +6,10 @@
 //! those operations to concrete controllers, providers, and repositories.
 
 use krunt_codegen_typescript::{
-	TypeScriptProgram, TypeScriptRenderError, TypeScriptSourceRenderer,
+	TypeScriptOperationKind, TypeScriptProgram, TypeScriptRenderError, TypeScriptSourceRenderer,
 };
 use krunt_framework_backend::{FrameworkBackend, GeneratedProject, ProjectError};
+use krunt_ir::GraphElementId;
 use std::fmt;
 
 /// The first NestJS backend implementation for Krunt.
@@ -35,7 +36,7 @@ impl FrameworkBackend for NestJsBackend {
 	}
 
 	fn generate(&self, program: &Self::Program) -> Result<GeneratedProject, Self::Error> {
-		if !has_execute_function(program) {
+		if !has_execution_function(program) {
 			return Err(NestJsGenerationError::MISSING_EXECUTE_FUNCTION);
 		}
 
@@ -45,7 +46,7 @@ impl FrameworkBackend for NestJsBackend {
 		{
 			files.push((format!("src/{path}"), content));
 		}
-		files.extend(static_project_files());
+		files.extend(static_project_files(&route_descriptors(program)));
 		GeneratedProject::try_new(files).map_err(NestJsGenerationError::PROJECT)
 	}
 }
@@ -73,17 +74,59 @@ impl fmt::Display for NestJsGenerationError {
 
 impl std::error::Error for NestJsGenerationError {}
 
-fn has_execute_function(program: &TypeScriptProgram) -> bool {
+fn has_execution_function(program: &TypeScriptProgram) -> bool {
 	program
 		.modules()
 		.iter()
 		.flat_map(|module| module.functions())
-		.any(|function| function.name() == "execute")
+		.any(|function| function.name() == "execute" || function.name().starts_with("execute_"))
 }
 
-fn static_project_files() -> Vec<(String, String)> {
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct RouteDescriptor {
+	operation_id: u32,
+	method: String,
+	path: String,
+	source: String,
+	execution_name: String,
+	status_code: u16,
+}
+
+fn route_descriptors(program: &TypeScriptProgram) -> Vec<RouteDescriptor> {
+	let mut routes = program
+		.modules()
+		.iter()
+		.flat_map(|module| module.functions())
+		.filter_map(|function| {
+			let operation = function.operations().iter().find(|operation| {
+				matches!(operation.kind(), TypeScriptOperationKind::ENTRY { .. })
+					&& operation.attributes().contains_key("backend.http.method")
+					&& operation.attributes().contains_key("backend.http.path")
+			})?;
+			let status_code = function
+				.operations()
+				.iter()
+				.find(|operation| matches!(operation.kind(), TypeScriptOperationKind::RETURN))
+				.and_then(|operation| operation.attributes().get("response.status_code"))
+				.and_then(|value| value.parse().ok())
+				.unwrap_or(200);
+			Some(RouteDescriptor {
+				operation_id: operation.id().as_u32(),
+				method: operation.attributes().get("backend.http.method")?.clone(),
+				path: operation.attributes().get("backend.http.path")?.clone(),
+				source: source_marker(operation.source()),
+				execution_name: function.name().to_string(),
+				status_code,
+			})
+		})
+		.collect::<Vec<_>>();
+	routes.sort();
+	routes
+}
+
+fn static_project_files(routes: &[RouteDescriptor]) -> Vec<(String, String)> {
 	vec![
-		("src/app.controller.ts".to_string(), app_controller()),
+		("src/app.controller.ts".to_string(), app_controller(routes)),
 		("src/app.module.ts".to_string(), app_module()),
 		("src/main.ts".to_string(), main_module()),
 		("package.json".to_string(), package_json()),
@@ -93,19 +136,89 @@ fn static_project_files() -> Vec<(String, String)> {
 	]
 }
 
-fn app_controller() -> String {
-	r#"import { Controller, Get } from '@nestjs/common';
-import { execute } from './generated';
+fn app_controller(routes: &[RouteDescriptor]) -> String {
+	let execution_imports = if routes.is_empty() {
+		"execute".to_string()
+	} else {
+		routes
+			.iter()
+			.map(|route| route.execution_name.as_str())
+			.collect::<Vec<_>>()
+			.join(", ")
+	};
+	let mut source = format!(
+		r#"import {{ Controller, Delete, Get, Head, HttpCode, Options, Patch, Post, Put }} from '@nestjs/common';
+import {{ {execution_imports} }} from './generated';
 
 @Controller()
-export class AppController {
-  @Get()
-  async execute(): Promise<unknown> {
-    return execute();
-  }
-}
+export class AppController {{
 "#
-	.to_string()
+	);
+
+	if routes.is_empty() {
+		source.push_str(
+			"  @Get()\n  async execute(): Promise<unknown> {\n    return execute();\n  }\n",
+		);
+	} else {
+		for route in routes {
+			source.push_str("  // krunt:source=");
+			source.push_str(&route.source);
+			source.push('\n');
+			source.push_str("  @HttpCode(");
+			source.push_str(&route.status_code.to_string());
+			source.push_str(")\n  @");
+			source.push_str(method_decorator(&route.method));
+			source.push_str("('");
+			source.push_str(&escape_single_quoted(&route.path));
+			source.push_str("')\n");
+			source.push_str("  async handle_");
+			source.push_str(&route.operation_id.to_string());
+			source.push_str("(): Promise<unknown> {\n    return ");
+			source.push_str(&route.execution_name);
+			source.push_str("();\n  }\n");
+		}
+	}
+	source.push_str("}\n");
+	source
+}
+
+fn method_decorator(method: &str) -> &'static str {
+	match method {
+		"DELETE" => "Delete",
+		"GET" => "Get",
+		"HEAD" => "Head",
+		"OPTIONS" => "Options",
+		"PATCH" => "Patch",
+		"POST" => "Post",
+		"PUT" => "Put",
+		_ => "Get",
+	}
+}
+
+fn escape_single_quoted(value: &str) -> String {
+	value.replace('\\', "\\\\").replace('\'', "\\'")
+}
+
+fn source_marker(source: &krunt_ir::SourceMap) -> String {
+	let primary = graph_element_marker(&source.primary);
+	if source.related.is_empty() {
+		return primary;
+	}
+	let related = source
+		.related
+		.iter()
+		.map(graph_element_marker)
+		.collect::<Vec<_>>()
+		.join(",");
+	format!("{primary};related={related}")
+}
+
+fn graph_element_marker(element: &GraphElementId) -> String {
+	match element {
+		GraphElementId::NODE(id) => format!("node:{}", id.0),
+		GraphElementId::PORT(id) => format!("port:{}", id.0),
+		GraphElementId::EDGE(id) => format!("edge:{}", id.0),
+	}
 }
 
 fn app_module() -> String {
@@ -176,10 +289,10 @@ npm run build
 npm start
 ```
 
-`src/generated.ts` contains source-linked operation markers. The initial
-backend scaffold preserves graph structure and traceability; concrete semantic
-operation implementations are supplied by the Backend DSL framework contracts
-as those generators are added.
+`src/generated.ts` contains source-linked operation markers and one execution
+function per HTTP route. The initial Backend DSL slice generates route-specific
+handlers and successful HTTP 200 responses; additional semantic operation
+implementations will be added as more Backend DSL nodes are introduced.
 "#
 	.to_string()
 }
@@ -221,8 +334,17 @@ fn tsconfig_build() -> String {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use krunt_backend_dsl::{
+		BackendDslPlugin, HTTP_REQUEST_TYPE, HTTP_ROUTE_NODE_TYPE, SUCCESS_RESPONSE_NODE_TYPE,
+	};
 	use krunt_codegen_typescript::TypeScriptBackend;
+	use krunt_graph_model::{
+		Edge, EdgeId, EdgeKind, GraphBuilder, GraphId, GraphMetadata, Node, NodeId, NodeTypeId,
+		Port, PortDirection, PortId, PortKind, TypeReference,
+	};
 	use krunt_ir::{GraphNodeId, IRBuilder, IRNode, IROp, OperationId, SourceMap, TypeId};
+	use krunt_plugin_api::PluginRegistry;
+	use serde_json::Value;
 
 	fn program() -> TypeScriptProgram {
 		let mut builder = IRBuilder::new();
@@ -236,11 +358,116 @@ mod tests {
 				output_types: vec![TypeId::new("Request").unwrap()],
 				async_kind: krunt_ir::AsyncKind::ASYNC,
 				effects: Vec::new(),
+				attributes: std::collections::BTreeMap::new(),
+				returns: false,
 				source: SourceMap::node(GraphNodeId(10)),
 			})
 			.unwrap();
 		let graph = builder.build().unwrap();
 		TypeScriptBackend::lower_graph(&graph).unwrap()
+	}
+
+	fn backend_dsl_program() -> TypeScriptProgram {
+		let metadata =
+			GraphMetadata::new(GraphId::new(1).unwrap(), "backend-v1", "krunt-test").unwrap();
+		let mut builder = GraphBuilder::new(metadata);
+
+		let mut route = Node::new(
+			NodeId::new(1).unwrap(),
+			NodeTypeId::new(HTTP_ROUTE_NODE_TYPE).unwrap(),
+		);
+		route
+			.add_port(Port::new(
+				PortId::new(11).unwrap(),
+				PortDirection::OUTPUT,
+				PortKind::EXECUTION,
+			))
+			.unwrap();
+		route
+			.add_port(
+				Port::new(
+					PortId::new(12).unwrap(),
+					PortDirection::OUTPUT,
+					PortKind::DATA,
+				)
+				.with_type_reference(TypeReference::new(HTTP_REQUEST_TYPE).unwrap()),
+			)
+			.unwrap();
+		route = route
+			.with_property("method", Value::String("GET".to_string()))
+			.unwrap();
+		route = route
+			.with_property("path", Value::String("/users".to_string()))
+			.unwrap();
+
+		let mut response = Node::new(
+			NodeId::new(2).unwrap(),
+			NodeTypeId::new(SUCCESS_RESPONSE_NODE_TYPE).unwrap(),
+		);
+		response
+			.add_port(Port::new(
+				PortId::new(21).unwrap(),
+				PortDirection::INPUT,
+				PortKind::EXECUTION,
+			))
+			.unwrap();
+
+		builder.add_node(route).unwrap();
+		builder.add_node(response).unwrap();
+		builder
+			.add_edge(Edge::new(
+				EdgeId::new(31).unwrap(),
+				PortId::new(11).unwrap(),
+				PortId::new(21).unwrap(),
+				EdgeKind::EXECUTION,
+			))
+			.unwrap();
+		let document = builder.build().unwrap();
+
+		let mut registry = PluginRegistry::new();
+		BackendDslPlugin::register(&mut registry).unwrap();
+		let result = krunt_compiler::compile(&document, &registry);
+		assert!(
+			!result.has_errors(),
+			"compiler diagnostics: {:?}",
+			result.diagnostics()
+		);
+		TypeScriptBackend::lower_graph(result.ir().expect("valid graph should lower")).unwrap()
+	}
+
+	fn backend_dsl_route_without_response_document() -> krunt_graph_model::GraphDocument {
+		let metadata =
+			GraphMetadata::new(GraphId::new(2).unwrap(), "backend-v1", "krunt-test").unwrap();
+		let mut builder = GraphBuilder::new(metadata);
+		let mut route = Node::new(
+			NodeId::new(1).unwrap(),
+			NodeTypeId::new(HTTP_ROUTE_NODE_TYPE).unwrap(),
+		);
+		route
+			.add_port(Port::new(
+				PortId::new(11).unwrap(),
+				PortDirection::OUTPUT,
+				PortKind::EXECUTION,
+			))
+			.unwrap();
+		route
+			.add_port(
+				Port::new(
+					PortId::new(12).unwrap(),
+					PortDirection::OUTPUT,
+					PortKind::DATA,
+				)
+				.with_type_reference(TypeReference::new(HTTP_REQUEST_TYPE).unwrap()),
+			)
+			.unwrap();
+		route = route
+			.with_property("method", Value::String("GET".to_string()))
+			.unwrap();
+		route = route
+			.with_property("path", Value::String("/users".to_string()))
+			.unwrap();
+		builder.add_node(route).unwrap();
+		builder.build().unwrap()
 	}
 
 	#[test]
@@ -271,5 +498,39 @@ mod tests {
 			.unwrap()
 			.contains("krunt:source=node:10"));
 		assert!(first.file("package.json").unwrap().contains("@nestjs/core"));
+	}
+
+	#[test]
+	fn renders_backend_dsl_http_routes_in_the_controller() {
+		let project = NestJsBackend::generate_project(&backend_dsl_program()).unwrap();
+		let controller = project.file("src/app.controller.ts").unwrap();
+
+		assert!(controller.contains("// krunt:source=node:1"));
+		assert!(controller.contains("@HttpCode(200)"));
+		assert!(controller.contains("@Get('/users')"));
+		assert!(controller.contains("return execute_1();"));
+		assert!(project
+			.file("src/generated.ts")
+			.unwrap()
+			.contains("export function execute_1(request: unknown = undefined): unknown"));
+		assert!(!project
+			.file("src/generated.ts")
+			.unwrap()
+			.contains("declare function krunt_backend_http_route"));
+	}
+
+	#[test]
+	fn compiler_rejects_a_route_without_a_success_response() {
+		let mut registry = PluginRegistry::new();
+		BackendDslPlugin::register(&mut registry).unwrap();
+		let result =
+			krunt_compiler::compile(&backend_dsl_route_without_response_document(), &registry);
+
+		assert!(result.has_errors());
+		assert_eq!(
+			result.diagnostics().as_slice()[0].code().as_str(),
+			"BACKEND_DSL.HTTP_ROUTE_MISSING_RESPONSE"
+		);
+		assert!(result.ir().is_none());
 	}
 }

@@ -56,6 +56,7 @@ pub fn compile(document: &GraphDocument, plugins: &PluginRegistry) -> Compilatio
 		validate_node_contract(node, &contract, &mut diagnostics);
 		contracts.insert(node.id(), contract);
 	}
+	diagnostics.extend(plugins.analyze_graph(document));
 
 	if !diagnostics.has_errors() {
 		analyze_data_types(document, &mut diagnostics);
@@ -771,7 +772,9 @@ fn ir_node(
 ) -> IRNode {
 	IRNode {
 		id,
-		op: if contract.is_entry() {
+		op: if lowered.returns() {
+			IROp::RETURN
+		} else if contract.is_entry() {
 			IROp::ENTRY {
 				name: lowered.operation().clone(),
 			}
@@ -784,6 +787,8 @@ fn ir_node(
 		output_types: lowered.output_types().to_vec(),
 		async_kind: lowered.async_kind(),
 		effects: lowered.effects().to_vec(),
+		attributes: lowered.attributes().clone(),
+		returns: lowered.returns(),
 		source: SourceMap::node(GraphNodeId(node.id().as_u64())),
 	}
 }

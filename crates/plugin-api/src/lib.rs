@@ -5,7 +5,7 @@
 //! generated files, or a specific framework.
 
 use krunt_diagnostics::Diagnostic;
-use krunt_graph_model::{Node, NodeTypeId, PluginReference, PortKind};
+use krunt_graph_model::{GraphDocument, Node, NodeTypeId, PluginReference, PortKind};
 use krunt_ir::{AsyncKind, EffectId, OperationId, TypeId};
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -56,6 +56,8 @@ pub struct LoweredOperation {
 	output_types: Vec<TypeId>,
 	async_kind: AsyncKind,
 	effects: Vec<EffectId>,
+	attributes: BTreeMap<String, String>,
+	returns: bool,
 }
 
 impl LoweredOperation {
@@ -75,7 +77,24 @@ impl LoweredOperation {
 			output_types: output_types.into_iter().collect(),
 			async_kind,
 			effects,
+			attributes: BTreeMap::new(),
+			returns: false,
 		}
+	}
+
+	/// Mark this operation as a target-neutral return/terminal operation.
+	pub fn with_return(mut self, returns: bool) -> Self {
+		self.returns = returns;
+		self
+	}
+
+	/// Attach deterministic, target-neutral semantic metadata to the lowered
+	/// operation. Namespaced keys keep domain attributes out of universal IR
+	/// structure while allowing later language/framework backends to consume
+	/// declared semantics.
+	pub fn with_attribute(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+		self.attributes.insert(key.into(), value.into());
+		self
 	}
 
 	pub fn operation(&self) -> &OperationId {
@@ -96,6 +115,14 @@ impl LoweredOperation {
 
 	pub fn effects(&self) -> &[EffectId] {
 		&self.effects
+	}
+
+	pub fn attributes(&self) -> &BTreeMap<String, String> {
+		&self.attributes
+	}
+
+	pub fn returns(&self) -> bool {
+		self.returns
 	}
 }
 
@@ -249,6 +276,10 @@ pub trait SemanticPlugin: Send + Sync {
 
 	fn contract(&self, node: &Node) -> NodeContract;
 
+	fn analyze_graph(&self, _document: &GraphDocument) -> Vec<Diagnostic> {
+		Vec::new()
+	}
+
 	fn analyze_node(&self, _node: &Node) -> Vec<Diagnostic> {
 		Vec::new()
 	}
@@ -293,6 +324,13 @@ impl PluginRegistry {
 	pub fn resolve(&self, node_type: &NodeTypeId) -> Option<&dyn SemanticPlugin> {
 		let plugin_id = self.node_types.get(node_type)?;
 		self.plugins.get(plugin_id).map(Box::as_ref)
+	}
+
+	pub fn analyze_graph(&self, document: &GraphDocument) -> Vec<Diagnostic> {
+		self.plugins
+			.values()
+			.flat_map(|plugin| plugin.analyze_graph(document))
+			.collect()
 	}
 
 	pub fn plugin_count(&self) -> usize {

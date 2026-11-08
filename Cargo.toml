@@ -11,6 +11,7 @@ members = [
 	"crates/codegen-typescript",
 	"crates/framework-backend",
 	"crates/codegen-nestjs",
+	"crates/backend-dsl",
 ]
 
 [workspace.package]
