@@ -147,7 +147,7 @@ fn app_controller(routes: &[RouteDescriptor]) -> String {
 			.join(", ")
 	};
 	let mut source = format!(
-		r#"import {{ Controller, Delete, Get, Head, HttpCode, Options, Patch, Post, Put }} from '@nestjs/common';
+		r#"import {{ Controller, Delete, Get, Head, HttpCode, Options, Patch, Post, Put, Req }} from '@nestjs/common';
 import {{ {execution_imports} }} from './generated';
 
 @Controller()
@@ -157,7 +157,7 @@ export class AppController {{
 
 	if routes.is_empty() {
 		source.push_str(
-			"  @Get()\n  async execute(): Promise<unknown> {\n    return execute();\n  }\n",
+			"  @Get()\n  async execute(@Req() request: unknown): Promise<unknown> {\n    return execute(request);\n  }\n",
 		);
 	} else {
 		for route in routes {
@@ -173,9 +173,9 @@ export class AppController {{
 			source.push_str("')\n");
 			source.push_str("  async handle_");
 			source.push_str(&route.operation_id.to_string());
-			source.push_str("(): Promise<unknown> {\n    return ");
+			source.push_str("(@Req() request: unknown): Promise<unknown> {\n    return ");
 			source.push_str(&route.execution_name);
-			source.push_str("();\n  }\n");
+			source.push_str("(request);\n  }\n");
 		}
 	}
 	source.push_str("}\n");
@@ -512,6 +512,14 @@ mod tests {
 			.unwrap()
 			.contains("@Controller()"));
 		assert!(first
+			.file("src/app.controller.ts")
+			.unwrap()
+			.contains("async execute(@Req() request: unknown): Promise<unknown>"));
+		assert!(first
+			.file("src/app.controller.ts")
+			.unwrap()
+			.contains("return execute(request);"));
+		assert!(first
 			.file("src/generated.ts")
 			.unwrap()
 			.contains("krunt:source=node:10"));
@@ -526,7 +534,8 @@ mod tests {
 		assert!(controller.contains("// krunt:source=node:1"));
 		assert!(controller.contains("@HttpCode(200)"));
 		assert!(controller.contains("@Get('/users')"));
-		assert!(controller.contains("return execute_1();"));
+		assert!(controller.contains("@Req() request: unknown"));
+		assert!(controller.contains("return execute_1(request);"));
 		assert!(project
 			.file("src/generated.ts")
 			.unwrap()
