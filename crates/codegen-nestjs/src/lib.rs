@@ -1,16 +1,82 @@
 //! NestJS framework backend for Krunt.
 //!
-//! This backend consumes TypeScript language IR and produces a deterministic
-//! NestJS project scaffold. Semantic operation implementations are deliberately
-//! not invented here; the Backend DSL and future framework contracts will map
-//! those operations to concrete controllers, providers, and repositories.
+//! This backend consumes TypeScript language IR, lowers it into a versioned
+//! NestJS framework semantic model, and produces a deterministic project
+//! scaffold. Semantic operation implementations are deliberately not invented
+//! here; the Backend DSL and future framework contracts will map those
+//! operations to concrete controllers, providers, and repositories.
 
 use krunt_codegen_typescript::{
 	TypeScriptOperationKind, TypeScriptProgram, TypeScriptRenderError, TypeScriptSourceRenderer,
 };
 use krunt_framework_backend::{FrameworkBackend, GeneratedProject, ProjectError};
 use krunt_ir::GraphElementId;
+use serde::Serialize;
 use std::fmt;
+
+/// Version of the NestJS framework semantic IR.
+pub const NESTJS_PROGRAM_VERSION: u32 = 1;
+
+/// Framework-level semantic model consumed by NestJS project rendering.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct NestJsProgram {
+	version: u32,
+	fallback_execution_name: String,
+	routes: Vec<NestJsRoute>,
+}
+
+impl NestJsProgram {
+	pub const CURRENT_VERSION: u32 = NESTJS_PROGRAM_VERSION;
+
+	pub fn version(&self) -> u32 {
+		self.version
+	}
+
+	pub fn fallback_execution_name(&self) -> &str {
+		&self.fallback_execution_name
+	}
+
+	pub fn routes(&self) -> &[NestJsRoute] {
+		&self.routes
+	}
+}
+
+/// One framework-level HTTP route binding.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+pub struct NestJsRoute {
+	operation_id: u32,
+	method: String,
+	path: String,
+	source: String,
+	execution_name: String,
+	status_code: u16,
+}
+
+impl NestJsRoute {
+	pub fn operation_id(&self) -> u32 {
+		self.operation_id
+	}
+
+	pub fn method(&self) -> &str {
+		&self.method
+	}
+
+	pub fn path(&self) -> &str {
+		&self.path
+	}
+
+	pub fn source(&self) -> &str {
+		&self.source
+	}
+
+	pub fn execution_name(&self) -> &str {
+		&self.execution_name
+	}
+
+	pub fn status_code(&self) -> u16 {
+		self.status_code
+	}
+}
 
 /// The first NestJS backend implementation for Krunt.
 #[derive(Clone, Copy, Debug, Default)]
@@ -25,6 +91,13 @@ impl NestJsBackend {
 	) -> Result<GeneratedProject, NestJsGenerationError> {
 		<Self as FrameworkBackend>::generate(&Self, program)
 	}
+
+	/// Lower TypeScript language IR into the NestJS framework semantic IR.
+	pub fn lower_program(
+		program: &TypeScriptProgram,
+	) -> Result<NestJsProgram, NestJsGenerationError> {
+		lower_nestjs_program(program)
+	}
 }
 
 impl FrameworkBackend for NestJsBackend {
@@ -36,9 +109,7 @@ impl FrameworkBackend for NestJsBackend {
 	}
 
 	fn generate(&self, program: &Self::Program) -> Result<GeneratedProject, Self::Error> {
-		if !has_execution_function(program) {
-			return Err(NestJsGenerationError::MISSING_EXECUTE_FUNCTION);
-		}
+		let framework_program = lower_nestjs_program(program)?;
 
 		let mut files = Vec::new();
 		for (path, content) in TypeScriptSourceRenderer::render_program(program)
@@ -46,7 +117,7 @@ impl FrameworkBackend for NestJsBackend {
 		{
 			files.push((format!("src/{path}"), content));
 		}
-		files.extend(static_project_files(&route_descriptors(program)));
+		files.extend(static_project_files(&framework_program));
 		GeneratedProject::try_new(files).map_err(NestJsGenerationError::PROJECT)
 	}
 }
@@ -74,25 +145,32 @@ impl fmt::Display for NestJsGenerationError {
 
 impl std::error::Error for NestJsGenerationError {}
 
-fn has_execution_function(program: &TypeScriptProgram) -> bool {
-	program
+fn execution_function_name(program: &TypeScriptProgram) -> Option<String> {
+	let mut names = program
 		.modules()
 		.iter()
 		.flat_map(|module| module.functions())
-		.any(|function| function.name() == "execute" || function.name().starts_with("execute_"))
+		.map(|function| function.name().to_string())
+		.filter(|name| name == "execute" || name.starts_with("execute_"))
+		.collect::<Vec<_>>();
+	names.sort();
+	names.into_iter().next()
 }
 
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
-struct RouteDescriptor {
-	operation_id: u32,
-	method: String,
-	path: String,
-	source: String,
-	execution_name: String,
-	status_code: u16,
+fn lower_nestjs_program(
+	program: &TypeScriptProgram,
+) -> Result<NestJsProgram, NestJsGenerationError> {
+	let Some(fallback_execution_name) = execution_function_name(program) else {
+		return Err(NestJsGenerationError::MISSING_EXECUTE_FUNCTION);
+	};
+	Ok(NestJsProgram {
+		version: NestJsProgram::CURRENT_VERSION,
+		fallback_execution_name,
+		routes: lower_routes(program),
+	})
 }
 
-fn route_descriptors(program: &TypeScriptProgram) -> Vec<RouteDescriptor> {
+fn lower_routes(program: &TypeScriptProgram) -> Vec<NestJsRoute> {
 	let mut routes = program
 		.modules()
 		.iter()
@@ -110,7 +188,7 @@ fn route_descriptors(program: &TypeScriptProgram) -> Vec<RouteDescriptor> {
 				.and_then(|operation| operation.attributes().get("response.status_code"))
 				.and_then(|value| value.parse().ok())
 				.unwrap_or(200);
-			Some(RouteDescriptor {
+			Some(NestJsRoute {
 				operation_id: operation.id().as_u32(),
 				method: operation.attributes().get("backend.http.method")?.clone(),
 				path: operation.attributes().get("backend.http.path")?.clone(),
@@ -124,9 +202,9 @@ fn route_descriptors(program: &TypeScriptProgram) -> Vec<RouteDescriptor> {
 	routes
 }
 
-fn static_project_files(routes: &[RouteDescriptor]) -> Vec<(String, String)> {
+fn static_project_files(program: &NestJsProgram) -> Vec<(String, String)> {
 	vec![
-		("src/app.controller.ts".to_string(), app_controller(routes)),
+		("src/app.controller.ts".to_string(), app_controller(program)),
 		("src/app.module.ts".to_string(), app_module()),
 		("src/main.ts".to_string(), main_module()),
 		("package.json".to_string(), package_json()),
@@ -136,13 +214,14 @@ fn static_project_files(routes: &[RouteDescriptor]) -> Vec<(String, String)> {
 	]
 }
 
-fn app_controller(routes: &[RouteDescriptor]) -> String {
-	let execution_imports = if routes.is_empty() {
-		"execute".to_string()
+fn app_controller(program: &NestJsProgram) -> String {
+	let execution_imports = if program.routes().is_empty() {
+		program.fallback_execution_name().to_string()
 	} else {
-		routes
+		program
+			.routes()
 			.iter()
-			.map(|route| route.execution_name.as_str())
+			.map(NestJsRoute::execution_name)
 			.collect::<Vec<_>>()
 			.join(", ")
 	};
@@ -155,26 +234,28 @@ export class AppController {{
 "#
 	);
 
-	if routes.is_empty() {
+	if program.routes().is_empty() {
 		source.push_str(
-			"  @Get()\n  async execute(@Req() request: unknown): Promise<unknown> {\n    return execute(request);\n  }\n",
+			"  @Get()\n  async execute(@Req() request: unknown): Promise<unknown> {\n    return ",
 		);
+		source.push_str(program.fallback_execution_name());
+		source.push_str("(request);\n  }\n");
 	} else {
-		for route in routes {
+		for route in program.routes() {
 			source.push_str("  // krunt:source=");
-			source.push_str(&route.source);
+			source.push_str(route.source());
 			source.push('\n');
 			source.push_str("  @HttpCode(");
-			source.push_str(&route.status_code.to_string());
+			source.push_str(&route.status_code().to_string());
 			source.push_str(")\n  @");
-			source.push_str(method_decorator(&route.method));
+			source.push_str(method_decorator(route.method()));
 			source.push_str("('");
-			source.push_str(&escape_single_quoted(&route.path));
+			source.push_str(&escape_single_quoted(route.path()));
 			source.push_str("')\n");
 			source.push_str("  async handle_");
-			source.push_str(&route.operation_id.to_string());
+			source.push_str(&route.operation_id().to_string());
 			source.push_str("(@Req() request: unknown): Promise<unknown> {\n    return ");
-			source.push_str(&route.execution_name);
+			source.push_str(route.execution_name());
 			source.push_str("(request);\n  }\n");
 		}
 	}
@@ -581,6 +662,26 @@ mod tests {
 			.unwrap()
 			.contains("krunt:source=node:10"));
 		assert!(first.file("package.json").unwrap().contains("@nestjs/core"));
+	}
+
+	#[test]
+	fn lowers_typescript_into_a_deterministic_nestjs_program() {
+		let first = NestJsBackend::lower_program(&backend_dsl_program()).unwrap();
+		let second = NestJsBackend::lower_program(&backend_dsl_program()).unwrap();
+
+		assert_eq!(first, second);
+		assert_eq!(first.version(), NestJsProgram::CURRENT_VERSION);
+		assert_eq!(first.routes().len(), 1);
+		assert_eq!(first.fallback_execution_name(), "execute_1");
+		assert_eq!(first.routes()[0].operation_id(), 1);
+		assert_eq!(first.routes()[0].method(), "GET");
+		assert_eq!(first.routes()[0].path(), "/users");
+		assert_eq!(first.routes()[0].execution_name(), "execute_1");
+		assert_eq!(first.routes()[0].status_code(), 200);
+		assert_eq!(
+			serde_json::to_string(&first).unwrap(),
+			serde_json::to_string(&second).unwrap()
+		);
 	}
 
 	#[test]

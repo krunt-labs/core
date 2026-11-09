@@ -9,6 +9,7 @@ description = "Deterministic NestJS framework backend for Krunt"
 krunt-codegen-typescript = { path = "../codegen-typescript" }
 krunt-framework-backend = { path = "../framework-backend" }
 krunt-ir = { path = "../ir" }
+serde = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
 krunt-backend-dsl = { path = "../backend-dsl" }
