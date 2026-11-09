@@ -1,13 +1,15 @@
 //! Initial Krunt Backend DSL semantic plugin.
 //!
 //! This crate owns backend meaning for the first vertical slice. It describes
-//! HTTP Route and Success Response nodes, validates their properties, and
-//! lowers them into target-neutral operations with namespaced metadata. It does
-//! not emit TypeScript or NestJS code.
+//! HTTP Route, Identity Transform, and Success Response nodes, validates their
+//! properties and typed data contracts, and lowers them into target-neutral
+//! operations with namespaced metadata. It does not emit TypeScript or NestJS
+//! code.
 
 use krunt_diagnostics::{CompilerStage, Diagnostic, DiagnosticCode, GraphElementId, Severity};
 use krunt_graph_model::{
-	EdgeKind, GraphDocument, Node, NodeId, NodeTypeId, PluginReference, PortId, PortKind,
+	EdgeKind, GraphDocument, Node, NodeId, NodeTypeId, PluginReference, PortDirection, PortId,
+	PortKind,
 };
 use krunt_ir::{AsyncKind, OperationId, TypeId};
 use krunt_plugin_api::{
@@ -20,6 +22,7 @@ use std::fmt;
 pub const BACKEND_DSL_ID: &str = "krunt.backend-dsl";
 pub const BACKEND_DSL_VERSION: &str = "0.1.0";
 pub const HTTP_ROUTE_NODE_TYPE: &str = "backend.http_route";
+pub const TRANSFORM_NODE_TYPE: &str = "backend.transform";
 pub const SUCCESS_RESPONSE_NODE_TYPE: &str = "backend.success_response";
 pub const HTTP_REQUEST_TYPE: &str = "HttpRequest";
 pub const RESPONSE_BODY_TYPE: &str = "ANY";
@@ -145,6 +148,8 @@ pub struct BackendDslPlugin {
 impl BackendDslPlugin {
 	pub fn new() -> Self {
 		let route_type = NodeTypeId::new(HTTP_ROUTE_NODE_TYPE).expect("static node type is valid");
+		let transform_type =
+			NodeTypeId::new(TRANSFORM_NODE_TYPE).expect("static node type is valid");
 		let response_type =
 			NodeTypeId::new(SUCCESS_RESPONSE_NODE_TYPE).expect("static node type is valid");
 		let request_type = TypeId::new(HTTP_REQUEST_TYPE).expect("static type is valid");
@@ -152,7 +157,11 @@ impl BackendDslPlugin {
 		let manifest = PluginManifest::new(
 			PluginReference::new(BACKEND_DSL_ID, BACKEND_DSL_VERSION)
 				.expect("static plugin identity is valid"),
-			[route_type.clone(), response_type.clone()],
+			[
+				route_type.clone(),
+				transform_type.clone(),
+				response_type.clone(),
+			],
 		)
 		.expect("static plugin manifest is valid");
 		let descriptors = vec![
@@ -190,6 +199,32 @@ impl BackendDslPlugin {
 						Some(Value::String("/".to_string())),
 					),
 				],
+			},
+			BackendNodeDescriptor {
+				type_id: transform_type,
+				label: "Identity Transform".to_string(),
+				category: "Data".to_string(),
+				inputs: vec![
+					BackendPortDescriptor::new(
+						"in",
+						PortContract::new(PortKind::EXECUTION, None, true),
+					),
+					BackendPortDescriptor::new(
+						"value",
+						PortContract::new(PortKind::DATA, None, true),
+					),
+				],
+				outputs: vec![
+					BackendPortDescriptor::new(
+						"next",
+						PortContract::new(PortKind::EXECUTION, None, true),
+					),
+					BackendPortDescriptor::new(
+						"result",
+						PortContract::new(PortKind::DATA, None, true),
+					),
+				],
+				properties: Vec::new(),
 			},
 			BackendNodeDescriptor {
 				type_id: response_type,
@@ -240,6 +275,7 @@ impl krunt_plugin_api::SemanticPlugin for BackendDslPlugin {
 			HTTP_ROUTE_NODE_TYPE => {
 				route_contract(TypeId::new(HTTP_REQUEST_TYPE).expect("static type is valid"))
 			}
+			TRANSFORM_NODE_TYPE => transform_contract(),
 			SUCCESS_RESPONSE_NODE_TYPE => response_contract(),
 			_ => NodeContract::new([], [], [], [], [], AsyncKind::SYNC, []),
 		}
@@ -250,14 +286,19 @@ impl krunt_plugin_api::SemanticPlugin for BackendDslPlugin {
 	}
 
 	fn analyze_node(&self, node: &Node) -> Vec<Diagnostic> {
-		if node.type_id().as_str() == HTTP_ROUTE_NODE_TYPE {
-			return route_properties(node)
+		match node.type_id().as_str() {
+			HTTP_ROUTE_NODE_TYPE => route_properties(node)
 				.err()
 				.map(|diagnostic| *diagnostic)
 				.into_iter()
-				.collect();
+				.collect(),
+			TRANSFORM_NODE_TYPE => transform_data_types(node)
+				.err()
+				.map(|diagnostic| *diagnostic)
+				.into_iter()
+				.collect(),
+			_ => Vec::new(),
 		}
-		Vec::new()
 	}
 
 	fn lower_node(&self, node: &Node) -> Result<LoweredOperation, Vec<Diagnostic>> {
@@ -273,6 +314,18 @@ impl krunt_plugin_api::SemanticPlugin for BackendDslPlugin {
 				)
 				.with_attribute("backend.http.method", properties.method)
 				.with_attribute("backend.http.path", properties.path))
+			}
+			TRANSFORM_NODE_TYPE => {
+				let (input_type, output_type) =
+					transform_data_types(node).map_err(|error| vec![*error])?;
+				Ok(LoweredOperation::new(
+					OperationId::new(TRANSFORM_NODE_TYPE).expect("static operation is valid"),
+					[input_type],
+					[output_type],
+					AsyncKind::SYNC,
+					[],
+				)
+				.with_attribute("backend.transform.kind", "IDENTITY"))
 			}
 			SUCCESS_RESPONSE_NODE_TYPE => Ok(LoweredOperation::new(
 				OperationId::new(SUCCESS_RESPONSE_NODE_TYPE).expect("static operation is valid"),
@@ -310,6 +363,24 @@ fn route_contract(request_type: TypeId) -> NodeContract {
 	.with_entry(true)
 }
 
+fn transform_contract() -> NodeContract {
+	NodeContract::new(
+		[
+			PortContract::new(PortKind::EXECUTION, None, true),
+			PortContract::new(PortKind::DATA, None, true),
+		],
+		[
+			PortContract::new(PortKind::EXECUTION, None, true),
+			PortContract::new(PortKind::DATA, None, true),
+		],
+		[],
+		[],
+		[],
+		AsyncKind::SYNC,
+		[],
+	)
+}
+
 fn response_contract() -> NodeContract {
 	NodeContract::new(
 		[
@@ -327,6 +398,67 @@ fn response_contract() -> NodeContract {
 		AsyncKind::SYNC,
 		[],
 	)
+}
+
+fn transform_data_types(node: &Node) -> Result<(TypeId, TypeId), Box<Diagnostic>> {
+	let input = node
+		.ports()
+		.iter()
+		.find(|port| port.direction() == PortDirection::INPUT && port.kind() == PortKind::DATA)
+		.ok_or_else(|| {
+			node_diagnostic(
+				node,
+				"BACKEND_DSL.TRANSFORM_INPUT_TYPE_MISSING",
+				"Identity Transform requires a typed data input.",
+			)
+		})?;
+	let output = node
+		.ports()
+		.iter()
+		.find(|port| port.direction() == PortDirection::OUTPUT && port.kind() == PortKind::DATA)
+		.ok_or_else(|| {
+			node_diagnostic(
+				node,
+				"BACKEND_DSL.TRANSFORM_OUTPUT_TYPE_MISSING",
+				"Identity Transform requires a typed data output.",
+			)
+		})?;
+	let input_type = input.type_reference().ok_or_else(|| {
+		node_diagnostic(
+			node,
+			"BACKEND_DSL.TRANSFORM_INPUT_TYPE_MISSING",
+			"Identity Transform requires a typed data input.",
+		)
+	})?;
+	let output_type = output.type_reference().ok_or_else(|| {
+		node_diagnostic(
+			node,
+			"BACKEND_DSL.TRANSFORM_OUTPUT_TYPE_MISSING",
+			"Identity Transform requires a typed data output.",
+		)
+	})?;
+	let input_type = TypeId::new(input_type.as_str()).map_err(|_| {
+		node_diagnostic(
+			node,
+			"BACKEND_DSL.TRANSFORM_INPUT_TYPE_INVALID",
+			"Identity Transform input type is invalid.",
+		)
+	})?;
+	let output_type = TypeId::new(output_type.as_str()).map_err(|_| {
+		node_diagnostic(
+			node,
+			"BACKEND_DSL.TRANSFORM_OUTPUT_TYPE_INVALID",
+			"Identity Transform output type is invalid.",
+		)
+	})?;
+	if input_type != output_type {
+		return Err(node_diagnostic(
+			node,
+			"BACKEND_DSL.TRANSFORM_TYPE_MISMATCH",
+			"Identity Transform input and output types must match.",
+		));
+	}
+	Ok((input_type, output_type))
 }
 
 fn validate_route_response_paths(document: &GraphDocument) -> Vec<Diagnostic> {
@@ -494,19 +626,107 @@ mod tests {
 	#[test]
 	fn exposes_route_and_response_descriptors() {
 		let plugin = BackendDslPlugin::new();
-		assert_eq!(plugin.descriptors().len(), 2);
+		assert_eq!(plugin.descriptors().len(), 3);
 		assert_eq!(plugin.descriptors()[0].label(), "HTTP Route");
 		assert_eq!(plugin.descriptors()[0].properties().len(), 2);
-		assert_eq!(plugin.descriptors()[1].label(), "Success Response");
+		assert_eq!(plugin.descriptors()[1].label(), "Identity Transform");
 		assert_eq!(plugin.descriptors()[1].inputs().len(), 2);
-		assert!(!plugin.descriptors()[1].inputs()[1].contract().required());
+		assert_eq!(plugin.descriptors()[1].outputs().len(), 2);
+		let response = plugin
+			.descriptors()
+			.iter()
+			.find(|descriptor| descriptor.type_id().as_str() == SUCCESS_RESPONSE_NODE_TYPE)
+			.expect("response descriptor should be registered");
+		assert_eq!(response.label(), "Success Response");
+		assert_eq!(response.inputs().len(), 2);
+		assert!(!response.inputs()[1].contract().required());
 		assert_eq!(
-			plugin.descriptors()[1].inputs()[1]
-				.contract()
-				.type_id()
-				.unwrap()
-				.as_str(),
+			response.inputs()[1].contract().type_id().unwrap().as_str(),
 			RESPONSE_BODY_TYPE
+		);
+	}
+
+	#[test]
+	fn lowers_an_identity_transform_with_preserved_data_types() {
+		let mut node = Node::new(
+			NodeId::new(2).unwrap(),
+			NodeTypeId::new(TRANSFORM_NODE_TYPE).unwrap(),
+		);
+		node.add_port(krunt_graph_model::Port::new(
+			krunt_graph_model::PortId::new(21).unwrap(),
+			PortDirection::INPUT,
+			PortKind::EXECUTION,
+		))
+		.unwrap();
+		node.add_port(
+			krunt_graph_model::Port::new(
+				krunt_graph_model::PortId::new(22).unwrap(),
+				PortDirection::INPUT,
+				PortKind::DATA,
+			)
+			.with_type_reference(krunt_graph_model::TypeReference::new(HTTP_REQUEST_TYPE).unwrap()),
+		)
+		.unwrap();
+		node.add_port(krunt_graph_model::Port::new(
+			krunt_graph_model::PortId::new(23).unwrap(),
+			PortDirection::OUTPUT,
+			PortKind::EXECUTION,
+		))
+		.unwrap();
+		node.add_port(
+			krunt_graph_model::Port::new(
+				krunt_graph_model::PortId::new(24).unwrap(),
+				PortDirection::OUTPUT,
+				PortKind::DATA,
+			)
+			.with_type_reference(krunt_graph_model::TypeReference::new(HTTP_REQUEST_TYPE).unwrap()),
+		)
+		.unwrap();
+
+		let lowered = BackendDslPlugin::new().lower_node(&node).unwrap();
+
+		assert_eq!(
+			lowered.input_types(),
+			&[TypeId::new(HTTP_REQUEST_TYPE).unwrap()]
+		);
+		assert_eq!(
+			lowered.output_types(),
+			&[TypeId::new(HTTP_REQUEST_TYPE).unwrap()]
+		);
+		assert_eq!(lowered.attributes()["backend.transform.kind"], "IDENTITY");
+	}
+
+	#[test]
+	fn rejects_identity_transforms_with_mismatched_data_types() {
+		let mut node = Node::new(
+			NodeId::new(2).unwrap(),
+			NodeTypeId::new(TRANSFORM_NODE_TYPE).unwrap(),
+		);
+		node.add_port(
+			krunt_graph_model::Port::new(
+				krunt_graph_model::PortId::new(21).unwrap(),
+				PortDirection::INPUT,
+				PortKind::DATA,
+			)
+			.with_type_reference(krunt_graph_model::TypeReference::new("Request").unwrap()),
+		)
+		.unwrap();
+		node.add_port(
+			krunt_graph_model::Port::new(
+				krunt_graph_model::PortId::new(22).unwrap(),
+				PortDirection::OUTPUT,
+				PortKind::DATA,
+			)
+			.with_type_reference(krunt_graph_model::TypeReference::new("Response").unwrap()),
+		)
+		.unwrap();
+
+		let diagnostics = BackendDslPlugin::new().analyze_node(&node);
+
+		assert_eq!(diagnostics.len(), 1);
+		assert_eq!(
+			diagnostics[0].code().as_str(),
+			"BACKEND_DSL.TRANSFORM_TYPE_MISMATCH"
 		);
 	}
 

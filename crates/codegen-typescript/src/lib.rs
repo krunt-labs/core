@@ -592,19 +592,31 @@ fn operation_declarations(function: &TypeScriptFunction) -> BTreeMap<String, Str
 	function
 		.operations
 		.iter()
-		.filter_map(|operation| match operation.kind() {
-			TypeScriptOperationKind::ENTRY { name }
-			| TypeScriptOperationKind::OPERATION { name }
-				if !is_http_entry(operation) =>
-			{
-				Some((
-					operation.id.as_u32().to_string(),
-					operation_callee(operation.id, name),
-				))
+		.filter_map(|operation| {
+			if is_identity_transform(operation) {
+				return None;
 			}
-			_ => None,
+			match operation.kind() {
+				TypeScriptOperationKind::ENTRY { name }
+				| TypeScriptOperationKind::OPERATION { name }
+					if !is_http_entry(operation) =>
+				{
+					Some((
+						operation.id.as_u32().to_string(),
+						operation_callee(operation.id, name),
+					))
+				}
+				_ => None,
+			}
 		})
 		.collect()
+}
+
+fn is_identity_transform(operation: &TypeScriptOperation) -> bool {
+	operation
+		.attributes()
+		.get("backend.transform.kind")
+		.is_some_and(|kind| kind == "IDENTITY")
 }
 
 fn render_named_operation(
@@ -613,6 +625,19 @@ fn render_named_operation(
 	name: &str,
 	data_inputs: &BTreeMap<TypeScriptOperationId, Vec<Option<TypeScriptOperationId>>>,
 ) {
+	if is_identity_transform(operation) {
+		source.push_str("  const ");
+		source.push_str(&operation_variable(operation.id));
+		source.push_str(" = ");
+		if let Some(value) = first_data_input(operation.id, data_inputs) {
+			source.push_str(&operation_variable(value));
+		} else {
+			source.push_str("undefined");
+		}
+		source.push_str(";\n");
+		return;
+	}
+
 	let callee = operation_callee(operation.id, name);
 	let arguments = data_inputs
 		.get(&operation.id)
@@ -930,6 +955,88 @@ mod tests {
 		assert!(first.contains("generated.ts"));
 		assert!(first.contains("Request"));
 		assert!(first.contains("Response"));
+	}
+
+	#[test]
+	fn renders_identity_transform_as_a_data_assignment() {
+		let mut builder = IRBuilder::new();
+		builder
+			.add_node(IRNode {
+				id: krunt_ir::IrNodeId(1),
+				op: IROp::ENTRY {
+					name: OperationId::new("route").unwrap(),
+				},
+				input_types: Vec::new(),
+				output_types: vec![TypeId::new("Request").unwrap()],
+				async_kind: AsyncKind::SYNC,
+				effects: Vec::new(),
+				attributes: BTreeMap::new(),
+				returns: false,
+				source: SourceMap::node(GraphNodeId(10)),
+			})
+			.unwrap();
+		let mut attributes = BTreeMap::new();
+		attributes.insert("backend.transform.kind".to_string(), "IDENTITY".to_string());
+		builder
+			.add_node(IRNode {
+				id: krunt_ir::IrNodeId(2),
+				op: IROp::OPERATION {
+					name: OperationId::new("backend.transform").unwrap(),
+				},
+				input_types: vec![TypeId::new("Request").unwrap()],
+				output_types: vec![TypeId::new("Request").unwrap()],
+				async_kind: AsyncKind::SYNC,
+				effects: Vec::new(),
+				attributes,
+				returns: false,
+				source: SourceMap::node(GraphNodeId(20)),
+			})
+			.unwrap();
+		builder
+			.add_node(IRNode {
+				id: krunt_ir::IrNodeId(3),
+				op: IROp::RETURN,
+				input_types: vec![TypeId::new("Request").unwrap()],
+				output_types: Vec::new(),
+				async_kind: AsyncKind::SYNC,
+				effects: Vec::new(),
+				attributes: BTreeMap::new(),
+				returns: true,
+				source: SourceMap::node(GraphNodeId(30)),
+			})
+			.unwrap();
+		for (from, to) in [(1, 2), (2, 3)] {
+			builder
+				.add_control_edge(ControlEdge {
+					from: krunt_ir::IrNodeId(from),
+					to: krunt_ir::IrNodeId(to),
+				})
+				.unwrap();
+		}
+		for (from, to) in [(1, 2), (2, 3)] {
+			builder
+				.add_data_edge(DataEdge {
+					from: PortRef {
+						node: krunt_ir::IrNodeId(from),
+						index: 0,
+					},
+					to: PortRef {
+						node: krunt_ir::IrNodeId(to),
+						index: 0,
+					},
+				})
+				.unwrap();
+		}
+
+		let program = TypeScriptBackend::lower_graph(&builder.build().unwrap()).unwrap();
+		let source = TypeScriptSourceRenderer::render_program(&program)
+			.unwrap()
+			.remove("generated.ts")
+			.unwrap();
+
+		assert!(source.contains("const operation_2 = operation_1;"));
+		assert!(source.contains("return operation_2;"));
+		assert!(!source.contains("declare function krunt_backend_transform"));
 	}
 
 	#[test]

@@ -336,6 +336,7 @@ mod tests {
 	use super::*;
 	use krunt_backend_dsl::{
 		BackendDslPlugin, HTTP_REQUEST_TYPE, HTTP_ROUTE_NODE_TYPE, SUCCESS_RESPONSE_NODE_TYPE,
+		TRANSFORM_NODE_TYPE,
 	};
 	use krunt_codegen_typescript::TypeScriptBackend;
 	use krunt_graph_model::{
@@ -400,13 +401,52 @@ mod tests {
 			.with_property("path", Value::String("/users".to_string()))
 			.unwrap();
 
-		let mut response = Node::new(
+		let mut transform = Node::new(
 			NodeId::new(2).unwrap(),
+			NodeTypeId::new(TRANSFORM_NODE_TYPE).unwrap(),
+		);
+		transform
+			.add_port(Port::new(
+				PortId::new(21).unwrap(),
+				PortDirection::INPUT,
+				PortKind::EXECUTION,
+			))
+			.unwrap();
+		transform
+			.add_port(
+				Port::new(
+					PortId::new(22).unwrap(),
+					PortDirection::INPUT,
+					PortKind::DATA,
+				)
+				.with_type_reference(TypeReference::new(HTTP_REQUEST_TYPE).unwrap()),
+			)
+			.unwrap();
+		transform
+			.add_port(Port::new(
+				PortId::new(23).unwrap(),
+				PortDirection::OUTPUT,
+				PortKind::EXECUTION,
+			))
+			.unwrap();
+		transform
+			.add_port(
+				Port::new(
+					PortId::new(24).unwrap(),
+					PortDirection::OUTPUT,
+					PortKind::DATA,
+				)
+				.with_type_reference(TypeReference::new(HTTP_REQUEST_TYPE).unwrap()),
+			)
+			.unwrap();
+
+		let mut response = Node::new(
+			NodeId::new(3).unwrap(),
 			NodeTypeId::new(SUCCESS_RESPONSE_NODE_TYPE).unwrap(),
 		);
 		response
 			.add_port(Port::new(
-				PortId::new(21).unwrap(),
+				PortId::new(31).unwrap(),
 				PortDirection::INPUT,
 				PortKind::EXECUTION,
 			))
@@ -414,7 +454,7 @@ mod tests {
 		response
 			.add_port(
 				Port::new(
-					PortId::new(22).unwrap(),
+					PortId::new(32).unwrap(),
 					PortDirection::INPUT,
 					PortKind::DATA,
 				)
@@ -423,6 +463,7 @@ mod tests {
 			.unwrap();
 
 		builder.add_node(route).unwrap();
+		builder.add_node(transform).unwrap();
 		builder.add_node(response).unwrap();
 		builder
 			.add_edge(Edge::new(
@@ -437,6 +478,22 @@ mod tests {
 				EdgeId::new(32).unwrap(),
 				PortId::new(12).unwrap(),
 				PortId::new(22).unwrap(),
+				EdgeKind::DATA,
+			))
+			.unwrap();
+		builder
+			.add_edge(Edge::new(
+				EdgeId::new(33).unwrap(),
+				PortId::new(23).unwrap(),
+				PortId::new(31).unwrap(),
+				EdgeKind::EXECUTION,
+			))
+			.unwrap();
+		builder
+			.add_edge(Edge::new(
+				EdgeId::new(34).unwrap(),
+				PortId::new(24).unwrap(),
+				PortId::new(32).unwrap(),
 				EdgeKind::DATA,
 			))
 			.unwrap();
@@ -543,7 +600,15 @@ mod tests {
 		assert!(project
 			.file("src/generated.ts")
 			.unwrap()
-			.contains("return operation_1;"));
+			.contains("return operation_2;"));
+		assert!(project
+			.file("src/generated.ts")
+			.unwrap()
+			.contains("const operation_2 = operation_1;"));
+		assert!(!project
+			.file("src/generated.ts")
+			.unwrap()
+			.contains("declare function krunt_backend_transform"));
 		assert!(!project
 			.file("src/generated.ts")
 			.unwrap()
