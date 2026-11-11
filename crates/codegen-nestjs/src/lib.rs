@@ -7,7 +7,8 @@
 //! operations to concrete controllers, providers, and repositories.
 
 use krunt_codegen_typescript::{
-	TypeScriptOperationKind, TypeScriptProgram, TypeScriptRenderError, TypeScriptSourceRenderer,
+	TypeScriptFunction, TypeScriptOperationKind, TypeScriptProgram, TypeScriptRenderError,
+	TypeScriptSourceRenderer,
 };
 use krunt_framework_backend::{FrameworkBackend, GeneratedProject, ProjectError};
 use krunt_ir::GraphElementId;
@@ -23,6 +24,14 @@ pub struct NestJsProgram {
 	version: u32,
 	fallback_execution_name: String,
 	routes: Vec<NestJsRoute>,
+}
+
+/// Response semantics preserved by the NestJS framework lowering boundary.
+#[allow(non_camel_case_types)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+pub enum NestJsResponseKind {
+	SUCCESS,
+	ERROR,
 }
 
 impl NestJsProgram {
@@ -50,6 +59,7 @@ pub struct NestJsRoute {
 	source: String,
 	execution_name: String,
 	status_code: u16,
+	response_kind: NestJsResponseKind,
 }
 
 impl NestJsRoute {
@@ -75,6 +85,10 @@ impl NestJsRoute {
 
 	pub fn status_code(&self) -> u16 {
 		self.status_code
+	}
+
+	pub fn response_kind(&self) -> NestJsResponseKind {
+		self.response_kind
 	}
 }
 
@@ -127,6 +141,7 @@ impl FrameworkBackend for NestJsBackend {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum NestJsGenerationError {
 	MISSING_EXECUTE_FUNCTION,
+	UNSUPPORTED_RESPONSE_KIND { kind: String },
 	TYPESCRIPT_RENDER(TypeScriptRenderError),
 	PROJECT(ProjectError),
 }
@@ -136,6 +151,12 @@ impl fmt::Display for NestJsGenerationError {
 		match self {
 			Self::MISSING_EXECUTE_FUNCTION => {
 				write!(f, "TypeScript program does not expose an execute function")
+			}
+			Self::UNSUPPORTED_RESPONSE_KIND { kind } => {
+				write!(
+					f,
+					"unsupported response kind '{kind}' in TypeScript program"
+				)
 			}
 			Self::TYPESCRIPT_RENDER(error) => write!(f, "TypeScript rendering failed: {error}"),
 			Self::PROJECT(error) => write!(f, "generated project is invalid: {error}"),
@@ -166,21 +187,21 @@ fn lower_nestjs_program(
 	Ok(NestJsProgram {
 		version: NestJsProgram::CURRENT_VERSION,
 		fallback_execution_name,
-		routes: lower_routes(program),
+		routes: lower_routes(program)?,
 	})
 }
 
-fn lower_routes(program: &TypeScriptProgram) -> Vec<NestJsRoute> {
-	let mut routes = program
-		.modules()
-		.iter()
-		.flat_map(|module| module.functions())
-		.filter_map(|function| {
-			let operation = function.operations().iter().find(|operation| {
+fn lower_routes(program: &TypeScriptProgram) -> Result<Vec<NestJsRoute>, NestJsGenerationError> {
+	let mut routes = Vec::new();
+	for module in program.modules() {
+		for function in module.functions() {
+			let Some(operation) = function.operations().iter().find(|operation| {
 				matches!(operation.kind(), TypeScriptOperationKind::ENTRY { .. })
 					&& operation.attributes().contains_key("backend.http.method")
 					&& operation.attributes().contains_key("backend.http.path")
-			})?;
+			}) else {
+				continue;
+			};
 			let status_code = function
 				.operations()
 				.iter()
@@ -188,18 +209,45 @@ fn lower_routes(program: &TypeScriptProgram) -> Vec<NestJsRoute> {
 				.and_then(|operation| operation.attributes().get("response.status_code"))
 				.and_then(|value| value.parse().ok())
 				.unwrap_or(200);
-			Some(NestJsRoute {
+			routes.push(NestJsRoute {
 				operation_id: operation.id().as_u32(),
-				method: operation.attributes().get("backend.http.method")?.clone(),
-				path: operation.attributes().get("backend.http.path")?.clone(),
+				method: operation
+					.attributes()
+					.get("backend.http.method")
+					.cloned()
+					.unwrap_or_default(),
+				path: operation
+					.attributes()
+					.get("backend.http.path")
+					.cloned()
+					.unwrap_or_default(),
 				source: source_marker(operation.source()),
 				execution_name: function.name().to_string(),
 				status_code,
-			})
-		})
-		.collect::<Vec<_>>();
+				response_kind: response_kind(function)?,
+			});
+		}
+	}
 	routes.sort();
-	routes
+	Ok(routes)
+}
+
+fn response_kind(
+	function: &TypeScriptFunction,
+) -> Result<NestJsResponseKind, NestJsGenerationError> {
+	let value = function
+		.operations()
+		.iter()
+		.find(|operation| matches!(operation.kind(), TypeScriptOperationKind::RETURN))
+		.and_then(|operation| operation.attributes().get("response.kind"))
+		.map(String::as_str);
+	match value {
+		None | Some("SUCCESS") => Ok(NestJsResponseKind::SUCCESS),
+		Some("ERROR") => Ok(NestJsResponseKind::ERROR),
+		Some(kind) => Err(NestJsGenerationError::UNSUPPORTED_RESPONSE_KIND {
+			kind: kind.to_string(),
+		}),
+	}
 }
 
 fn static_project_files(program: &NestJsProgram) -> Vec<(String, String)> {
@@ -372,8 +420,9 @@ npm start
 
 `src/generated.ts` contains source-linked operation markers and one execution
 function per HTTP route. The initial Backend DSL slice generates route-specific
-handlers and successful HTTP 200 responses; additional semantic operation
-implementations will be added as more Backend DSL nodes are introduced.
+handlers with the declared success or error HTTP status; additional semantic
+operation implementations will be added as more Backend DSL nodes are
+introduced.
 "#
 	.to_string()
 }
@@ -416,8 +465,8 @@ fn tsconfig_build() -> String {
 mod tests {
 	use super::*;
 	use krunt_backend_dsl::{
-		BackendDslPlugin, HTTP_REQUEST_TYPE, HTTP_ROUTE_NODE_TYPE, SUCCESS_RESPONSE_NODE_TYPE,
-		TRANSFORM_NODE_TYPE,
+		BackendDslPlugin, ERROR_RESPONSE_NODE_TYPE, HTTP_REQUEST_TYPE, HTTP_ROUTE_NODE_TYPE,
+		SUCCESS_RESPONSE_NODE_TYPE, TRANSFORM_NODE_TYPE,
 	};
 	use krunt_codegen_typescript::TypeScriptBackend;
 	use krunt_graph_model::{
@@ -450,6 +499,17 @@ mod tests {
 	}
 
 	fn backend_dsl_program() -> TypeScriptProgram {
+		backend_dsl_program_with_response(SUCCESS_RESPONSE_NODE_TYPE, 201)
+	}
+
+	fn backend_dsl_error_program() -> TypeScriptProgram {
+		backend_dsl_program_with_response(ERROR_RESPONSE_NODE_TYPE, 422)
+	}
+
+	fn backend_dsl_program_with_response(
+		response_node_type: &str,
+		status_code: u16,
+	) -> TypeScriptProgram {
 		let metadata =
 			GraphMetadata::new(GraphId::new(1).unwrap(), "backend-v1", "krunt-test").unwrap();
 		let mut builder = GraphBuilder::new(metadata);
@@ -523,7 +583,7 @@ mod tests {
 
 		let mut response = Node::new(
 			NodeId::new(3).unwrap(),
-			NodeTypeId::new(SUCCESS_RESPONSE_NODE_TYPE).unwrap(),
+			NodeTypeId::new(response_node_type).unwrap(),
 		);
 		response
 			.add_port(Port::new(
@@ -543,7 +603,10 @@ mod tests {
 			)
 			.unwrap();
 		response = response
-			.with_property("status_code", Value::Number(serde_json::Number::from(201)))
+			.with_property(
+				"status_code",
+				Value::Number(serde_json::Number::from(status_code)),
+			)
 			.unwrap();
 
 		builder.add_node(route).unwrap();
@@ -682,6 +745,10 @@ mod tests {
 		assert_eq!(first.routes()[0].execution_name(), "execute_1");
 		assert_eq!(first.routes()[0].status_code(), 201);
 		assert_eq!(
+			first.routes()[0].response_kind(),
+			NestJsResponseKind::SUCCESS
+		);
+		assert_eq!(
 			serde_json::to_string(&first).unwrap(),
 			serde_json::to_string(&second).unwrap()
 		);
@@ -720,7 +787,26 @@ mod tests {
 	}
 
 	#[test]
-	fn compiler_rejects_a_route_without_a_success_response() {
+	fn preserves_backend_dsl_error_responses_in_the_nestjs_program() {
+		let program = backend_dsl_error_program();
+		let framework_program = NestJsBackend::lower_program(&program).unwrap();
+
+		assert_eq!(framework_program.routes().len(), 1);
+		assert_eq!(framework_program.routes()[0].status_code(), 422);
+		assert_eq!(
+			framework_program.routes()[0].response_kind(),
+			NestJsResponseKind::ERROR
+		);
+
+		let project = NestJsBackend::generate_project(&program).unwrap();
+		assert!(project
+			.file("src/app.controller.ts")
+			.unwrap()
+			.contains("@HttpCode(422)"));
+	}
+
+	#[test]
+	fn compiler_rejects_a_route_without_a_terminal_response() {
 		let mut registry = PluginRegistry::new();
 		BackendDslPlugin::register(&mut registry).unwrap();
 		let result =

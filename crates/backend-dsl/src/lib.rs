@@ -1,10 +1,10 @@
 //! Initial Krunt Backend DSL semantic plugin.
 //!
 //! This crate owns backend meaning for the first vertical slice. It describes
-//! HTTP Route, Identity Transform, and Success Response nodes, validates their
-//! properties and typed data contracts, and lowers them into target-neutral
-//! operations with namespaced metadata. It does not emit TypeScript or NestJS
-//! code.
+//! HTTP Route, Identity Transform, Success Response, and Error Response nodes,
+//! validates their properties and typed data contracts, and lowers them into
+//! target-neutral operations with namespaced metadata. It does not emit
+//! TypeScript or NestJS code.
 
 use krunt_diagnostics::{CompilerStage, Diagnostic, DiagnosticCode, GraphElementId, Severity};
 use krunt_graph_model::{
@@ -24,9 +24,11 @@ pub const BACKEND_DSL_VERSION: &str = "0.1.0";
 pub const HTTP_ROUTE_NODE_TYPE: &str = "backend.http_route";
 pub const TRANSFORM_NODE_TYPE: &str = "backend.transform";
 pub const SUCCESS_RESPONSE_NODE_TYPE: &str = "backend.success_response";
+pub const ERROR_RESPONSE_NODE_TYPE: &str = "backend.error_response";
 pub const HTTP_REQUEST_TYPE: &str = "HttpRequest";
 pub const RESPONSE_BODY_TYPE: &str = "ANY";
 pub const SUCCESS_RESPONSE_DEFAULT_STATUS_CODE: u16 = 200;
+pub const ERROR_RESPONSE_DEFAULT_STATUS_CODE: u16 = 500;
 
 const HTTP_METHODS: [&str; 7] = ["DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT"];
 
@@ -154,6 +156,8 @@ impl BackendDslPlugin {
 			NodeTypeId::new(TRANSFORM_NODE_TYPE).expect("static node type is valid");
 		let response_type =
 			NodeTypeId::new(SUCCESS_RESPONSE_NODE_TYPE).expect("static node type is valid");
+		let error_response_type =
+			NodeTypeId::new(ERROR_RESPONSE_NODE_TYPE).expect("static node type is valid");
 		let request_type = TypeId::new(HTTP_REQUEST_TYPE).expect("static type is valid");
 		let response_body_type = TypeId::new(RESPONSE_BODY_TYPE).expect("static type is valid");
 		let manifest = PluginManifest::new(
@@ -163,6 +167,7 @@ impl BackendDslPlugin {
 				route_type.clone(),
 				transform_type.clone(),
 				response_type.clone(),
+				error_response_type.clone(),
 			],
 		)
 		.expect("static plugin manifest is valid");
@@ -239,7 +244,7 @@ impl BackendDslPlugin {
 					),
 					BackendPortDescriptor::new(
 						"body",
-						PortContract::new(PortKind::DATA, Some(response_body_type), false),
+						PortContract::new(PortKind::DATA, Some(response_body_type.clone()), false),
 					),
 				],
 				outputs: Vec::new(),
@@ -249,6 +254,30 @@ impl BackendDslPlugin {
 					false,
 					Some(Value::Number(serde_json::Number::from(
 						SUCCESS_RESPONSE_DEFAULT_STATUS_CODE,
+					))),
+				)],
+			},
+			BackendNodeDescriptor {
+				type_id: error_response_type,
+				label: "Error Response".to_string(),
+				category: "Response".to_string(),
+				inputs: vec![
+					BackendPortDescriptor::new(
+						"in",
+						PortContract::new(PortKind::EXECUTION, None, true),
+					),
+					BackendPortDescriptor::new(
+						"body",
+						PortContract::new(PortKind::DATA, Some(response_body_type), false),
+					),
+				],
+				outputs: Vec::new(),
+				properties: vec![BackendPropertyDescriptor::new(
+					"status_code",
+					BackendPropertyKind::INTEGER,
+					false,
+					Some(Value::Number(serde_json::Number::from(
+						ERROR_RESPONSE_DEFAULT_STATUS_CODE,
 					))),
 				)],
 			},
@@ -285,7 +314,7 @@ impl krunt_plugin_api::SemanticPlugin for BackendDslPlugin {
 				route_contract(TypeId::new(HTTP_REQUEST_TYPE).expect("static type is valid"))
 			}
 			TRANSFORM_NODE_TYPE => transform_contract(),
-			SUCCESS_RESPONSE_NODE_TYPE => response_contract(),
+			SUCCESS_RESPONSE_NODE_TYPE | ERROR_RESPONSE_NODE_TYPE => response_contract(),
 			_ => NodeContract::new([], [], [], [], [], AsyncKind::SYNC, []),
 		}
 	}
@@ -306,7 +335,12 @@ impl krunt_plugin_api::SemanticPlugin for BackendDslPlugin {
 				.map(|diagnostic| *diagnostic)
 				.into_iter()
 				.collect(),
-			SUCCESS_RESPONSE_NODE_TYPE => response_status_code(node)
+			SUCCESS_RESPONSE_NODE_TYPE => success_response_status_code(node)
+				.err()
+				.map(|diagnostic| *diagnostic)
+				.into_iter()
+				.collect(),
+			ERROR_RESPONSE_NODE_TYPE => error_response_status_code(node)
 				.err()
 				.map(|diagnostic| *diagnostic)
 				.into_iter()
@@ -342,7 +376,8 @@ impl krunt_plugin_api::SemanticPlugin for BackendDslPlugin {
 				.with_attribute("backend.transform.kind", "IDENTITY"))
 			}
 			SUCCESS_RESPONSE_NODE_TYPE => {
-				let status_code = response_status_code(node).map_err(|error| vec![*error])?;
+				let status_code =
+					success_response_status_code(node).map_err(|error| vec![*error])?;
 				Ok(LoweredOperation::new(
 					OperationId::new(SUCCESS_RESPONSE_NODE_TYPE)
 						.expect("static operation is valid"),
@@ -352,6 +387,20 @@ impl krunt_plugin_api::SemanticPlugin for BackendDslPlugin {
 					[],
 				)
 				.with_return(true)
+				.with_attribute("response.kind", "SUCCESS")
+				.with_attribute("response.status_code", status_code.to_string()))
+			}
+			ERROR_RESPONSE_NODE_TYPE => {
+				let status_code = error_response_status_code(node).map_err(|error| vec![*error])?;
+				Ok(LoweredOperation::new(
+					OperationId::new(ERROR_RESPONSE_NODE_TYPE).expect("static operation is valid"),
+					[TypeId::new(RESPONSE_BODY_TYPE).expect("static type is valid")],
+					[],
+					AsyncKind::SYNC,
+					[],
+				)
+				.with_return(true)
+				.with_attribute("response.kind", "ERROR")
 				.with_attribute("response.status_code", status_code.to_string()))
 			}
 			_ => unreachable!("registry only resolves Backend DSL node types"),
@@ -479,22 +528,56 @@ fn transform_data_types(node: &Node) -> Result<(TypeId, TypeId), Box<Diagnostic>
 	Ok((input_type, output_type))
 }
 
-fn response_status_code(node: &Node) -> Result<u16, Box<Diagnostic>> {
+fn success_response_status_code(node: &Node) -> Result<u16, Box<Diagnostic>> {
+	response_status_code(
+		node,
+		SUCCESS_RESPONSE_DEFAULT_STATUS_CODE,
+		200,
+		299,
+		"Success",
+		"BACKEND_DSL.SUCCESS_RESPONSE_STATUS_CODE_TYPE",
+		"BACKEND_DSL.SUCCESS_RESPONSE_STATUS_CODE_INVALID",
+	)
+}
+
+fn error_response_status_code(node: &Node) -> Result<u16, Box<Diagnostic>> {
+	response_status_code(
+		node,
+		ERROR_RESPONSE_DEFAULT_STATUS_CODE,
+		400,
+		599,
+		"Error",
+		"BACKEND_DSL.ERROR_RESPONSE_STATUS_CODE_TYPE",
+		"BACKEND_DSL.ERROR_RESPONSE_STATUS_CODE_INVALID",
+	)
+}
+
+fn response_status_code(
+	node: &Node,
+	default: u16,
+	minimum: u16,
+	maximum: u16,
+	response_kind: &str,
+	type_code: &str,
+	invalid_code: &str,
+) -> Result<u16, Box<Diagnostic>> {
 	let Some(value) = node.properties().get("status_code") else {
-		return Ok(SUCCESS_RESPONSE_DEFAULT_STATUS_CODE);
+		return Ok(default);
 	};
 	let Some(status_code) = value.as_u64().and_then(|value| u16::try_from(value).ok()) else {
 		return Err(node_diagnostic(
 			node,
-			"BACKEND_DSL.SUCCESS_RESPONSE_STATUS_CODE_TYPE",
-			"Success Response property 'status_code' must be an integer.",
+			type_code,
+			format!("{response_kind} Response property 'status_code' must be an integer."),
 		));
 	};
-	if !(200..=299).contains(&status_code) {
+	if !(minimum..=maximum).contains(&status_code) {
 		return Err(node_diagnostic(
 			node,
-			"BACKEND_DSL.SUCCESS_RESPONSE_STATUS_CODE_INVALID",
-			"Success Response status_code must be between 200 and 299.",
+			invalid_code,
+			format!(
+				"{response_kind} Response status_code must be between {minimum} and {maximum}."
+			),
 		));
 	}
 	Ok(status_code)
@@ -525,10 +608,15 @@ fn validate_route_response_paths(document: &GraphDocument) -> Vec<Diagnostic> {
 		successors.dedup();
 	}
 
-	let response_nodes: std::collections::BTreeSet<_> = document
+	let terminal_response_nodes: std::collections::BTreeSet<_> = document
 		.nodes()
 		.iter()
-		.filter(|node| node.type_id().as_str() == SUCCESS_RESPONSE_NODE_TYPE)
+		.filter(|node| {
+			matches!(
+				node.type_id().as_str(),
+				SUCCESS_RESPONSE_NODE_TYPE | ERROR_RESPONSE_NODE_TYPE
+			)
+		})
 		.map(Node::id)
 		.collect();
 
@@ -546,7 +634,7 @@ fn validate_route_response_paths(document: &GraphDocument) -> Vec<Diagnostic> {
 				if !visited.insert(node_id) {
 					continue;
 				}
-				if response_nodes.contains(&node_id) {
+				if terminal_response_nodes.contains(&node_id) {
 					reaches_response = true;
 					continue;
 				}
@@ -566,7 +654,7 @@ fn validate_route_response_paths(document: &GraphDocument) -> Vec<Diagnostic> {
 			Some(node_diagnostic(
 				route,
 				"BACKEND_DSL.HTTP_ROUTE_MISSING_RESPONSE",
-				"Every HTTP Route execution path must reach a Success Response.",
+				"Every HTTP Route execution path must reach a Success Response or Error Response.",
 			))
 		})
 		.map(|diagnostic| *diagnostic)
@@ -665,7 +753,7 @@ mod tests {
 	#[test]
 	fn exposes_route_and_response_descriptors() {
 		let plugin = BackendDslPlugin::new();
-		assert_eq!(plugin.descriptors().len(), 3);
+		assert_eq!(plugin.descriptors().len(), 4);
 		assert_eq!(plugin.descriptors()[0].label(), "HTTP Route");
 		assert_eq!(plugin.descriptors()[0].properties().len(), 2);
 		assert_eq!(plugin.descriptors()[1].label(), "Identity Transform");
@@ -695,6 +783,21 @@ mod tests {
 		assert_eq!(
 			response.inputs()[1].contract().type_id().unwrap().as_str(),
 			RESPONSE_BODY_TYPE
+		);
+		let error_response = plugin
+			.descriptors()
+			.iter()
+			.find(|descriptor| descriptor.type_id().as_str() == ERROR_RESPONSE_NODE_TYPE)
+			.expect("error response descriptor should be registered");
+		assert_eq!(error_response.label(), "Error Response");
+		assert_eq!(error_response.inputs().len(), 2);
+		assert!(!error_response.inputs()[1].contract().required());
+		assert_eq!(error_response.properties().len(), 1);
+		assert_eq!(
+			error_response.properties()[0].default(),
+			Some(&Value::Number(serde_json::Number::from(
+				ERROR_RESPONSE_DEFAULT_STATUS_CODE,
+			)))
 		);
 	}
 
@@ -796,6 +899,7 @@ mod tests {
 			&[TypeId::new(RESPONSE_BODY_TYPE).unwrap()]
 		);
 		assert!(lowered.returns());
+		assert_eq!(lowered.attributes()["response.kind"], "SUCCESS");
 		assert_eq!(lowered.attributes()["response.status_code"], "200");
 	}
 
@@ -810,6 +914,36 @@ mod tests {
 		let lowered = BackendDslPlugin::new().lower_node(&node).unwrap();
 
 		assert_eq!(lowered.attributes()["response.status_code"], "201");
+	}
+
+	#[test]
+	fn lowers_error_response_with_a_default_status_code() {
+		let node = Node::new(
+			NodeId::new(2).unwrap(),
+			NodeTypeId::new(ERROR_RESPONSE_NODE_TYPE).unwrap(),
+		);
+		let lowered = BackendDslPlugin::new().lower_node(&node).unwrap();
+
+		assert!(lowered.returns());
+		assert_eq!(lowered.attributes()["response.kind"], "ERROR");
+		assert_eq!(lowered.attributes()["response.status_code"], "500");
+	}
+
+	#[test]
+	fn rejects_invalid_error_response_status_codes() {
+		let node = Node::new(
+			NodeId::new(2).unwrap(),
+			NodeTypeId::new(ERROR_RESPONSE_NODE_TYPE).unwrap(),
+		)
+		.with_property("status_code", Value::Number(serde_json::Number::from(201)))
+		.unwrap();
+		let diagnostics = BackendDslPlugin::new().analyze_node(&node);
+
+		assert_eq!(diagnostics.len(), 1);
+		assert_eq!(
+			diagnostics[0].code().as_str(),
+			"BACKEND_DSL.ERROR_RESPONSE_STATUS_CODE_INVALID"
+		);
 	}
 
 	#[test]
