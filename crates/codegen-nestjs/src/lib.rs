@@ -466,7 +466,7 @@ mod tests {
 	use super::*;
 	use krunt_backend_dsl::{
 		BackendDslPlugin, ERROR_RESPONSE_NODE_TYPE, HTTP_REQUEST_TYPE, HTTP_ROUTE_NODE_TYPE,
-		SUCCESS_RESPONSE_NODE_TYPE, TRANSFORM_NODE_TYPE,
+		SUCCESS_RESPONSE_NODE_TYPE, TRANSFORM_NODE_TYPE, VALIDATION_ERROR_NODE_TYPE,
 	};
 	use krunt_codegen_typescript::TypeScriptBackend;
 	use krunt_graph_model::{
@@ -504,6 +504,10 @@ mod tests {
 
 	fn backend_dsl_error_program() -> TypeScriptProgram {
 		backend_dsl_program_with_response(ERROR_RESPONSE_NODE_TYPE, 422)
+	}
+
+	fn backend_dsl_validation_error_program() -> TypeScriptProgram {
+		backend_dsl_program_with_response(VALIDATION_ERROR_NODE_TYPE, 422)
 	}
 
 	fn backend_dsl_program_with_response(
@@ -602,12 +606,14 @@ mod tests {
 				.with_type_reference(TypeReference::new("ANY").unwrap()),
 			)
 			.unwrap();
-		response = response
-			.with_property(
-				"status_code",
-				Value::Number(serde_json::Number::from(status_code)),
-			)
-			.unwrap();
+		if response_node_type != VALIDATION_ERROR_NODE_TYPE {
+			response = response
+				.with_property(
+					"status_code",
+					Value::Number(serde_json::Number::from(status_code)),
+				)
+				.unwrap();
+		}
 
 		builder.add_node(route).unwrap();
 		builder.add_node(transform).unwrap();
@@ -803,6 +809,19 @@ mod tests {
 			.file("src/app.controller.ts")
 			.unwrap()
 			.contains("@HttpCode(422)"));
+	}
+
+	#[test]
+	fn preserves_validation_errors_as_bad_request_responses() {
+		let program = backend_dsl_validation_error_program();
+		let framework_program = NestJsBackend::lower_program(&program).unwrap();
+
+		assert_eq!(framework_program.routes().len(), 1);
+		assert_eq!(framework_program.routes()[0].status_code(), 400);
+		assert_eq!(
+			framework_program.routes()[0].response_kind(),
+			NestJsResponseKind::ERROR
+		);
 	}
 
 	#[test]

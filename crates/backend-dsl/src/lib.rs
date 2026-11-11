@@ -1,10 +1,10 @@
 //! Initial Krunt Backend DSL semantic plugin.
 //!
 //! This crate owns backend meaning for the first vertical slice. It describes
-//! HTTP Route, Identity Transform, Success Response, Error Response, and
-//! Try/Catch nodes, validates their properties and typed data contracts, and
-//! lowers them into target-neutral operations with namespaced metadata. It does
-//! not emit TypeScript or NestJS code.
+//! HTTP Route, Identity Transform, Success Response, Error Response, Try/Catch,
+//! and Validation Error nodes, validates their properties and typed data
+//! contracts, and lowers them into target-neutral operations with namespaced
+//! metadata. It does not emit TypeScript or NestJS code.
 
 use krunt_diagnostics::{CompilerStage, Diagnostic, DiagnosticCode, GraphElementId, Severity};
 use krunt_graph_model::{
@@ -27,10 +27,13 @@ pub const TRANSFORM_NODE_TYPE: &str = "backend.transform";
 pub const SUCCESS_RESPONSE_NODE_TYPE: &str = "backend.success_response";
 pub const ERROR_RESPONSE_NODE_TYPE: &str = "backend.error_response";
 pub const TRY_CATCH_NODE_TYPE: &str = "backend.try_catch";
+pub const VALIDATION_ERROR_NODE_TYPE: &str = "backend.validation_error";
 pub const HTTP_REQUEST_TYPE: &str = "HttpRequest";
 pub const RESPONSE_BODY_TYPE: &str = "ANY";
 pub const SUCCESS_RESPONSE_DEFAULT_STATUS_CODE: u16 = 200;
 pub const ERROR_RESPONSE_DEFAULT_STATUS_CODE: u16 = 500;
+pub const VALIDATION_ERROR_DEFAULT_STATUS_CODE: u16 = 400;
+pub const VALIDATION_ERROR_DEFAULT_MESSAGE: &str = "Validation failed";
 
 const HTTP_METHODS: [&str; 7] = ["DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT"];
 
@@ -162,6 +165,8 @@ impl BackendDslPlugin {
 			NodeTypeId::new(ERROR_RESPONSE_NODE_TYPE).expect("static node type is valid");
 		let try_catch_type =
 			NodeTypeId::new(TRY_CATCH_NODE_TYPE).expect("static node type is valid");
+		let validation_error_type =
+			NodeTypeId::new(VALIDATION_ERROR_NODE_TYPE).expect("static node type is valid");
 		let request_type = TypeId::new(HTTP_REQUEST_TYPE).expect("static type is valid");
 		let response_body_type = TypeId::new(RESPONSE_BODY_TYPE).expect("static type is valid");
 		let manifest = PluginManifest::new(
@@ -173,6 +178,7 @@ impl BackendDslPlugin {
 				response_type.clone(),
 				error_response_type.clone(),
 				try_catch_type.clone(),
+				validation_error_type.clone(),
 			],
 		)
 		.expect("static plugin manifest is valid");
@@ -273,7 +279,7 @@ impl BackendDslPlugin {
 					),
 					BackendPortDescriptor::new(
 						"body",
-						PortContract::new(PortKind::DATA, Some(response_body_type), false),
+						PortContract::new(PortKind::DATA, Some(response_body_type.clone()), false),
 					),
 				],
 				outputs: Vec::new(),
@@ -305,6 +311,28 @@ impl BackendDslPlugin {
 					),
 				],
 				properties: Vec::new(),
+			},
+			BackendNodeDescriptor {
+				type_id: validation_error_type,
+				label: "Validation Error".to_string(),
+				category: "Error Handling".to_string(),
+				inputs: vec![
+					BackendPortDescriptor::new(
+						"in",
+						PortContract::new(PortKind::EXECUTION, None, true),
+					),
+					BackendPortDescriptor::new(
+						"body",
+						PortContract::new(PortKind::DATA, Some(response_body_type), false),
+					),
+				],
+				outputs: Vec::new(),
+				properties: vec![BackendPropertyDescriptor::new(
+					"message",
+					BackendPropertyKind::STRING,
+					false,
+					Some(Value::String(VALIDATION_ERROR_DEFAULT_MESSAGE.to_string())),
+				)],
 			},
 		];
 		Self {
@@ -341,6 +369,7 @@ impl krunt_plugin_api::SemanticPlugin for BackendDslPlugin {
 			TRANSFORM_NODE_TYPE => transform_contract(),
 			SUCCESS_RESPONSE_NODE_TYPE | ERROR_RESPONSE_NODE_TYPE => response_contract(),
 			TRY_CATCH_NODE_TYPE => try_catch_contract(),
+			VALIDATION_ERROR_NODE_TYPE => response_contract(),
 			_ => NodeContract::new([], [], [], [], [], AsyncKind::SYNC, []),
 		}
 	}
@@ -374,6 +403,11 @@ impl krunt_plugin_api::SemanticPlugin for BackendDslPlugin {
 				.into_iter()
 				.collect(),
 			TRY_CATCH_NODE_TYPE => Vec::new(),
+			VALIDATION_ERROR_NODE_TYPE => validation_error_message(node)
+				.err()
+				.map(|diagnostic| *diagnostic)
+				.into_iter()
+				.collect(),
 			_ => Vec::new(),
 		}
 	}
@@ -443,6 +477,25 @@ impl krunt_plugin_api::SemanticPlugin for BackendDslPlugin {
 			.with_attribute("error.handling.kind", "TRY_CATCH")
 			.with_attribute("error.handling.try_output", "0")
 			.with_attribute("error.handling.catch_output", "1")),
+			VALIDATION_ERROR_NODE_TYPE => {
+				let message = validation_error_message(node).map_err(|error| vec![*error])?;
+				Ok(LoweredOperation::new(
+					OperationId::new(VALIDATION_ERROR_NODE_TYPE)
+						.expect("static operation is valid"),
+					[TypeId::new(RESPONSE_BODY_TYPE).expect("static type is valid")],
+					[],
+					AsyncKind::SYNC,
+					[],
+				)
+				.with_return(true)
+				.with_attribute("response.kind", "ERROR")
+				.with_attribute(
+					"response.status_code",
+					VALIDATION_ERROR_DEFAULT_STATUS_CODE.to_string(),
+				)
+				.with_attribute("error.kind", "VALIDATION")
+				.with_attribute("error.message", message))
+			}
 			_ => unreachable!("registry only resolves Backend DSL node types"),
 		}
 	}
@@ -520,6 +573,27 @@ fn try_catch_contract() -> NodeContract {
 		AsyncKind::SYNC,
 		[],
 	)
+}
+
+fn validation_error_message(node: &Node) -> Result<String, Box<Diagnostic>> {
+	let Some(value) = node.properties().get("message") else {
+		return Ok(VALIDATION_ERROR_DEFAULT_MESSAGE.to_string());
+	};
+	let Some(message) = value.as_str() else {
+		return Err(node_diagnostic(
+			node,
+			"BACKEND_DSL.VALIDATION_ERROR_MESSAGE_TYPE",
+			"Validation Error property 'message' must be a string.",
+		));
+	};
+	if message.trim().is_empty() {
+		return Err(node_diagnostic(
+			node,
+			"BACKEND_DSL.VALIDATION_ERROR_MESSAGE_EMPTY",
+			"Validation Error property 'message' must not be empty.",
+		));
+	}
+	Ok(message.to_string())
 }
 
 fn transform_data_types(node: &Node) -> Result<(TypeId, TypeId), Box<Diagnostic>> {
@@ -669,7 +743,7 @@ fn validate_route_response_paths(document: &GraphDocument) -> Vec<Diagnostic> {
 		.filter(|node| {
 			matches!(
 				node.type_id().as_str(),
-				SUCCESS_RESPONSE_NODE_TYPE | ERROR_RESPONSE_NODE_TYPE
+				SUCCESS_RESPONSE_NODE_TYPE | ERROR_RESPONSE_NODE_TYPE | VALIDATION_ERROR_NODE_TYPE
 			)
 		})
 		.map(Node::id)
@@ -854,7 +928,7 @@ mod tests {
 	#[test]
 	fn exposes_route_and_response_descriptors() {
 		let plugin = BackendDslPlugin::new();
-		assert_eq!(plugin.descriptors().len(), 5);
+		assert_eq!(plugin.descriptors().len(), 6);
 		assert_eq!(plugin.descriptors()[0].label(), "HTTP Route");
 		assert_eq!(plugin.descriptors()[0].properties().len(), 2);
 		assert_eq!(plugin.descriptors()[1].label(), "Identity Transform");
@@ -910,6 +984,21 @@ mod tests {
 		assert_eq!(try_catch.inputs().len(), 1);
 		assert_eq!(try_catch.outputs().len(), 2);
 		assert!(try_catch.properties().is_empty());
+		let validation_error = plugin
+			.descriptors()
+			.iter()
+			.find(|descriptor| descriptor.type_id().as_str() == VALIDATION_ERROR_NODE_TYPE)
+			.expect("validation error descriptor should be registered");
+		assert_eq!(validation_error.label(), "Validation Error");
+		assert_eq!(validation_error.category(), "Error Handling");
+		assert_eq!(validation_error.inputs().len(), 2);
+		assert!(!validation_error.inputs()[1].contract().required());
+		assert_eq!(validation_error.properties().len(), 1);
+		assert_eq!(validation_error.properties()[0].key(), "message");
+		assert_eq!(
+			validation_error.properties()[0].default(),
+			Some(&Value::String(VALIDATION_ERROR_DEFAULT_MESSAGE.to_string()))
+		);
 	}
 
 	#[test]
@@ -1069,6 +1158,65 @@ mod tests {
 		assert_eq!(lowered.kind(), LoweredOperationKind::BRANCH);
 		assert_eq!(lowered.attributes()["error.handling.kind"], "TRY_CATCH");
 		assert!(!lowered.returns());
+	}
+
+	#[test]
+	fn lowers_validation_error_with_default_response_metadata() {
+		let node = Node::new(
+			NodeId::new(2).unwrap(),
+			NodeTypeId::new(VALIDATION_ERROR_NODE_TYPE).unwrap(),
+		);
+		let lowered = BackendDslPlugin::new().lower_node(&node).unwrap();
+
+		assert!(lowered.returns());
+		assert_eq!(lowered.attributes()["response.kind"], "ERROR");
+		assert_eq!(
+			lowered.attributes()["response.status_code"],
+			VALIDATION_ERROR_DEFAULT_STATUS_CODE.to_string()
+		);
+		assert_eq!(
+			lowered.attributes()["error.message"],
+			VALIDATION_ERROR_DEFAULT_MESSAGE
+		);
+	}
+
+	#[test]
+	fn lowers_validation_error_with_a_custom_message() {
+		let node = Node::new(
+			NodeId::new(2).unwrap(),
+			NodeTypeId::new(VALIDATION_ERROR_NODE_TYPE).unwrap(),
+		)
+		.with_property("message", Value::String("email is invalid".to_string()))
+		.unwrap();
+		let lowered = BackendDslPlugin::new().lower_node(&node).unwrap();
+
+		assert_eq!(lowered.attributes()["error.message"], "email is invalid");
+	}
+
+	#[test]
+	fn rejects_invalid_validation_error_messages() {
+		let plugin = BackendDslPlugin::new();
+		let wrong_type = Node::new(
+			NodeId::new(2).unwrap(),
+			NodeTypeId::new(VALIDATION_ERROR_NODE_TYPE).unwrap(),
+		)
+		.with_property("message", Value::Bool(true))
+		.unwrap();
+		let empty = Node::new(
+			NodeId::new(3).unwrap(),
+			NodeTypeId::new(VALIDATION_ERROR_NODE_TYPE).unwrap(),
+		)
+		.with_property("message", Value::String("  ".to_string()))
+		.unwrap();
+
+		assert_eq!(
+			plugin.analyze_node(&wrong_type)[0].code().as_str(),
+			"BACKEND_DSL.VALIDATION_ERROR_MESSAGE_TYPE"
+		);
+		assert_eq!(
+			plugin.analyze_node(&empty)[0].code().as_str(),
+			"BACKEND_DSL.VALIDATION_ERROR_MESSAGE_EMPTY"
+		);
 	}
 
 	#[test]
