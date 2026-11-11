@@ -542,6 +542,9 @@ mod tests {
 				.with_type_reference(TypeReference::new("ANY").unwrap()),
 			)
 			.unwrap();
+		response = response
+			.with_property("status_code", Value::Number(serde_json::Number::from(201)))
+			.unwrap();
 
 		builder.add_node(route).unwrap();
 		builder.add_node(transform).unwrap();
@@ -677,7 +680,7 @@ mod tests {
 		assert_eq!(first.routes()[0].method(), "GET");
 		assert_eq!(first.routes()[0].path(), "/users");
 		assert_eq!(first.routes()[0].execution_name(), "execute_1");
-		assert_eq!(first.routes()[0].status_code(), 200);
+		assert_eq!(first.routes()[0].status_code(), 201);
 		assert_eq!(
 			serde_json::to_string(&first).unwrap(),
 			serde_json::to_string(&second).unwrap()
@@ -690,7 +693,7 @@ mod tests {
 		let controller = project.file("src/app.controller.ts").unwrap();
 
 		assert!(controller.contains("// krunt:source=node:1"));
-		assert!(controller.contains("@HttpCode(200)"));
+		assert!(controller.contains("@HttpCode(201)"));
 		assert!(controller.contains("@Get('/users')"));
 		assert!(controller.contains("@Req() request: unknown"));
 		assert!(controller.contains("return execute_1(request);"));
