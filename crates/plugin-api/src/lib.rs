@@ -48,10 +48,21 @@ impl PluginManifest {
 	}
 }
 
+/// The target-neutral control shape returned by a semantic plugin.
+#[allow(non_camel_case_types)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub enum LoweredOperationKind {
+	OPERATION,
+	BRANCH,
+	MERGE,
+	LOOP,
+}
+
 /// The target-neutral operation returned by a semantic plugin.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct LoweredOperation {
 	operation: OperationId,
+	kind: LoweredOperationKind,
 	input_types: Vec<TypeId>,
 	output_types: Vec<TypeId>,
 	async_kind: AsyncKind,
@@ -73,6 +84,7 @@ impl LoweredOperation {
 		effects.dedup();
 		Self {
 			operation,
+			kind: LoweredOperationKind::OPERATION,
 			input_types: input_types.into_iter().collect(),
 			output_types: output_types.into_iter().collect(),
 			async_kind,
@@ -80,6 +92,12 @@ impl LoweredOperation {
 			attributes: BTreeMap::new(),
 			returns: false,
 		}
+	}
+
+	/// Set the canonical control shape for this lowered operation.
+	pub fn with_kind(mut self, kind: LoweredOperationKind) -> Self {
+		self.kind = kind;
+		self
 	}
 
 	/// Mark this operation as a target-neutral return/terminal operation.
@@ -99,6 +117,10 @@ impl LoweredOperation {
 
 	pub fn operation(&self) -> &OperationId {
 		&self.operation
+	}
+
+	pub fn kind(&self) -> LoweredOperationKind {
+		self.kind
 	}
 
 	pub fn input_types(&self) -> &[TypeId] {

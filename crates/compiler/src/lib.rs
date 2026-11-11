@@ -12,7 +12,9 @@ use krunt_ir::{
 	eliminate_unreachable_nodes, BuildError, ControlEdge, DataEdge, GraphNodeId, IRBuilder,
 	IRGraph, IRNode, IROp, PortRef, SourceMap,
 };
-use krunt_plugin_api::{CapabilityId, LoweredOperation, NodeContract, PluginRegistry};
+use krunt_plugin_api::{
+	CapabilityId, LoweredOperation, LoweredOperationKind, NodeContract, PluginRegistry,
+};
 use krunt_type_system::{check_assignable, Type};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
@@ -779,8 +781,13 @@ fn ir_node(
 				name: lowered.operation().clone(),
 			}
 		} else {
-			IROp::OPERATION {
-				name: lowered.operation().clone(),
+			match lowered.kind() {
+				LoweredOperationKind::OPERATION => IROp::OPERATION {
+					name: lowered.operation().clone(),
+				},
+				LoweredOperationKind::BRANCH => IROp::BRANCH,
+				LoweredOperationKind::MERGE => IROp::MERGE,
+				LoweredOperationKind::LOOP => IROp::LOOP,
 			}
 		},
 		input_types: lowered.input_types().to_vec(),

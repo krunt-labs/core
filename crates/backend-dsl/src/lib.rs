@@ -1,10 +1,10 @@
 //! Initial Krunt Backend DSL semantic plugin.
 //!
 //! This crate owns backend meaning for the first vertical slice. It describes
-//! HTTP Route, Identity Transform, Success Response, and Error Response nodes,
-//! validates their properties and typed data contracts, and lowers them into
-//! target-neutral operations with namespaced metadata. It does not emit
-//! TypeScript or NestJS code.
+//! HTTP Route, Identity Transform, Success Response, Error Response, and
+//! Try/Catch nodes, validates their properties and typed data contracts, and
+//! lowers them into target-neutral operations with namespaced metadata. It does
+//! not emit TypeScript or NestJS code.
 
 use krunt_diagnostics::{CompilerStage, Diagnostic, DiagnosticCode, GraphElementId, Severity};
 use krunt_graph_model::{
@@ -13,7 +13,8 @@ use krunt_graph_model::{
 };
 use krunt_ir::{AsyncKind, OperationId, TypeId};
 use krunt_plugin_api::{
-	LoweredOperation, NodeContract, PluginApiError, PluginManifest, PluginRegistry, PortContract,
+	LoweredOperation, LoweredOperationKind, NodeContract, PluginApiError, PluginManifest,
+	PluginRegistry, PortContract,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -25,6 +26,7 @@ pub const HTTP_ROUTE_NODE_TYPE: &str = "backend.http_route";
 pub const TRANSFORM_NODE_TYPE: &str = "backend.transform";
 pub const SUCCESS_RESPONSE_NODE_TYPE: &str = "backend.success_response";
 pub const ERROR_RESPONSE_NODE_TYPE: &str = "backend.error_response";
+pub const TRY_CATCH_NODE_TYPE: &str = "backend.try_catch";
 pub const HTTP_REQUEST_TYPE: &str = "HttpRequest";
 pub const RESPONSE_BODY_TYPE: &str = "ANY";
 pub const SUCCESS_RESPONSE_DEFAULT_STATUS_CODE: u16 = 200;
@@ -158,6 +160,8 @@ impl BackendDslPlugin {
 			NodeTypeId::new(SUCCESS_RESPONSE_NODE_TYPE).expect("static node type is valid");
 		let error_response_type =
 			NodeTypeId::new(ERROR_RESPONSE_NODE_TYPE).expect("static node type is valid");
+		let try_catch_type =
+			NodeTypeId::new(TRY_CATCH_NODE_TYPE).expect("static node type is valid");
 		let request_type = TypeId::new(HTTP_REQUEST_TYPE).expect("static type is valid");
 		let response_body_type = TypeId::new(RESPONSE_BODY_TYPE).expect("static type is valid");
 		let manifest = PluginManifest::new(
@@ -168,6 +172,7 @@ impl BackendDslPlugin {
 				transform_type.clone(),
 				response_type.clone(),
 				error_response_type.clone(),
+				try_catch_type.clone(),
 			],
 		)
 		.expect("static plugin manifest is valid");
@@ -281,6 +286,26 @@ impl BackendDslPlugin {
 					))),
 				)],
 			},
+			BackendNodeDescriptor {
+				type_id: try_catch_type,
+				label: "Try/Catch".to_string(),
+				category: "Error Handling".to_string(),
+				inputs: vec![BackendPortDescriptor::new(
+					"in",
+					PortContract::new(PortKind::EXECUTION, None, true),
+				)],
+				outputs: vec![
+					BackendPortDescriptor::new(
+						"try",
+						PortContract::new(PortKind::EXECUTION, None, true),
+					),
+					BackendPortDescriptor::new(
+						"catch",
+						PortContract::new(PortKind::EXECUTION, None, true),
+					),
+				],
+				properties: Vec::new(),
+			},
 		];
 		Self {
 			manifest,
@@ -315,12 +340,15 @@ impl krunt_plugin_api::SemanticPlugin for BackendDslPlugin {
 			}
 			TRANSFORM_NODE_TYPE => transform_contract(),
 			SUCCESS_RESPONSE_NODE_TYPE | ERROR_RESPONSE_NODE_TYPE => response_contract(),
+			TRY_CATCH_NODE_TYPE => try_catch_contract(),
 			_ => NodeContract::new([], [], [], [], [], AsyncKind::SYNC, []),
 		}
 	}
 
 	fn analyze_graph(&self, document: &GraphDocument) -> Vec<Diagnostic> {
-		validate_route_response_paths(document)
+		let mut diagnostics = validate_try_catch_branches(document);
+		diagnostics.extend(validate_route_response_paths(document));
+		diagnostics
 	}
 
 	fn analyze_node(&self, node: &Node) -> Vec<Diagnostic> {
@@ -345,6 +373,7 @@ impl krunt_plugin_api::SemanticPlugin for BackendDslPlugin {
 				.map(|diagnostic| *diagnostic)
 				.into_iter()
 				.collect(),
+			TRY_CATCH_NODE_TYPE => Vec::new(),
 			_ => Vec::new(),
 		}
 	}
@@ -403,6 +432,17 @@ impl krunt_plugin_api::SemanticPlugin for BackendDslPlugin {
 				.with_attribute("response.kind", "ERROR")
 				.with_attribute("response.status_code", status_code.to_string()))
 			}
+			TRY_CATCH_NODE_TYPE => Ok(LoweredOperation::new(
+				OperationId::new(TRY_CATCH_NODE_TYPE).expect("static operation is valid"),
+				[],
+				[],
+				AsyncKind::SYNC,
+				[],
+			)
+			.with_kind(LoweredOperationKind::BRANCH)
+			.with_attribute("error.handling.kind", "TRY_CATCH")
+			.with_attribute("error.handling.try_output", "0")
+			.with_attribute("error.handling.catch_output", "1")),
 			_ => unreachable!("registry only resolves Backend DSL node types"),
 		}
 	}
@@ -459,6 +499,21 @@ fn response_contract() -> NodeContract {
 			),
 		],
 		[],
+		[],
+		[],
+		[],
+		AsyncKind::SYNC,
+		[],
+	)
+}
+
+fn try_catch_contract() -> NodeContract {
+	NodeContract::new(
+		[PortContract::new(PortKind::EXECUTION, None, true)],
+		[
+			PortContract::new(PortKind::EXECUTION, None, true),
+			PortContract::new(PortKind::EXECUTION, None, true),
+		],
 		[],
 		[],
 		[],
@@ -661,6 +716,35 @@ fn validate_route_response_paths(document: &GraphDocument) -> Vec<Diagnostic> {
 		.collect()
 }
 
+fn validate_try_catch_branches(document: &GraphDocument) -> Vec<Diagnostic> {
+	document
+		.nodes()
+		.iter()
+		.filter(|node| node.type_id().as_str() == TRY_CATCH_NODE_TYPE)
+		.flat_map(|node| {
+			node.ports()
+				.iter()
+				.filter(|port| {
+					port.direction() == PortDirection::OUTPUT && port.kind() == PortKind::EXECUTION
+				})
+				.filter(|port| {
+					!document
+						.edges()
+						.iter()
+						.any(|edge| edge.kind() == EdgeKind::EXECUTION && edge.from() == port.id())
+				})
+				.map(|port| {
+					port_diagnostic(
+						port,
+						"BACKEND_DSL.TRY_CATCH_BRANCH_UNCONNECTED",
+						"Try/Catch requires both the try and catch execution branches to be connected.",
+					)
+				})
+		})
+		.map(|diagnostic| *diagnostic)
+		.collect()
+}
+
 fn route_properties(node: &Node) -> Result<RouteProperties, Box<Diagnostic>> {
 	let method = match node.properties().get("method") {
 		Some(Value::String(value)) => value.to_ascii_uppercase(),
@@ -728,6 +812,23 @@ fn node_diagnostic(node: &Node, code: &str, message: impl Into<String>) -> Box<D
 	)
 }
 
+fn port_diagnostic(
+	port: &krunt_graph_model::Port,
+	code: &str,
+	message: impl Into<String>,
+) -> Box<Diagnostic> {
+	Box::new(
+		Diagnostic::new(
+			DiagnosticCode::new(code).expect("static diagnostic code is valid"),
+			Severity::ERROR,
+			CompilerStage::SEMANTIC_ANALYSIS,
+			message,
+			GraphElementId::PORT(port.id()),
+		)
+		.expect("static Backend DSL diagnostic is valid"),
+	)
+}
+
 impl fmt::Display for BackendPropertyKind {
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		write!(formatter, "{self:?}")
@@ -753,7 +854,7 @@ mod tests {
 	#[test]
 	fn exposes_route_and_response_descriptors() {
 		let plugin = BackendDslPlugin::new();
-		assert_eq!(plugin.descriptors().len(), 4);
+		assert_eq!(plugin.descriptors().len(), 5);
 		assert_eq!(plugin.descriptors()[0].label(), "HTTP Route");
 		assert_eq!(plugin.descriptors()[0].properties().len(), 2);
 		assert_eq!(plugin.descriptors()[1].label(), "Identity Transform");
@@ -799,6 +900,16 @@ mod tests {
 				ERROR_RESPONSE_DEFAULT_STATUS_CODE,
 			)))
 		);
+		let try_catch = plugin
+			.descriptors()
+			.iter()
+			.find(|descriptor| descriptor.type_id().as_str() == TRY_CATCH_NODE_TYPE)
+			.expect("try/catch descriptor should be registered");
+		assert_eq!(try_catch.label(), "Try/Catch");
+		assert_eq!(try_catch.category(), "Error Handling");
+		assert_eq!(try_catch.inputs().len(), 1);
+		assert_eq!(try_catch.outputs().len(), 2);
+		assert!(try_catch.properties().is_empty());
 	}
 
 	#[test]
@@ -947,6 +1058,20 @@ mod tests {
 	}
 
 	#[test]
+	fn lowers_try_catch_with_target_neutral_error_handling_metadata() {
+		let node = Node::new(
+			NodeId::new(2).unwrap(),
+			NodeTypeId::new(TRY_CATCH_NODE_TYPE).unwrap(),
+		);
+		let lowered = BackendDslPlugin::new().lower_node(&node).unwrap();
+
+		assert_eq!(lowered.operation().as_str(), TRY_CATCH_NODE_TYPE);
+		assert_eq!(lowered.kind(), LoweredOperationKind::BRANCH);
+		assert_eq!(lowered.attributes()["error.handling.kind"], "TRY_CATCH");
+		assert!(!lowered.returns());
+	}
+
+	#[test]
 	fn rejects_invalid_success_response_status_codes() {
 		let node = Node::new(
 			NodeId::new(2).unwrap(),
@@ -1012,6 +1137,96 @@ mod tests {
 		assert_eq!(
 			diagnostics[0].code().as_str(),
 			"BACKEND_DSL.HTTP_ROUTE_MISSING_RESPONSE"
+		);
+	}
+
+	#[test]
+	fn rejects_a_try_catch_with_an_unconnected_branch() {
+		let metadata = krunt_graph_model::GraphMetadata::new(
+			krunt_graph_model::GraphId::new(2).unwrap(),
+			"backend-v1",
+			"krunt-test",
+		)
+		.unwrap();
+		let mut builder = krunt_graph_model::GraphBuilder::new(metadata);
+
+		let mut route = route(&[
+			("method", Value::String("GET".to_string())),
+			("path", Value::String("/users".to_string())),
+		]);
+		route
+			.add_port(krunt_graph_model::Port::new(
+				krunt_graph_model::PortId::new(11).unwrap(),
+				PortDirection::OUTPUT,
+				PortKind::EXECUTION,
+			))
+			.unwrap();
+		let mut try_catch = Node::new(
+			NodeId::new(2).unwrap(),
+			NodeTypeId::new(TRY_CATCH_NODE_TYPE).unwrap(),
+		);
+		try_catch
+			.add_port(krunt_graph_model::Port::new(
+				krunt_graph_model::PortId::new(21).unwrap(),
+				PortDirection::INPUT,
+				PortKind::EXECUTION,
+			))
+			.unwrap();
+		try_catch
+			.add_port(krunt_graph_model::Port::new(
+				krunt_graph_model::PortId::new(22).unwrap(),
+				PortDirection::OUTPUT,
+				PortKind::EXECUTION,
+			))
+			.unwrap();
+		try_catch
+			.add_port(krunt_graph_model::Port::new(
+				krunt_graph_model::PortId::new(23).unwrap(),
+				PortDirection::OUTPUT,
+				PortKind::EXECUTION,
+			))
+			.unwrap();
+		let mut response = Node::new(
+			NodeId::new(3).unwrap(),
+			NodeTypeId::new(SUCCESS_RESPONSE_NODE_TYPE).unwrap(),
+		);
+		response
+			.add_port(krunt_graph_model::Port::new(
+				krunt_graph_model::PortId::new(31).unwrap(),
+				PortDirection::INPUT,
+				PortKind::EXECUTION,
+			))
+			.unwrap();
+
+		builder.add_node(route).unwrap();
+		builder.add_node(try_catch).unwrap();
+		builder.add_node(response).unwrap();
+		builder
+			.add_edge(krunt_graph_model::Edge::new(
+				krunt_graph_model::EdgeId::new(41).unwrap(),
+				krunt_graph_model::PortId::new(11).unwrap(),
+				krunt_graph_model::PortId::new(21).unwrap(),
+				EdgeKind::EXECUTION,
+			))
+			.unwrap();
+		builder
+			.add_edge(krunt_graph_model::Edge::new(
+				krunt_graph_model::EdgeId::new(42).unwrap(),
+				krunt_graph_model::PortId::new(22).unwrap(),
+				krunt_graph_model::PortId::new(31).unwrap(),
+				EdgeKind::EXECUTION,
+			))
+			.unwrap();
+		let diagnostics = BackendDslPlugin::new().analyze_graph(&builder.build().unwrap());
+
+		assert_eq!(diagnostics.len(), 1);
+		assert_eq!(
+			diagnostics[0].code().as_str(),
+			"BACKEND_DSL.TRY_CATCH_BRANCH_UNCONNECTED"
+		);
+		assert_eq!(
+			diagnostics[0].primary(),
+			GraphElementId::PORT(krunt_graph_model::PortId::new(23).unwrap())
 		);
 	}
 }
