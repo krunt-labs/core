@@ -647,6 +647,8 @@ fn register_port_bindings(
 ) {
 	let mut input_index = 0u16;
 	let mut output_index = 0u16;
+	let mut execution_input_index = 0u16;
+	let mut execution_output_index = 0u16;
 	for port in node.ports() {
 		let index = match (port.direction(), port.kind()) {
 			(PortDirection::INPUT, PortKind::DATA) => {
@@ -659,7 +661,16 @@ fn register_port_bindings(
 				output_index = output_index.saturating_add(1);
 				index
 			}
-			_ => 0,
+			(PortDirection::INPUT, PortKind::EXECUTION) => {
+				let index = execution_input_index;
+				execution_input_index = execution_input_index.saturating_add(1);
+				index
+			}
+			(PortDirection::OUTPUT, PortKind::EXECUTION) => {
+				let index = execution_output_index;
+				execution_output_index = execution_output_index.saturating_add(1);
+				index
+			}
 		};
 		port_bindings.insert(
 			port.id(),
@@ -671,13 +682,17 @@ fn register_port_bindings(
 			},
 		);
 	}
-	if input_index == u16::MAX || output_index == u16::MAX {
+	if input_index == u16::MAX
+		|| output_index == u16::MAX
+		|| execution_input_index == u16::MAX
+		|| execution_output_index == u16::MAX
+	{
 		diagnostics.push(
 			Diagnostic::new(
-				DiagnosticCode::new("LOWERING.TOO_MANY_DATA_PORTS").unwrap(),
+				DiagnosticCode::new("LOWERING.TOO_MANY_PORTS").unwrap(),
 				Severity::ERROR,
 				CompilerStage::LOWERING,
-				"A node has too many data ports for the canonical IR.",
+				"A node has too many ports for the canonical IR.",
 				GraphElementId::NODE(krunt_graph_model::NodeId::new(node.id().as_u64()).unwrap()),
 			)
 			.unwrap(),
@@ -714,8 +729,14 @@ fn add_control_edge(
 		return;
 	}
 	if let Err(error) = builder.add_control_edge(ControlEdge {
-		from: from.ir_node,
-		to: to.ir_node,
+		from: PortRef {
+			node: from.ir_node,
+			index: from.index,
+		},
+		to: PortRef {
+			node: to.ir_node,
+			index: to.index,
+		},
 	}) {
 		diagnostics.push(ir_build_diagnostic(
 			GraphElementId::PORT(from.source_port),
@@ -1196,6 +1217,20 @@ mod tests {
 		assert_eq!(result.ir().unwrap().nodes().len(), 2);
 		assert_eq!(result.ir().unwrap().control_edges().len(), 1);
 		assert_eq!(result.ir().unwrap().data_edges().len(), 1);
+		assert_eq!(
+			result.ir().unwrap().control_edges()[0].from,
+			PortRef {
+				node: krunt_ir::IrNodeId(1),
+				index: 0,
+			}
+		);
+		assert_eq!(
+			result.ir().unwrap().control_edges()[0].to,
+			PortRef {
+				node: krunt_ir::IrNodeId(2),
+				index: 0,
+			}
+		);
 		assert!(matches!(
 			result.ir().unwrap().node(krunt_ir::IrNodeId(1)).unwrap().op,
 			IROp::ENTRY { .. }

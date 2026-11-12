@@ -1,8 +1,8 @@
 //! Initial Krunt Backend DSL semantic plugin.
 //!
 //! This crate owns backend meaning for the first vertical slice. It describes
-//! HTTP Route, Identity Transform, Success Response, Error Response, Try/Catch,
-//! and Validation Error nodes, validates their properties and typed data
+//! HTTP Route, Branch, Merge, Identity Transform, Success Response, Error
+//! Response, Try/Catch, and Validation Error nodes, validates their properties and typed data
 //! contracts, and lowers them into target-neutral operations with namespaced
 //! metadata. It does not emit TypeScript or NestJS code.
 
@@ -23,12 +23,15 @@ use std::fmt;
 pub const BACKEND_DSL_ID: &str = "krunt.backend-dsl";
 pub const BACKEND_DSL_VERSION: &str = "0.1.0";
 pub const HTTP_ROUTE_NODE_TYPE: &str = "backend.http_route";
+pub const BRANCH_NODE_TYPE: &str = "backend.branch";
+pub const MERGE_NODE_TYPE: &str = "backend.merge";
 pub const TRANSFORM_NODE_TYPE: &str = "backend.transform";
 pub const SUCCESS_RESPONSE_NODE_TYPE: &str = "backend.success_response";
 pub const ERROR_RESPONSE_NODE_TYPE: &str = "backend.error_response";
 pub const TRY_CATCH_NODE_TYPE: &str = "backend.try_catch";
 pub const VALIDATION_ERROR_NODE_TYPE: &str = "backend.validation_error";
 pub const HTTP_REQUEST_TYPE: &str = "HttpRequest";
+pub const BOOLEAN_TYPE: &str = "Boolean";
 pub const RESPONSE_BODY_TYPE: &str = "ANY";
 pub const SUCCESS_RESPONSE_DEFAULT_STATUS_CODE: u16 = 200;
 pub const ERROR_RESPONSE_DEFAULT_STATUS_CODE: u16 = 500;
@@ -157,6 +160,8 @@ pub struct BackendDslPlugin {
 impl BackendDslPlugin {
 	pub fn new() -> Self {
 		let route_type = NodeTypeId::new(HTTP_ROUTE_NODE_TYPE).expect("static node type is valid");
+		let branch_type = NodeTypeId::new(BRANCH_NODE_TYPE).expect("static node type is valid");
+		let merge_type = NodeTypeId::new(MERGE_NODE_TYPE).expect("static node type is valid");
 		let transform_type =
 			NodeTypeId::new(TRANSFORM_NODE_TYPE).expect("static node type is valid");
 		let response_type =
@@ -168,12 +173,15 @@ impl BackendDslPlugin {
 		let validation_error_type =
 			NodeTypeId::new(VALIDATION_ERROR_NODE_TYPE).expect("static node type is valid");
 		let request_type = TypeId::new(HTTP_REQUEST_TYPE).expect("static type is valid");
+		let boolean_type = TypeId::new(BOOLEAN_TYPE).expect("static type is valid");
 		let response_body_type = TypeId::new(RESPONSE_BODY_TYPE).expect("static type is valid");
 		let manifest = PluginManifest::new(
 			PluginReference::new(BACKEND_DSL_ID, BACKEND_DSL_VERSION)
 				.expect("static plugin identity is valid"),
 			[
 				route_type.clone(),
+				branch_type.clone(),
+				merge_type.clone(),
 				transform_type.clone(),
 				response_type.clone(),
 				error_response_type.clone(),
@@ -217,6 +225,52 @@ impl BackendDslPlugin {
 						Some(Value::String("/".to_string())),
 					),
 				],
+			},
+			BackendNodeDescriptor {
+				type_id: branch_type,
+				label: "Branch".to_string(),
+				category: "Flow".to_string(),
+				inputs: vec![
+					BackendPortDescriptor::new(
+						"in",
+						PortContract::new(PortKind::EXECUTION, None, true),
+					),
+					BackendPortDescriptor::new(
+						"condition",
+						PortContract::new(PortKind::DATA, Some(boolean_type.clone()), true),
+					),
+				],
+				outputs: vec![
+					BackendPortDescriptor::new(
+						"true",
+						PortContract::new(PortKind::EXECUTION, None, true),
+					),
+					BackendPortDescriptor::new(
+						"false",
+						PortContract::new(PortKind::EXECUTION, None, true),
+					),
+				],
+				properties: Vec::new(),
+			},
+			BackendNodeDescriptor {
+				type_id: merge_type,
+				label: "Merge".to_string(),
+				category: "Flow".to_string(),
+				inputs: vec![
+					BackendPortDescriptor::new(
+						"left",
+						PortContract::new(PortKind::EXECUTION, None, true),
+					),
+					BackendPortDescriptor::new(
+						"right",
+						PortContract::new(PortKind::EXECUTION, None, true),
+					),
+				],
+				outputs: vec![BackendPortDescriptor::new(
+					"out",
+					PortContract::new(PortKind::EXECUTION, None, true),
+				)],
+				properties: Vec::new(),
 			},
 			BackendNodeDescriptor {
 				type_id: transform_type,
@@ -366,6 +420,8 @@ impl krunt_plugin_api::SemanticPlugin for BackendDslPlugin {
 			HTTP_ROUTE_NODE_TYPE => {
 				route_contract(TypeId::new(HTTP_REQUEST_TYPE).expect("static type is valid"))
 			}
+			BRANCH_NODE_TYPE => branch_contract(),
+			MERGE_NODE_TYPE => merge_contract(),
 			TRANSFORM_NODE_TYPE => transform_contract(),
 			SUCCESS_RESPONSE_NODE_TYPE | ERROR_RESPONSE_NODE_TYPE => response_contract(),
 			TRY_CATCH_NODE_TYPE => try_catch_contract(),
@@ -375,7 +431,21 @@ impl krunt_plugin_api::SemanticPlugin for BackendDslPlugin {
 	}
 
 	fn analyze_graph(&self, document: &GraphDocument) -> Vec<Diagnostic> {
-		let mut diagnostics = validate_try_catch_branches(document);
+		let mut diagnostics = validate_required_execution_ports(
+			document,
+			BRANCH_NODE_TYPE,
+			PortDirection::OUTPUT,
+			"BACKEND_DSL.BRANCH_OUTPUT_UNCONNECTED",
+			"Branch requires both the true and false execution outputs to be connected.",
+		);
+		diagnostics.extend(validate_required_execution_ports(
+			document,
+			MERGE_NODE_TYPE,
+			PortDirection::INPUT,
+			"BACKEND_DSL.MERGE_INPUT_UNCONNECTED",
+			"Merge requires both execution inputs to be connected.",
+		));
+		diagnostics.extend(validate_try_catch_branches(document));
 		diagnostics.extend(validate_route_response_paths(document));
 		diagnostics
 	}
@@ -426,6 +496,24 @@ impl krunt_plugin_api::SemanticPlugin for BackendDslPlugin {
 				.with_attribute("backend.http.method", properties.method)
 				.with_attribute("backend.http.path", properties.path))
 			}
+			BRANCH_NODE_TYPE => Ok(LoweredOperation::new(
+				OperationId::new(BRANCH_NODE_TYPE).expect("static operation is valid"),
+				[TypeId::new(BOOLEAN_TYPE).expect("static type is valid")],
+				[],
+				AsyncKind::SYNC,
+				[],
+			)
+			.with_kind(LoweredOperationKind::BRANCH)
+			.with_attribute("control.kind", "BRANCH")),
+			MERGE_NODE_TYPE => Ok(LoweredOperation::new(
+				OperationId::new(MERGE_NODE_TYPE).expect("static operation is valid"),
+				[],
+				[],
+				AsyncKind::SYNC,
+				[],
+			)
+			.with_kind(LoweredOperationKind::MERGE)
+			.with_attribute("control.kind", "MERGE")),
 			TRANSFORM_NODE_TYPE => {
 				let (input_type, output_type) =
 					transform_data_types(node).map_err(|error| vec![*error])?;
@@ -474,9 +562,7 @@ impl krunt_plugin_api::SemanticPlugin for BackendDslPlugin {
 				[],
 			)
 			.with_kind(LoweredOperationKind::BRANCH)
-			.with_attribute("error.handling.kind", "TRY_CATCH")
-			.with_attribute("error.handling.try_output", "0")
-			.with_attribute("error.handling.catch_output", "1")),
+			.with_attribute("error.handling.kind", "TRY_CATCH")),
 			VALIDATION_ERROR_NODE_TYPE => {
 				let message = validation_error_message(node).map_err(|error| vec![*error])?;
 				Ok(LoweredOperation::new(
@@ -521,6 +607,43 @@ fn route_contract(request_type: TypeId) -> NodeContract {
 		[],
 	)
 	.with_entry(true)
+}
+
+fn branch_contract() -> NodeContract {
+	NodeContract::new(
+		[
+			PortContract::new(PortKind::EXECUTION, None, true),
+			PortContract::new(
+				PortKind::DATA,
+				Some(TypeId::new(BOOLEAN_TYPE).expect("static type is valid")),
+				true,
+			),
+		],
+		[
+			PortContract::new(PortKind::EXECUTION, None, true),
+			PortContract::new(PortKind::EXECUTION, None, true),
+		],
+		[],
+		[],
+		[],
+		AsyncKind::SYNC,
+		[],
+	)
+}
+
+fn merge_contract() -> NodeContract {
+	NodeContract::new(
+		[
+			PortContract::new(PortKind::EXECUTION, None, true),
+			PortContract::new(PortKind::EXECUTION, None, true),
+		],
+		[PortContract::new(PortKind::EXECUTION, None, true)],
+		[],
+		[],
+		[],
+		AsyncKind::SYNC,
+		[],
+	)
 }
 
 fn transform_contract() -> NodeContract {
@@ -783,7 +906,7 @@ fn validate_route_response_paths(document: &GraphDocument) -> Vec<Diagnostic> {
 			Some(node_diagnostic(
 				route,
 				"BACKEND_DSL.HTTP_ROUTE_MISSING_RESPONSE",
-				"Every HTTP Route execution path must reach a Success Response or Error Response.",
+				"Every HTTP Route execution path must reach a Success Response, Error Response, or Validation Error.",
 			))
 		})
 		.map(|diagnostic| *diagnostic)
@@ -791,29 +914,41 @@ fn validate_route_response_paths(document: &GraphDocument) -> Vec<Diagnostic> {
 }
 
 fn validate_try_catch_branches(document: &GraphDocument) -> Vec<Diagnostic> {
+	validate_required_execution_ports(
+		document,
+		TRY_CATCH_NODE_TYPE,
+		PortDirection::OUTPUT,
+		"BACKEND_DSL.TRY_CATCH_BRANCH_UNCONNECTED",
+		"Try/Catch requires both the try and catch execution branches to be connected.",
+	)
+}
+
+fn validate_required_execution_ports(
+	document: &GraphDocument,
+	node_type: &str,
+	direction: PortDirection,
+	code: &str,
+	message: &str,
+) -> Vec<Diagnostic> {
 	document
 		.nodes()
 		.iter()
-		.filter(|node| node.type_id().as_str() == TRY_CATCH_NODE_TYPE)
+		.filter(|node| node.type_id().as_str() == node_type)
 		.flat_map(|node| {
 			node.ports()
 				.iter()
+				.filter(|port| port.direction() == direction && port.kind() == PortKind::EXECUTION)
 				.filter(|port| {
-					port.direction() == PortDirection::OUTPUT && port.kind() == PortKind::EXECUTION
+					let connected = document.edges().iter().any(|edge| {
+						edge.kind() == EdgeKind::EXECUTION
+							&& match direction {
+								PortDirection::INPUT => edge.to() == port.id(),
+								PortDirection::OUTPUT => edge.from() == port.id(),
+							}
+					});
+					!connected
 				})
-				.filter(|port| {
-					!document
-						.edges()
-						.iter()
-						.any(|edge| edge.kind() == EdgeKind::EXECUTION && edge.from() == port.id())
-				})
-				.map(|port| {
-					port_diagnostic(
-						port,
-						"BACKEND_DSL.TRY_CATCH_BRANCH_UNCONNECTED",
-						"Try/Catch requires both the try and catch execution branches to be connected.",
-					)
-				})
+				.map(|port| port_diagnostic(port, code, message))
 		})
 		.map(|diagnostic| *diagnostic)
 		.collect()
@@ -928,12 +1063,39 @@ mod tests {
 	#[test]
 	fn exposes_route_and_response_descriptors() {
 		let plugin = BackendDslPlugin::new();
-		assert_eq!(plugin.descriptors().len(), 6);
+		assert_eq!(plugin.descriptors().len(), 8);
 		assert_eq!(plugin.descriptors()[0].label(), "HTTP Route");
 		assert_eq!(plugin.descriptors()[0].properties().len(), 2);
-		assert_eq!(plugin.descriptors()[1].label(), "Identity Transform");
-		assert_eq!(plugin.descriptors()[1].inputs().len(), 2);
-		assert_eq!(plugin.descriptors()[1].outputs().len(), 2);
+		let branch = plugin
+			.descriptors()
+			.iter()
+			.find(|descriptor| descriptor.type_id().as_str() == BRANCH_NODE_TYPE)
+			.expect("branch descriptor should be registered");
+		assert_eq!(branch.label(), "Branch");
+		assert_eq!(branch.category(), "Flow");
+		assert_eq!(branch.inputs().len(), 2);
+		assert_eq!(
+			branch.inputs()[1].contract().type_id().unwrap().as_str(),
+			BOOLEAN_TYPE
+		);
+		assert_eq!(branch.outputs().len(), 2);
+		let merge = plugin
+			.descriptors()
+			.iter()
+			.find(|descriptor| descriptor.type_id().as_str() == MERGE_NODE_TYPE)
+			.expect("merge descriptor should be registered");
+		assert_eq!(merge.label(), "Merge");
+		assert_eq!(merge.category(), "Flow");
+		assert_eq!(merge.inputs().len(), 2);
+		assert_eq!(merge.outputs().len(), 1);
+		let transform = plugin
+			.descriptors()
+			.iter()
+			.find(|descriptor| descriptor.type_id().as_str() == TRANSFORM_NODE_TYPE)
+			.expect("transform descriptor should be registered");
+		assert_eq!(transform.label(), "Identity Transform");
+		assert_eq!(transform.inputs().len(), 2);
+		assert_eq!(transform.outputs().len(), 2);
 		let response = plugin
 			.descriptors()
 			.iter()
@@ -1049,6 +1211,34 @@ mod tests {
 			&[TypeId::new(HTTP_REQUEST_TYPE).unwrap()]
 		);
 		assert_eq!(lowered.attributes()["backend.transform.kind"], "IDENTITY");
+	}
+
+	#[test]
+	fn lowers_branch_with_a_boolean_condition_and_explicit_control_kind() {
+		let node = Node::new(
+			NodeId::new(2).unwrap(),
+			NodeTypeId::new(BRANCH_NODE_TYPE).unwrap(),
+		);
+		let lowered = BackendDslPlugin::new().lower_node(&node).unwrap();
+
+		assert_eq!(lowered.kind(), LoweredOperationKind::BRANCH);
+		assert_eq!(lowered.input_types(), &[TypeId::new(BOOLEAN_TYPE).unwrap()]);
+		assert!(lowered.output_types().is_empty());
+		assert_eq!(lowered.attributes()["control.kind"], "BRANCH");
+	}
+
+	#[test]
+	fn lowers_merge_with_explicit_control_kind() {
+		let node = Node::new(
+			NodeId::new(2).unwrap(),
+			NodeTypeId::new(MERGE_NODE_TYPE).unwrap(),
+		);
+		let lowered = BackendDslPlugin::new().lower_node(&node).unwrap();
+
+		assert_eq!(lowered.kind(), LoweredOperationKind::MERGE);
+		assert!(lowered.input_types().is_empty());
+		assert!(lowered.output_types().is_empty());
+		assert_eq!(lowered.attributes()["control.kind"], "MERGE");
 	}
 
 	#[test]
@@ -1376,5 +1566,101 @@ mod tests {
 			diagnostics[0].primary(),
 			GraphElementId::PORT(krunt_graph_model::PortId::new(23).unwrap())
 		);
+	}
+
+	#[test]
+	fn rejects_a_branch_with_unconnected_outputs() {
+		let metadata = krunt_graph_model::GraphMetadata::new(
+			krunt_graph_model::GraphId::new(3).unwrap(),
+			"backend-v1",
+			"krunt-test",
+		)
+		.unwrap();
+		let mut branch = Node::new(
+			NodeId::new(2).unwrap(),
+			NodeTypeId::new(BRANCH_NODE_TYPE).unwrap(),
+		);
+		branch
+			.add_port(krunt_graph_model::Port::new(
+				PortId::new(21).unwrap(),
+				PortDirection::INPUT,
+				PortKind::EXECUTION,
+			))
+			.unwrap();
+		branch
+			.add_port(
+				krunt_graph_model::Port::new(
+					PortId::new(22).unwrap(),
+					PortDirection::INPUT,
+					PortKind::DATA,
+				)
+				.with_type_reference(krunt_graph_model::TypeReference::new(BOOLEAN_TYPE).unwrap()),
+			)
+			.unwrap();
+		branch
+			.add_port(krunt_graph_model::Port::new(
+				PortId::new(23).unwrap(),
+				PortDirection::OUTPUT,
+				PortKind::EXECUTION,
+			))
+			.unwrap();
+		branch
+			.add_port(krunt_graph_model::Port::new(
+				PortId::new(24).unwrap(),
+				PortDirection::OUTPUT,
+				PortKind::EXECUTION,
+			))
+			.unwrap();
+		let mut builder = krunt_graph_model::GraphBuilder::new(metadata);
+		builder.add_node(branch).unwrap();
+		let diagnostics = BackendDslPlugin::new().analyze_graph(&builder.build().unwrap());
+
+		assert_eq!(diagnostics.len(), 2);
+		assert!(diagnostics.iter().all(|diagnostic| {
+			diagnostic.code().as_str() == "BACKEND_DSL.BRANCH_OUTPUT_UNCONNECTED"
+		}));
+	}
+
+	#[test]
+	fn rejects_a_merge_with_unconnected_inputs() {
+		let metadata = krunt_graph_model::GraphMetadata::new(
+			krunt_graph_model::GraphId::new(4).unwrap(),
+			"backend-v1",
+			"krunt-test",
+		)
+		.unwrap();
+		let mut merge = Node::new(
+			NodeId::new(2).unwrap(),
+			NodeTypeId::new(MERGE_NODE_TYPE).unwrap(),
+		);
+		merge
+			.add_port(krunt_graph_model::Port::new(
+				PortId::new(21).unwrap(),
+				PortDirection::INPUT,
+				PortKind::EXECUTION,
+			))
+			.unwrap();
+		merge
+			.add_port(krunt_graph_model::Port::new(
+				PortId::new(22).unwrap(),
+				PortDirection::INPUT,
+				PortKind::EXECUTION,
+			))
+			.unwrap();
+		merge
+			.add_port(krunt_graph_model::Port::new(
+				PortId::new(23).unwrap(),
+				PortDirection::OUTPUT,
+				PortKind::EXECUTION,
+			))
+			.unwrap();
+		let mut builder = krunt_graph_model::GraphBuilder::new(metadata);
+		builder.add_node(merge).unwrap();
+		let diagnostics = BackendDslPlugin::new().analyze_graph(&builder.build().unwrap());
+
+		assert_eq!(diagnostics.len(), 2);
+		assert!(diagnostics.iter().all(|diagnostic| {
+			diagnostic.code().as_str() == "BACKEND_DSL.MERGE_INPUT_UNCONNECTED"
+		}));
 	}
 }

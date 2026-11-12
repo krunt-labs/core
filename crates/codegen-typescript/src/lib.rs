@@ -188,16 +188,24 @@ pub enum TypeScriptType {
 /// A control-flow edge between TypeScript operations.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct TypeScriptControlEdge {
-	from: TypeScriptOperationId,
-	to: TypeScriptOperationId,
+	from: TypeScriptPortRef,
+	to: TypeScriptPortRef,
 }
 
 impl TypeScriptControlEdge {
 	pub fn from(&self) -> TypeScriptOperationId {
-		self.from
+		self.from.node()
 	}
 
 	pub fn to(&self) -> TypeScriptOperationId {
+		self.to.node()
+	}
+
+	pub fn from_port(&self) -> TypeScriptPortRef {
+		self.from
+	}
+
+	pub fn to_port(&self) -> TypeScriptPortRef {
 		self.to
 	}
 }
@@ -345,8 +353,8 @@ fn reachable_operations(
 			continue;
 		}
 		for edge in graph.control_edges() {
-			if edge.from.0 == node.as_u32() {
-				worklist.push(TypeScriptOperationId::new(edge.to.0));
+			if edge.from.node.0 == node.as_u32() {
+				worklist.push(TypeScriptOperationId::new(edge.to.node.0));
 			}
 		}
 		for edge in graph.data_edges() {
@@ -380,12 +388,18 @@ fn lower_function(
 			.control_edges()
 			.iter()
 			.filter(|edge| {
-				operation_ids.contains(&TypeScriptOperationId::new(edge.from.0))
-					&& operation_ids.contains(&TypeScriptOperationId::new(edge.to.0))
+				operation_ids.contains(&TypeScriptOperationId::new(edge.from.node.0))
+					&& operation_ids.contains(&TypeScriptOperationId::new(edge.to.node.0))
 			})
 			.map(|edge| TypeScriptControlEdge {
-				from: TypeScriptOperationId::new(edge.from.0),
-				to: TypeScriptOperationId::new(edge.to.0),
+				from: TypeScriptPortRef::new(
+					TypeScriptOperationId::new(edge.from.node.0),
+					edge.from.index,
+				),
+				to: TypeScriptPortRef::new(
+					TypeScriptOperationId::new(edge.to.node.0),
+					edge.to.index,
+				),
 			})
 			.collect(),
 		data_edges: graph
@@ -898,8 +912,14 @@ mod tests {
 			.unwrap();
 		builder
 			.add_control_edge(ControlEdge {
-				from: krunt_ir::IrNodeId(1),
-				to: krunt_ir::IrNodeId(2),
+				from: PortRef {
+					node: krunt_ir::IrNodeId(1),
+					index: 0,
+				},
+				to: PortRef {
+					node: krunt_ir::IrNodeId(2),
+					index: 0,
+				},
 			})
 			.unwrap();
 		builder
@@ -931,6 +951,8 @@ mod tests {
 		assert_eq!(function.async_kind(), AsyncKind::ASYNC);
 		assert_eq!(function.operations().len(), 2);
 		assert_eq!(function.control_edges().len(), 1);
+		assert_eq!(function.control_edges()[0].from_port().index(), 0);
+		assert_eq!(function.control_edges()[0].to_port().index(), 0);
 		assert_eq!(function.data_edges().len(), 1);
 		assert_eq!(
 			function.operations()[0].source().primary,
@@ -1008,8 +1030,14 @@ mod tests {
 		for (from, to) in [(1, 2), (2, 3)] {
 			builder
 				.add_control_edge(ControlEdge {
-					from: krunt_ir::IrNodeId(from),
-					to: krunt_ir::IrNodeId(to),
+					from: PortRef {
+						node: krunt_ir::IrNodeId(from),
+						index: 0,
+					},
+					to: PortRef {
+						node: krunt_ir::IrNodeId(to),
+						index: 0,
+					},
 				})
 				.unwrap();
 		}
@@ -1076,8 +1104,14 @@ mod tests {
 				.unwrap();
 			builder
 				.add_control_edge(ControlEdge {
-					from: krunt_ir::IrNodeId(id),
-					to: krunt_ir::IrNodeId(id + 1),
+					from: PortRef {
+						node: krunt_ir::IrNodeId(id),
+						index: 0,
+					},
+					to: PortRef {
+						node: krunt_ir::IrNodeId(id + 1),
+						index: 0,
+					},
 				})
 				.unwrap();
 			builder

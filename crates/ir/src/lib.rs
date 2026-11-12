@@ -155,8 +155,8 @@ pub struct IRNode {
 /// A control-flow relationship between two IR operations.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct ControlEdge {
-	pub from: IrNodeId,
-	pub to: IrNodeId,
+	pub from: PortRef,
+	pub to: PortRef,
 }
 
 /// A typed value relationship between an output and an input slot.
@@ -271,8 +271,8 @@ impl IRBuilder {
 
 	pub fn build(mut self) -> Result<IRGraph, BuildError> {
 		for edge in &self.control_edges {
-			self.require_node(edge.from)?;
-			self.require_node(edge.to)?;
+			self.require_node(edge.from.node)?;
+			self.require_node(edge.to.node)?;
 		}
 
 		for edge in &self.data_edges {
@@ -354,8 +354,8 @@ pub fn eliminate_unreachable_nodes(
 			continue;
 		}
 		for edge in &graph.control_edges {
-			if edge.from == node {
-				worklist.push(edge.to);
+			if edge.from.node == node {
+				worklist.push(edge.to.node);
 			}
 		}
 		for edge in &graph.data_edges {
@@ -382,7 +382,7 @@ pub fn eliminate_unreachable_nodes(
 		}
 	}
 	for edge in &graph.control_edges {
-		if reachable.contains_key(&edge.from) && reachable.contains_key(&edge.to) {
+		if reachable.contains_key(&edge.from.node) && reachable.contains_key(&edge.to.node) {
 			builder.add_control_edge(*edge)?;
 		}
 	}
@@ -443,14 +443,26 @@ mod tests {
 			.unwrap();
 		builder
 			.add_control_edge(ControlEdge {
-				from: IrNodeId(1),
-				to: IrNodeId(2),
+				from: PortRef {
+					node: IrNodeId(1),
+					index: 0,
+				},
+				to: PortRef {
+					node: IrNodeId(2),
+					index: 0,
+				},
 			})
 			.unwrap();
 		builder
 			.add_control_edge(ControlEdge {
-				from: IrNodeId(2),
-				to: IrNodeId(3),
+				from: PortRef {
+					node: IrNodeId(2),
+					index: 0,
+				},
+				to: PortRef {
+					node: IrNodeId(3),
+					index: 0,
+				},
 			})
 			.unwrap();
 		builder
@@ -496,12 +508,48 @@ mod tests {
 			.unwrap();
 		builder
 			.add_control_edge(ControlEdge {
-				from: IrNodeId(1),
-				to: IrNodeId(99),
+				from: PortRef {
+					node: IrNodeId(1),
+					index: 0,
+				},
+				to: PortRef {
+					node: IrNodeId(99),
+					index: 0,
+				},
 			})
 			.unwrap();
 
 		assert_eq!(builder.build(), Err(BuildError::MissingNode(IrNodeId(99))));
+	}
+
+	#[test]
+	fn preserves_execution_port_identity_for_distinct_control_edges() {
+		let mut builder = IRBuilder::new();
+		builder
+			.add_node(operation("branch", 1, 10, &[], &[]))
+			.unwrap();
+		builder
+			.add_node(operation("next", 2, 20, &[], &[]))
+			.unwrap();
+		for output_index in [0, 1] {
+			builder
+				.add_control_edge(ControlEdge {
+					from: PortRef {
+						node: IrNodeId(1),
+						index: output_index,
+					},
+					to: PortRef {
+						node: IrNodeId(2),
+						index: 0,
+					},
+				})
+				.unwrap();
+		}
+
+		let graph = builder.build().unwrap();
+		assert_eq!(graph.control_edges().len(), 2);
+		assert_eq!(graph.control_edges()[0].from.index, 0);
+		assert_eq!(graph.control_edges()[1].from.index, 1);
 	}
 
 	#[test]
@@ -648,8 +696,14 @@ mod tests {
 			.unwrap();
 		builder
 			.add_control_edge(ControlEdge {
-				from: IrNodeId(1),
-				to: IrNodeId(2),
+				from: PortRef {
+					node: IrNodeId(1),
+					index: 0,
+				},
+				to: PortRef {
+					node: IrNodeId(2),
+					index: 0,
+				},
 			})
 			.unwrap();
 
@@ -680,8 +734,14 @@ mod tests {
 			.unwrap();
 		builder
 			.add_control_edge(ControlEdge {
-				from: IrNodeId(1),
-				to: IrNodeId(2),
+				from: PortRef {
+					node: IrNodeId(1),
+					index: 0,
+				},
+				to: PortRef {
+					node: IrNodeId(2),
+					index: 0,
+				},
 			})
 			.unwrap();
 		builder
