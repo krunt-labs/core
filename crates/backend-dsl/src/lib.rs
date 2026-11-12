@@ -1,10 +1,10 @@
 //! Initial Krunt Backend DSL semantic plugin.
 //!
 //! This crate owns backend meaning for the first vertical slice. It describes
-//! HTTP Route, Branch, Merge, Identity Transform, Success Response, Error
-//! Response, Try/Catch, and Validation Error nodes, validates their properties and typed data
-//! contracts, and lowers them into target-neutral operations with namespaced
-//! metadata. It does not emit TypeScript or NestJS code.
+//! HTTP Route, Branch, Merge, Loop, Identity Transform, Success Response, Error
+//! Response, Try/Catch, and Validation Error nodes, validates their properties
+//! and typed data contracts, and lowers them into target-neutral operations with
+//! namespaced metadata. It does not emit TypeScript or NestJS code.
 
 use krunt_diagnostics::{CompilerStage, Diagnostic, DiagnosticCode, GraphElementId, Severity};
 use krunt_graph_model::{
@@ -18,6 +18,7 @@ use krunt_plugin_api::{
 };
 use serde::Serialize;
 use serde_json::Value;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 
 pub const BACKEND_DSL_ID: &str = "krunt.backend-dsl";
@@ -25,6 +26,7 @@ pub const BACKEND_DSL_VERSION: &str = "0.1.0";
 pub const HTTP_ROUTE_NODE_TYPE: &str = "backend.http_route";
 pub const BRANCH_NODE_TYPE: &str = "backend.branch";
 pub const MERGE_NODE_TYPE: &str = "backend.merge";
+pub const LOOP_NODE_TYPE: &str = "backend.loop";
 pub const TRANSFORM_NODE_TYPE: &str = "backend.transform";
 pub const SUCCESS_RESPONSE_NODE_TYPE: &str = "backend.success_response";
 pub const ERROR_RESPONSE_NODE_TYPE: &str = "backend.error_response";
@@ -162,6 +164,7 @@ impl BackendDslPlugin {
 		let route_type = NodeTypeId::new(HTTP_ROUTE_NODE_TYPE).expect("static node type is valid");
 		let branch_type = NodeTypeId::new(BRANCH_NODE_TYPE).expect("static node type is valid");
 		let merge_type = NodeTypeId::new(MERGE_NODE_TYPE).expect("static node type is valid");
+		let loop_type = NodeTypeId::new(LOOP_NODE_TYPE).expect("static node type is valid");
 		let transform_type =
 			NodeTypeId::new(TRANSFORM_NODE_TYPE).expect("static node type is valid");
 		let response_type =
@@ -182,6 +185,7 @@ impl BackendDslPlugin {
 				route_type.clone(),
 				branch_type.clone(),
 				merge_type.clone(),
+				loop_type.clone(),
 				transform_type.clone(),
 				response_type.clone(),
 				error_response_type.clone(),
@@ -270,6 +274,36 @@ impl BackendDslPlugin {
 					"out",
 					PortContract::new(PortKind::EXECUTION, None, true),
 				)],
+				properties: Vec::new(),
+			},
+			BackendNodeDescriptor {
+				type_id: loop_type,
+				label: "Loop".to_string(),
+				category: "Flow".to_string(),
+				inputs: vec![
+					BackendPortDescriptor::new(
+						"entry",
+						PortContract::new(PortKind::EXECUTION, None, true),
+					),
+					BackendPortDescriptor::new(
+						"back",
+						PortContract::new(PortKind::EXECUTION, None, true),
+					),
+					BackendPortDescriptor::new(
+						"condition",
+						PortContract::new(PortKind::DATA, Some(boolean_type.clone()), true),
+					),
+				],
+				outputs: vec![
+					BackendPortDescriptor::new(
+						"body",
+						PortContract::new(PortKind::EXECUTION, None, true),
+					),
+					BackendPortDescriptor::new(
+						"done",
+						PortContract::new(PortKind::EXECUTION, None, true),
+					),
+				],
 				properties: Vec::new(),
 			},
 			BackendNodeDescriptor {
@@ -422,6 +456,7 @@ impl krunt_plugin_api::SemanticPlugin for BackendDslPlugin {
 			}
 			BRANCH_NODE_TYPE => branch_contract(),
 			MERGE_NODE_TYPE => merge_contract(),
+			LOOP_NODE_TYPE => loop_contract(),
 			TRANSFORM_NODE_TYPE => transform_contract(),
 			SUCCESS_RESPONSE_NODE_TYPE | ERROR_RESPONSE_NODE_TYPE => response_contract(),
 			TRY_CATCH_NODE_TYPE => try_catch_contract(),
@@ -445,6 +480,21 @@ impl krunt_plugin_api::SemanticPlugin for BackendDslPlugin {
 			"BACKEND_DSL.MERGE_INPUT_UNCONNECTED",
 			"Merge requires both execution inputs to be connected.",
 		));
+		diagnostics.extend(validate_required_execution_ports(
+			document,
+			LOOP_NODE_TYPE,
+			PortDirection::INPUT,
+			"BACKEND_DSL.LOOP_INPUT_UNCONNECTED",
+			"Loop requires its entry and back execution inputs to be connected.",
+		));
+		diagnostics.extend(validate_required_execution_ports(
+			document,
+			LOOP_NODE_TYPE,
+			PortDirection::OUTPUT,
+			"BACKEND_DSL.LOOP_OUTPUT_UNCONNECTED",
+			"Loop requires its body and done execution outputs to be connected.",
+		));
+		diagnostics.extend(validate_loop_back_edges(document));
 		diagnostics.extend(validate_try_catch_branches(document));
 		diagnostics.extend(validate_route_response_paths(document));
 		diagnostics
@@ -514,6 +564,15 @@ impl krunt_plugin_api::SemanticPlugin for BackendDslPlugin {
 			)
 			.with_kind(LoweredOperationKind::MERGE)
 			.with_attribute("control.kind", "MERGE")),
+			LOOP_NODE_TYPE => Ok(LoweredOperation::new(
+				OperationId::new(LOOP_NODE_TYPE).expect("static operation is valid"),
+				[TypeId::new(BOOLEAN_TYPE).expect("static type is valid")],
+				[],
+				AsyncKind::SYNC,
+				[],
+			)
+			.with_kind(LoweredOperationKind::LOOP)
+			.with_attribute("control.kind", "LOOP")),
 			TRANSFORM_NODE_TYPE => {
 				let (input_type, output_type) =
 					transform_data_types(node).map_err(|error| vec![*error])?;
@@ -644,6 +703,30 @@ fn merge_contract() -> NodeContract {
 		AsyncKind::SYNC,
 		[],
 	)
+}
+
+fn loop_contract() -> NodeContract {
+	NodeContract::new(
+		[
+			PortContract::new(PortKind::EXECUTION, None, true),
+			PortContract::new(PortKind::EXECUTION, None, true),
+			PortContract::new(
+				PortKind::DATA,
+				Some(TypeId::new(BOOLEAN_TYPE).expect("static type is valid")),
+				true,
+			),
+		],
+		[
+			PortContract::new(PortKind::EXECUTION, None, true),
+			PortContract::new(PortKind::EXECUTION, None, true),
+		],
+		[],
+		[],
+		[],
+		AsyncKind::SYNC,
+		[],
+	)
+	.with_loop(true)
 }
 
 fn transform_contract() -> NodeContract {
@@ -954,6 +1037,96 @@ fn validate_required_execution_ports(
 		.collect()
 }
 
+fn validate_loop_back_edges(document: &GraphDocument) -> Vec<Diagnostic> {
+	let mut port_owners = BTreeMap::<PortId, NodeId>::new();
+	for node in document.nodes() {
+		for port in node.ports() {
+			port_owners.insert(port.id(), node.id());
+		}
+	}
+
+	let mut outgoing = BTreeMap::<PortId, Vec<(NodeId, PortId)>>::new();
+	for edge in document
+		.edges()
+		.iter()
+		.filter(|edge| edge.kind() == EdgeKind::EXECUTION)
+	{
+		let Some(target_node) = port_owners.get(&edge.to()).copied() else {
+			continue;
+		};
+		outgoing
+			.entry(edge.from())
+			.or_default()
+			.push((target_node, edge.to()));
+	}
+
+	document
+		.nodes()
+		.iter()
+		.filter(|node| node.type_id().as_str() == LOOP_NODE_TYPE)
+		.filter_map(|loop_node| {
+			let execution_inputs: Vec<_> = loop_node
+				.ports()
+				.iter()
+				.filter(|port| {
+					port.direction() == PortDirection::INPUT && port.kind() == PortKind::EXECUTION
+				})
+				.collect();
+			let body_output = loop_node.ports().iter().find(|port| {
+				port.direction() == PortDirection::OUTPUT && port.kind() == PortKind::EXECUTION
+			})?;
+			let back_input = *execution_inputs.get(1)?;
+
+			let mut worklist = VecDeque::new();
+			let mut visited = BTreeSet::new();
+			for (target_node, target_port) in outgoing
+				.get(&body_output.id())
+				.into_iter()
+				.flatten()
+				.copied()
+			{
+				worklist.push_back((target_node, target_port));
+			}
+
+			let mut reaches_back_input = false;
+			while let Some((node_id, target_port)) = worklist.pop_front() {
+				if !visited.insert((node_id, target_port)) {
+					continue;
+				}
+				if node_id == loop_node.id() {
+					if target_port == back_input.id() {
+						reaches_back_input = true;
+						break;
+					}
+					continue;
+				}
+
+				let Some(node) = document.nodes().iter().find(|node| node.id() == node_id) else {
+					continue;
+				};
+				for output in node.ports().iter().filter(|port| {
+					port.direction() == PortDirection::OUTPUT && port.kind() == PortKind::EXECUTION
+				}) {
+					for successor in outgoing.get(&output.id()).into_iter().flatten() {
+						worklist.push_back(*successor);
+					}
+				}
+			}
+
+			if reaches_back_input {
+				None
+			} else {
+				Some(port_diagnostic(
+					body_output,
+					"BACKEND_DSL.LOOP_BODY_MISSING_BACK_EDGE",
+					"Loop body execution must return to the loop's back input.",
+				))
+			}
+		})
+		.map(|diagnostic| *diagnostic)
+		.collect()
+}
+
 fn route_properties(node: &Node) -> Result<RouteProperties, Box<Diagnostic>> {
 	let method = match node.properties().get("method") {
 		Some(Value::String(value)) => value.to_ascii_uppercase(),
@@ -1060,10 +1233,155 @@ mod tests {
 		node
 	}
 
+	fn loop_document(with_back_edge: bool) -> GraphDocument {
+		let metadata = krunt_graph_model::GraphMetadata::new(
+			krunt_graph_model::GraphId::new(if with_back_edge { 10 } else { 11 }).unwrap(),
+			"backend-v1",
+			"krunt-test",
+		)
+		.unwrap();
+		let mut source = Node::new(
+			NodeId::new(1).unwrap(),
+			NodeTypeId::new("backend.test_source").unwrap(),
+		);
+		source
+			.add_port(krunt_graph_model::Port::new(
+				PortId::new(11).unwrap(),
+				PortDirection::OUTPUT,
+				PortKind::EXECUTION,
+			))
+			.unwrap();
+		source
+			.add_port(krunt_graph_model::Port::new(
+				PortId::new(13).unwrap(),
+				PortDirection::OUTPUT,
+				PortKind::EXECUTION,
+			))
+			.unwrap();
+		source
+			.add_port(
+				krunt_graph_model::Port::new(
+					PortId::new(12).unwrap(),
+					PortDirection::OUTPUT,
+					PortKind::DATA,
+				)
+				.with_type_reference(krunt_graph_model::TypeReference::new(BOOLEAN_TYPE).unwrap()),
+			)
+			.unwrap();
+
+		let mut loop_node = Node::new(
+			NodeId::new(2).unwrap(),
+			NodeTypeId::new(LOOP_NODE_TYPE).unwrap(),
+		);
+		for (port_id, direction, kind) in [
+			(21, PortDirection::INPUT, PortKind::EXECUTION),
+			(22, PortDirection::INPUT, PortKind::EXECUTION),
+			(24, PortDirection::OUTPUT, PortKind::EXECUTION),
+			(25, PortDirection::OUTPUT, PortKind::EXECUTION),
+		] {
+			loop_node
+				.add_port(krunt_graph_model::Port::new(
+					PortId::new(port_id).unwrap(),
+					direction,
+					kind,
+				))
+				.unwrap();
+		}
+		loop_node
+			.add_port(
+				krunt_graph_model::Port::new(
+					PortId::new(23).unwrap(),
+					PortDirection::INPUT,
+					PortKind::DATA,
+				)
+				.with_type_reference(krunt_graph_model::TypeReference::new(BOOLEAN_TYPE).unwrap()),
+			)
+			.unwrap();
+
+		let mut body = Node::new(
+			NodeId::new(3).unwrap(),
+			NodeTypeId::new("backend.test_body").unwrap(),
+		);
+		body.add_port(krunt_graph_model::Port::new(
+			PortId::new(31).unwrap(),
+			PortDirection::INPUT,
+			PortKind::EXECUTION,
+		))
+		.unwrap();
+		body.add_port(krunt_graph_model::Port::new(
+			PortId::new(32).unwrap(),
+			PortDirection::OUTPUT,
+			PortKind::EXECUTION,
+		))
+		.unwrap();
+
+		let mut sink = Node::new(
+			NodeId::new(4).unwrap(),
+			NodeTypeId::new("backend.test_sink").unwrap(),
+		);
+		for port_id in [41, 42] {
+			sink.add_port(krunt_graph_model::Port::new(
+				PortId::new(port_id).unwrap(),
+				PortDirection::INPUT,
+				PortKind::EXECUTION,
+			))
+			.unwrap();
+		}
+
+		let mut builder = krunt_graph_model::GraphBuilder::new(metadata);
+		for node in [source, loop_node, body, sink] {
+			builder.add_node(node).unwrap();
+		}
+		let edges = [
+			(51, 11, 21, EdgeKind::EXECUTION),
+			(52, 12, 23, EdgeKind::DATA),
+			(53, 24, 31, EdgeKind::EXECUTION),
+			(54, 25, 41, EdgeKind::EXECUTION),
+		];
+		for (edge_id, from, to, kind) in edges {
+			builder
+				.add_edge(krunt_graph_model::Edge::new(
+					krunt_graph_model::EdgeId::new(edge_id).unwrap(),
+					PortId::new(from).unwrap(),
+					PortId::new(to).unwrap(),
+					kind,
+				))
+				.unwrap();
+		}
+		if with_back_edge {
+			builder
+				.add_edge(krunt_graph_model::Edge::new(
+					krunt_graph_model::EdgeId::new(55).unwrap(),
+					PortId::new(32).unwrap(),
+					PortId::new(22).unwrap(),
+					EdgeKind::EXECUTION,
+				))
+				.unwrap();
+		} else {
+			builder
+				.add_edge(krunt_graph_model::Edge::new(
+					krunt_graph_model::EdgeId::new(56).unwrap(),
+					PortId::new(13).unwrap(),
+					PortId::new(22).unwrap(),
+					EdgeKind::EXECUTION,
+				))
+				.unwrap();
+			builder
+				.add_edge(krunt_graph_model::Edge::new(
+					krunt_graph_model::EdgeId::new(57).unwrap(),
+					PortId::new(32).unwrap(),
+					PortId::new(42).unwrap(),
+					EdgeKind::EXECUTION,
+				))
+				.unwrap();
+		}
+		builder.build().unwrap()
+	}
+
 	#[test]
 	fn exposes_route_and_response_descriptors() {
 		let plugin = BackendDslPlugin::new();
-		assert_eq!(plugin.descriptors().len(), 8);
+		assert_eq!(plugin.descriptors().len(), 9);
 		assert_eq!(plugin.descriptors()[0].label(), "HTTP Route");
 		assert_eq!(plugin.descriptors()[0].properties().len(), 2);
 		let branch = plugin
@@ -1088,6 +1406,24 @@ mod tests {
 		assert_eq!(merge.category(), "Flow");
 		assert_eq!(merge.inputs().len(), 2);
 		assert_eq!(merge.outputs().len(), 1);
+		let loop_descriptor = plugin
+			.descriptors()
+			.iter()
+			.find(|descriptor| descriptor.type_id().as_str() == LOOP_NODE_TYPE)
+			.expect("loop descriptor should be registered");
+		assert_eq!(loop_descriptor.label(), "Loop");
+		assert_eq!(loop_descriptor.category(), "Flow");
+		assert_eq!(loop_descriptor.inputs().len(), 3);
+		assert_eq!(
+			loop_descriptor.inputs()[2]
+				.contract()
+				.type_id()
+				.unwrap()
+				.as_str(),
+			BOOLEAN_TYPE
+		);
+		assert_eq!(loop_descriptor.outputs().len(), 2);
+		assert!(loop_descriptor.properties().is_empty());
 		let transform = plugin
 			.descriptors()
 			.iter()
@@ -1239,6 +1575,22 @@ mod tests {
 		assert!(lowered.input_types().is_empty());
 		assert!(lowered.output_types().is_empty());
 		assert_eq!(lowered.attributes()["control.kind"], "MERGE");
+	}
+
+	#[test]
+	fn lowers_loop_with_a_boolean_condition_and_structured_control_kind() {
+		let node = Node::new(
+			NodeId::new(2).unwrap(),
+			NodeTypeId::new(LOOP_NODE_TYPE).unwrap(),
+		);
+		let contract = BackendDslPlugin::new().contract(&node);
+		let lowered = BackendDslPlugin::new().lower_node(&node).unwrap();
+
+		assert!(contract.is_loop());
+		assert_eq!(lowered.kind(), LoweredOperationKind::LOOP);
+		assert_eq!(lowered.input_types(), &[TypeId::new(BOOLEAN_TYPE).unwrap()]);
+		assert!(lowered.output_types().is_empty());
+		assert_eq!(lowered.attributes()["control.kind"], "LOOP");
 	}
 
 	#[test]
@@ -1662,5 +2014,27 @@ mod tests {
 		assert!(diagnostics.iter().all(|diagnostic| {
 			diagnostic.code().as_str() == "BACKEND_DSL.MERGE_INPUT_UNCONNECTED"
 		}));
+	}
+
+	#[test]
+	fn accepts_a_loop_with_a_body_back_edge_and_done_exit() {
+		let diagnostics = BackendDslPlugin::new().analyze_graph(&loop_document(true));
+
+		assert!(diagnostics.is_empty());
+	}
+
+	#[test]
+	fn rejects_a_loop_whose_body_does_not_return_to_the_back_input() {
+		let diagnostics = BackendDslPlugin::new().analyze_graph(&loop_document(false));
+
+		assert_eq!(diagnostics.len(), 1);
+		assert_eq!(
+			diagnostics[0].code().as_str(),
+			"BACKEND_DSL.LOOP_BODY_MISSING_BACK_EDGE"
+		);
+		assert_eq!(
+			diagnostics[0].primary(),
+			GraphElementId::PORT(PortId::new(24).unwrap())
+		);
 	}
 }
