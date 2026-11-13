@@ -809,6 +809,7 @@ fn ir_node(
 				LoweredOperationKind::BRANCH => IROp::BRANCH,
 				LoweredOperationKind::MERGE => IROp::MERGE,
 				LoweredOperationKind::LOOP => IROp::LOOP,
+				LoweredOperationKind::SUBGRAPH => IROp::SUBGRAPH,
 			}
 		},
 		input_types: lowered.input_types().to_vec(),

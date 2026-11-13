@@ -56,6 +56,7 @@ pub enum LoweredOperationKind {
 	BRANCH,
 	MERGE,
 	LOOP,
+	SUBGRAPH,
 }
 
 /// The target-neutral operation returned by a semantic plugin.

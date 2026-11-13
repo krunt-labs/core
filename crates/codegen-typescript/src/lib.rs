@@ -174,6 +174,7 @@ pub enum TypeScriptOperationKind {
 	BRANCH,
 	MERGE,
 	LOOP,
+	SUBGRAPH,
 	RETURN,
 }
 
@@ -582,7 +583,8 @@ fn render_function(function: &TypeScriptFunction) -> String {
 			}
 			TypeScriptOperationKind::BRANCH
 			| TypeScriptOperationKind::MERGE
-			| TypeScriptOperationKind::LOOP => {
+			| TypeScriptOperationKind::LOOP
+			| TypeScriptOperationKind::SUBGRAPH => {
 				source.push_str("  const ");
 				source.push_str(&operation_variable(operation.id));
 				source.push_str(": unknown = undefined;\n");
@@ -739,6 +741,7 @@ fn render_operation_kind(kind: &TypeScriptOperationKind) -> String {
 		TypeScriptOperationKind::BRANCH => "BRANCH".to_string(),
 		TypeScriptOperationKind::MERGE => "MERGE".to_string(),
 		TypeScriptOperationKind::LOOP => "LOOP".to_string(),
+		TypeScriptOperationKind::SUBGRAPH => "SUBGRAPH".to_string(),
 		TypeScriptOperationKind::RETURN => "RETURN".to_string(),
 	}
 }
@@ -846,6 +849,7 @@ fn lower_operation(
 		IROp::BRANCH => TypeScriptOperationKind::BRANCH,
 		IROp::MERGE => TypeScriptOperationKind::MERGE,
 		IROp::LOOP => TypeScriptOperationKind::LOOP,
+		IROp::SUBGRAPH => TypeScriptOperationKind::SUBGRAPH,
 		IROp::RETURN => TypeScriptOperationKind::RETURN,
 	};
 

@@ -1,15 +1,15 @@
 //! Initial Krunt Backend DSL semantic plugin.
 //!
 //! This crate owns backend meaning for the first vertical slice. It describes
-//! HTTP Route, Branch, Merge, Loop, Identity Transform, Success Response, Error
-//! Response, Try/Catch, and Validation Error nodes, validates their properties
+//! HTTP Route, Cron, Branch, Merge, Loop, Subgraph, Identity Transform, Success
+//! Response, Error Response, Try/Catch, and Validation Error nodes, validates their properties
 //! and typed data contracts, and lowers them into target-neutral operations with
 //! namespaced metadata. It does not emit TypeScript or NestJS code.
 
 use krunt_diagnostics::{CompilerStage, Diagnostic, DiagnosticCode, GraphElementId, Severity};
 use krunt_graph_model::{
 	EdgeKind, GraphDocument, Node, NodeId, NodeTypeId, PluginReference, PortDirection, PortId,
-	PortKind,
+	PortKind, SubgraphId,
 };
 use krunt_ir::{AsyncKind, OperationId, TypeId};
 use krunt_plugin_api::{
@@ -28,6 +28,7 @@ pub const CRON_NODE_TYPE: &str = "backend.cron";
 pub const BRANCH_NODE_TYPE: &str = "backend.branch";
 pub const MERGE_NODE_TYPE: &str = "backend.merge";
 pub const LOOP_NODE_TYPE: &str = "backend.loop";
+pub const SUBGRAPH_NODE_TYPE: &str = "backend.subgraph";
 pub const TRANSFORM_NODE_TYPE: &str = "backend.transform";
 pub const SUCCESS_RESPONSE_NODE_TYPE: &str = "backend.success_response";
 pub const ERROR_RESPONSE_NODE_TYPE: &str = "backend.error_response";
@@ -41,6 +42,7 @@ pub const ERROR_RESPONSE_DEFAULT_STATUS_CODE: u16 = 500;
 pub const VALIDATION_ERROR_DEFAULT_STATUS_CODE: u16 = 400;
 pub const VALIDATION_ERROR_DEFAULT_MESSAGE: &str = "Validation failed";
 pub const CRON_SCHEDULE_PROPERTY: &str = "schedule";
+pub const SUBGRAPH_ID_PROPERTY: &str = "subgraph_id";
 
 const HTTP_METHODS: [&str; 7] = ["DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT"];
 
@@ -168,6 +170,7 @@ impl BackendDslPlugin {
 		let branch_type = NodeTypeId::new(BRANCH_NODE_TYPE).expect("static node type is valid");
 		let merge_type = NodeTypeId::new(MERGE_NODE_TYPE).expect("static node type is valid");
 		let loop_type = NodeTypeId::new(LOOP_NODE_TYPE).expect("static node type is valid");
+		let subgraph_type = NodeTypeId::new(SUBGRAPH_NODE_TYPE).expect("static node type is valid");
 		let transform_type =
 			NodeTypeId::new(TRANSFORM_NODE_TYPE).expect("static node type is valid");
 		let response_type =
@@ -190,6 +193,7 @@ impl BackendDslPlugin {
 				branch_type.clone(),
 				merge_type.clone(),
 				loop_type.clone(),
+				subgraph_type.clone(),
 				transform_type.clone(),
 				response_type.clone(),
 				error_response_type.clone(),
@@ -325,6 +329,25 @@ impl BackendDslPlugin {
 					),
 				],
 				properties: Vec::new(),
+			},
+			BackendNodeDescriptor {
+				type_id: subgraph_type,
+				label: "Subgraph".to_string(),
+				category: "Flow".to_string(),
+				inputs: vec![BackendPortDescriptor::new(
+					"in",
+					PortContract::new(PortKind::EXECUTION, None, true),
+				)],
+				outputs: vec![BackendPortDescriptor::new(
+					"out",
+					PortContract::new(PortKind::EXECUTION, None, true),
+				)],
+				properties: vec![BackendPropertyDescriptor::new(
+					SUBGRAPH_ID_PROPERTY,
+					BackendPropertyKind::INTEGER,
+					true,
+					None,
+				)],
 			},
 			BackendNodeDescriptor {
 				type_id: transform_type,
@@ -478,6 +501,7 @@ impl krunt_plugin_api::SemanticPlugin for BackendDslPlugin {
 			BRANCH_NODE_TYPE => branch_contract(),
 			MERGE_NODE_TYPE => merge_contract(),
 			LOOP_NODE_TYPE => loop_contract(),
+			SUBGRAPH_NODE_TYPE => subgraph_contract(),
 			TRANSFORM_NODE_TYPE => transform_contract(),
 			SUCCESS_RESPONSE_NODE_TYPE | ERROR_RESPONSE_NODE_TYPE => response_contract(),
 			TRY_CATCH_NODE_TYPE => try_catch_contract(),
@@ -523,6 +547,14 @@ impl krunt_plugin_api::SemanticPlugin for BackendDslPlugin {
 			"Loop requires its body and done execution outputs to be connected.",
 		));
 		diagnostics.extend(validate_loop_back_edges(document));
+		diagnostics.extend(validate_required_execution_ports(
+			document,
+			SUBGRAPH_NODE_TYPE,
+			PortDirection::OUTPUT,
+			"BACKEND_DSL.SUBGRAPH_OUTPUT_UNCONNECTED",
+			"Subgraph requires its execution output to be connected.",
+		));
+		diagnostics.extend(validate_subgraph_references(document));
 		diagnostics.extend(validate_try_catch_branches(document));
 		diagnostics.extend(validate_route_response_paths(document));
 		diagnostics
@@ -536,6 +568,11 @@ impl krunt_plugin_api::SemanticPlugin for BackendDslPlugin {
 				.into_iter()
 				.collect(),
 			CRON_NODE_TYPE => cron_schedule(node)
+				.err()
+				.map(|diagnostic| *diagnostic)
+				.into_iter()
+				.collect(),
+			SUBGRAPH_NODE_TYPE => subgraph_reference(node)
 				.err()
 				.map(|diagnostic| *diagnostic)
 				.into_iter()
@@ -617,6 +654,19 @@ impl krunt_plugin_api::SemanticPlugin for BackendDslPlugin {
 			)
 			.with_kind(LoweredOperationKind::LOOP)
 			.with_attribute("control.kind", "LOOP")),
+			SUBGRAPH_NODE_TYPE => {
+				let subgraph_id = subgraph_reference(node).map_err(|error| vec![*error])?;
+				Ok(LoweredOperation::new(
+					OperationId::new(SUBGRAPH_NODE_TYPE).expect("static operation is valid"),
+					[],
+					[],
+					AsyncKind::SYNC,
+					[],
+				)
+				.with_kind(LoweredOperationKind::SUBGRAPH)
+				.with_attribute("control.kind", "SUBGRAPH")
+				.with_attribute("backend.subgraph.id", subgraph_id.as_u64().to_string()))
+			}
 			TRANSFORM_NODE_TYPE => {
 				let (input_type, output_type) =
 					transform_data_types(node).map_err(|error| vec![*error])?;
@@ -784,6 +834,18 @@ fn loop_contract() -> NodeContract {
 		[],
 	)
 	.with_loop(true)
+}
+
+fn subgraph_contract() -> NodeContract {
+	NodeContract::new(
+		[PortContract::new(PortKind::EXECUTION, None, true)],
+		[PortContract::new(PortKind::EXECUTION, None, true)],
+		[],
+		[],
+		[],
+		AsyncKind::SYNC,
+		[],
+	)
 }
 
 fn transform_contract() -> NodeContract {
@@ -1063,6 +1125,99 @@ fn validate_try_catch_branches(document: &GraphDocument) -> Vec<Diagnostic> {
 	)
 }
 
+fn validate_subgraph_references(document: &GraphDocument) -> Vec<Diagnostic> {
+	let subgraphs: BTreeMap<SubgraphId, _> = document
+		.subgraphs()
+		.iter()
+		.map(|subgraph| (subgraph.id(), subgraph))
+		.collect();
+	let mut dependencies = BTreeMap::<SubgraphId, BTreeSet<SubgraphId>>::new();
+	let mut invocations = Vec::new();
+	let mut diagnostics = Vec::new();
+
+	for node in document
+		.nodes()
+		.iter()
+		.filter(|node| node.type_id().as_str() == SUBGRAPH_NODE_TYPE)
+	{
+		let Ok(target) = subgraph_reference(node) else {
+			continue;
+		};
+		let Some(target_subgraph) = subgraphs.get(&target) else {
+			diagnostics.push(*node_diagnostic(
+				node,
+				"BACKEND_DSL.SUBGRAPH_NOT_FOUND",
+				format!(
+					"Subgraph {target_id} does not exist.",
+					target_id = target.as_u64()
+				),
+			));
+			continue;
+		};
+		if target_subgraph.ports().is_empty() {
+			diagnostics.push(*node_diagnostic(
+				node,
+				"BACKEND_DSL.SUBGRAPH_BOUNDARY_MISSING",
+				format!(
+					"Subgraph {target_id} must declare at least one boundary port.",
+					target_id = target.as_u64()
+				),
+			));
+		}
+
+		for source_subgraph in document
+			.subgraphs()
+			.iter()
+			.filter(|subgraph| subgraph.nodes().contains(&node.id()))
+		{
+			dependencies
+				.entry(source_subgraph.id())
+				.or_default()
+				.insert(target);
+			invocations.push((node.id(), source_subgraph.id(), target));
+		}
+	}
+
+	for (node_id, source, target) in invocations {
+		if subgraph_reaches(target, source, &dependencies) {
+			diagnostics.push(
+				Diagnostic::new(
+					DiagnosticCode::new("BACKEND_DSL.SUBGRAPH_RECURSION")
+						.expect("static diagnostic code is valid"),
+					Severity::ERROR,
+					CompilerStage::SEMANTIC_ANALYSIS,
+					"Recursive subgraph invocation is not supported.",
+					GraphElementId::NODE(node_id),
+				)
+				.expect("static Backend DSL diagnostic is valid"),
+			);
+		}
+	}
+
+	diagnostics
+}
+
+fn subgraph_reaches(
+	start: SubgraphId,
+	goal: SubgraphId,
+	dependencies: &BTreeMap<SubgraphId, BTreeSet<SubgraphId>>,
+) -> bool {
+	let mut visited = BTreeSet::new();
+	let mut worklist = VecDeque::from([start]);
+	while let Some(current) = worklist.pop_front() {
+		if !visited.insert(current) {
+			continue;
+		}
+		if current == goal {
+			return true;
+		}
+		if let Some(next) = dependencies.get(&current) {
+			worklist.extend(next.iter().copied());
+		}
+	}
+	false
+}
+
 fn validate_required_execution_ports(
 	document: &GraphDocument,
 	node_type: &str,
@@ -1216,6 +1371,30 @@ fn cron_schedule(node: &Node) -> Result<String, Box<Diagnostic>> {
 		));
 	}
 	Ok(schedule)
+}
+
+fn subgraph_reference(node: &Node) -> Result<SubgraphId, Box<Diagnostic>> {
+	let Some(value) = node.properties().get(SUBGRAPH_ID_PROPERTY) else {
+		return Err(node_diagnostic(
+			node,
+			"BACKEND_DSL.SUBGRAPH_ID_MISSING",
+			"Subgraph property 'subgraph_id' is required.",
+		));
+	};
+	let Some(value) = value.as_u64() else {
+		return Err(node_diagnostic(
+			node,
+			"BACKEND_DSL.SUBGRAPH_ID_TYPE",
+			"Subgraph property 'subgraph_id' must be a positive integer.",
+		));
+	};
+	SubgraphId::new(value).map_err(|_| {
+		node_diagnostic(
+			node,
+			"BACKEND_DSL.SUBGRAPH_ID_INVALID",
+			"Subgraph property 'subgraph_id' must be a positive integer.",
+		)
+	})
 }
 
 fn route_properties(node: &Node) -> Result<RouteProperties, Box<Diagnostic>> {
@@ -1472,7 +1651,7 @@ mod tests {
 	#[test]
 	fn exposes_route_and_response_descriptors() {
 		let plugin = BackendDslPlugin::new();
-		assert_eq!(plugin.descriptors().len(), 10);
+		assert_eq!(plugin.descriptors().len(), 11);
 		assert_eq!(plugin.descriptors()[0].label(), "HTTP Route");
 		assert_eq!(plugin.descriptors()[0].properties().len(), 2);
 		let cron = plugin
@@ -1602,6 +1781,144 @@ mod tests {
 			validation_error.properties()[0].default(),
 			Some(&Value::String(VALIDATION_ERROR_DEFAULT_MESSAGE.to_string()))
 		);
+	}
+
+	#[test]
+	fn exposes_and_lowers_subgraph_invocations() {
+		let plugin = BackendDslPlugin::new();
+		let descriptor = plugin
+			.descriptors()
+			.iter()
+			.find(|descriptor| descriptor.type_id().as_str() == SUBGRAPH_NODE_TYPE)
+			.expect("subgraph descriptor should be registered");
+		assert_eq!(descriptor.label(), "Subgraph");
+		assert_eq!(descriptor.category(), "Flow");
+		assert_eq!(descriptor.inputs().len(), 1);
+		assert_eq!(descriptor.outputs().len(), 1);
+		assert_eq!(descriptor.properties().len(), 1);
+		assert_eq!(descriptor.properties()[0].key(), SUBGRAPH_ID_PROPERTY);
+		assert_eq!(
+			descriptor.properties()[0].kind(),
+			&BackendPropertyKind::INTEGER
+		);
+		assert!(descriptor.properties()[0].required());
+
+		let node = Node::new(
+			NodeId::new(2).unwrap(),
+			NodeTypeId::new(SUBGRAPH_NODE_TYPE).unwrap(),
+		)
+		.with_property(
+			SUBGRAPH_ID_PROPERTY,
+			Value::Number(serde_json::Number::from(40)),
+		)
+		.unwrap();
+		let lowered = plugin.lower_node(&node).unwrap();
+		assert_eq!(lowered.kind(), LoweredOperationKind::SUBGRAPH);
+		assert_eq!(lowered.attributes()["control.kind"], "SUBGRAPH");
+		assert_eq!(lowered.attributes()["backend.subgraph.id"], "40");
+	}
+
+	#[test]
+	fn rejects_invalid_subgraph_references() {
+		let plugin = BackendDslPlugin::new();
+		let missing = Node::new(
+			NodeId::new(2).unwrap(),
+			NodeTypeId::new(SUBGRAPH_NODE_TYPE).unwrap(),
+		);
+		let wrong_type = missing
+			.clone()
+			.with_property(SUBGRAPH_ID_PROPERTY, Value::String("40".to_string()))
+			.unwrap();
+		let zero = missing
+			.clone()
+			.with_property(
+				SUBGRAPH_ID_PROPERTY,
+				Value::Number(serde_json::Number::from(0)),
+			)
+			.unwrap();
+
+		assert_eq!(
+			plugin.analyze_node(&missing)[0].code().as_str(),
+			"BACKEND_DSL.SUBGRAPH_ID_MISSING"
+		);
+		assert_eq!(
+			plugin.analyze_node(&wrong_type)[0].code().as_str(),
+			"BACKEND_DSL.SUBGRAPH_ID_TYPE"
+		);
+		assert_eq!(
+			plugin.analyze_node(&zero)[0].code().as_str(),
+			"BACKEND_DSL.SUBGRAPH_ID_INVALID"
+		);
+	}
+
+	#[test]
+	fn rejects_unknown_and_recursive_subgraph_references() {
+		let metadata = krunt_graph_model::GraphMetadata::new(
+			krunt_graph_model::GraphId::new(20).unwrap(),
+			"backend-v1",
+			"krunt-test",
+		)
+		.unwrap();
+		let mut unknown = Node::new(
+			NodeId::new(2).unwrap(),
+			NodeTypeId::new(SUBGRAPH_NODE_TYPE).unwrap(),
+		)
+		.with_property(
+			SUBGRAPH_ID_PROPERTY,
+			Value::Number(serde_json::Number::from(999)),
+		)
+		.unwrap();
+		unknown
+			.add_port(krunt_graph_model::Port::new(
+				PortId::new(21).unwrap(),
+				PortDirection::OUTPUT,
+				PortKind::EXECUTION,
+			))
+			.unwrap();
+		let mut builder = krunt_graph_model::GraphBuilder::new(metadata.clone());
+		builder.add_node(unknown).unwrap();
+		let diagnostics = BackendDslPlugin::new().analyze_graph(&builder.build().unwrap());
+		assert!(diagnostics
+			.iter()
+			.any(|diagnostic| diagnostic.code().as_str() == "BACKEND_DSL.SUBGRAPH_NOT_FOUND"));
+
+		let mut recursive = Node::new(
+			NodeId::new(3).unwrap(),
+			NodeTypeId::new(SUBGRAPH_NODE_TYPE).unwrap(),
+		)
+		.with_property(
+			SUBGRAPH_ID_PROPERTY,
+			Value::Number(serde_json::Number::from(40)),
+		)
+		.unwrap();
+		recursive
+			.add_port(krunt_graph_model::Port::new(
+				PortId::new(31).unwrap(),
+				PortDirection::OUTPUT,
+				PortKind::EXECUTION,
+			))
+			.unwrap();
+		let mut recursive_builder = krunt_graph_model::GraphBuilder::new(metadata);
+		recursive_builder.add_node(recursive).unwrap();
+		recursive_builder
+			.add_subgraph(
+				krunt_graph_model::Subgraph::new(
+					SubgraphId::new(40).unwrap(),
+					[NodeId::new(3).unwrap()],
+					[krunt_graph_model::SubgraphPort::new(
+						PortId::new(41).unwrap(),
+						PortDirection::INPUT,
+						PortKind::EXECUTION,
+					)],
+				)
+				.unwrap(),
+			)
+			.unwrap();
+		let diagnostics =
+			BackendDslPlugin::new().analyze_graph(&recursive_builder.build().unwrap());
+		assert!(diagnostics
+			.iter()
+			.any(|diagnostic| diagnostic.code().as_str() == "BACKEND_DSL.SUBGRAPH_RECURSION"));
 	}
 
 	#[test]

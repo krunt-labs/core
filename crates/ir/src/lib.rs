@@ -128,6 +128,7 @@ pub enum IROp {
 	BRANCH,
 	MERGE,
 	LOOP,
+	SUBGRAPH,
 	RETURN,
 }
 
