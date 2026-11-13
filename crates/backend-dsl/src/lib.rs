@@ -24,6 +24,7 @@ use std::fmt;
 pub const BACKEND_DSL_ID: &str = "krunt.backend-dsl";
 pub const BACKEND_DSL_VERSION: &str = "0.1.0";
 pub const HTTP_ROUTE_NODE_TYPE: &str = "backend.http_route";
+pub const CRON_NODE_TYPE: &str = "backend.cron";
 pub const BRANCH_NODE_TYPE: &str = "backend.branch";
 pub const MERGE_NODE_TYPE: &str = "backend.merge";
 pub const LOOP_NODE_TYPE: &str = "backend.loop";
@@ -39,6 +40,7 @@ pub const SUCCESS_RESPONSE_DEFAULT_STATUS_CODE: u16 = 200;
 pub const ERROR_RESPONSE_DEFAULT_STATUS_CODE: u16 = 500;
 pub const VALIDATION_ERROR_DEFAULT_STATUS_CODE: u16 = 400;
 pub const VALIDATION_ERROR_DEFAULT_MESSAGE: &str = "Validation failed";
+pub const CRON_SCHEDULE_PROPERTY: &str = "schedule";
 
 const HTTP_METHODS: [&str; 7] = ["DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT"];
 
@@ -162,6 +164,7 @@ pub struct BackendDslPlugin {
 impl BackendDslPlugin {
 	pub fn new() -> Self {
 		let route_type = NodeTypeId::new(HTTP_ROUTE_NODE_TYPE).expect("static node type is valid");
+		let cron_type = NodeTypeId::new(CRON_NODE_TYPE).expect("static node type is valid");
 		let branch_type = NodeTypeId::new(BRANCH_NODE_TYPE).expect("static node type is valid");
 		let merge_type = NodeTypeId::new(MERGE_NODE_TYPE).expect("static node type is valid");
 		let loop_type = NodeTypeId::new(LOOP_NODE_TYPE).expect("static node type is valid");
@@ -183,6 +186,7 @@ impl BackendDslPlugin {
 				.expect("static plugin identity is valid"),
 			[
 				route_type.clone(),
+				cron_type.clone(),
 				branch_type.clone(),
 				merge_type.clone(),
 				loop_type.clone(),
@@ -229,6 +233,22 @@ impl BackendDslPlugin {
 						Some(Value::String("/".to_string())),
 					),
 				],
+			},
+			BackendNodeDescriptor {
+				type_id: cron_type,
+				label: "Cron".to_string(),
+				category: "Entry".to_string(),
+				inputs: Vec::new(),
+				outputs: vec![BackendPortDescriptor::new(
+					"next",
+					PortContract::new(PortKind::EXECUTION, None, true),
+				)],
+				properties: vec![BackendPropertyDescriptor::new(
+					CRON_SCHEDULE_PROPERTY,
+					BackendPropertyKind::STRING,
+					true,
+					None,
+				)],
 			},
 			BackendNodeDescriptor {
 				type_id: branch_type,
@@ -454,6 +474,7 @@ impl krunt_plugin_api::SemanticPlugin for BackendDslPlugin {
 			HTTP_ROUTE_NODE_TYPE => {
 				route_contract(TypeId::new(HTTP_REQUEST_TYPE).expect("static type is valid"))
 			}
+			CRON_NODE_TYPE => cron_contract(),
 			BRANCH_NODE_TYPE => branch_contract(),
 			MERGE_NODE_TYPE => merge_contract(),
 			LOOP_NODE_TYPE => loop_contract(),
@@ -468,11 +489,18 @@ impl krunt_plugin_api::SemanticPlugin for BackendDslPlugin {
 	fn analyze_graph(&self, document: &GraphDocument) -> Vec<Diagnostic> {
 		let mut diagnostics = validate_required_execution_ports(
 			document,
+			CRON_NODE_TYPE,
+			PortDirection::OUTPUT,
+			"BACKEND_DSL.CRON_OUTPUT_UNCONNECTED",
+			"Cron requires its execution output to be connected.",
+		);
+		diagnostics.extend(validate_required_execution_ports(
+			document,
 			BRANCH_NODE_TYPE,
 			PortDirection::OUTPUT,
 			"BACKEND_DSL.BRANCH_OUTPUT_UNCONNECTED",
 			"Branch requires both the true and false execution outputs to be connected.",
-		);
+		));
 		diagnostics.extend(validate_required_execution_ports(
 			document,
 			MERGE_NODE_TYPE,
@@ -503,6 +531,11 @@ impl krunt_plugin_api::SemanticPlugin for BackendDslPlugin {
 	fn analyze_node(&self, node: &Node) -> Vec<Diagnostic> {
 		match node.type_id().as_str() {
 			HTTP_ROUTE_NODE_TYPE => route_properties(node)
+				.err()
+				.map(|diagnostic| *diagnostic)
+				.into_iter()
+				.collect(),
+			CRON_NODE_TYPE => cron_schedule(node)
 				.err()
 				.map(|diagnostic| *diagnostic)
 				.into_iter()
@@ -545,6 +578,17 @@ impl krunt_plugin_api::SemanticPlugin for BackendDslPlugin {
 				)
 				.with_attribute("backend.http.method", properties.method)
 				.with_attribute("backend.http.path", properties.path))
+			}
+			CRON_NODE_TYPE => {
+				let schedule = cron_schedule(node).map_err(|error| vec![*error])?;
+				Ok(LoweredOperation::new(
+					OperationId::new(CRON_NODE_TYPE).expect("static operation is valid"),
+					[],
+					[],
+					AsyncKind::SYNC,
+					[],
+				)
+				.with_attribute("backend.cron.schedule", schedule))
 			}
 			BRANCH_NODE_TYPE => Ok(LoweredOperation::new(
 				OperationId::new(BRANCH_NODE_TYPE).expect("static operation is valid"),
@@ -659,6 +703,19 @@ fn route_contract(request_type: TypeId) -> NodeContract {
 			PortContract::new(PortKind::EXECUTION, None, true),
 			PortContract::new(PortKind::DATA, Some(request_type), true),
 		],
+		[],
+		[],
+		[],
+		AsyncKind::SYNC,
+		[],
+	)
+	.with_entry(true)
+}
+
+fn cron_contract() -> NodeContract {
+	NodeContract::new(
+		[],
+		[PortContract::new(PortKind::EXECUTION, None, true)],
 		[],
 		[],
 		[],
@@ -1127,6 +1184,40 @@ fn validate_loop_back_edges(document: &GraphDocument) -> Vec<Diagnostic> {
 		.collect()
 }
 
+fn cron_schedule(node: &Node) -> Result<String, Box<Diagnostic>> {
+	let Some(value) = node.properties().get(CRON_SCHEDULE_PROPERTY) else {
+		return Err(node_diagnostic(
+			node,
+			"BACKEND_DSL.CRON_SCHEDULE_MISSING",
+			"Cron requires a 'schedule' property.",
+		));
+	};
+	let Some(schedule) = value.as_str() else {
+		return Err(node_diagnostic(
+			node,
+			"BACKEND_DSL.CRON_SCHEDULE_TYPE",
+			"Cron property 'schedule' must be a string.",
+		));
+	};
+	let schedule = schedule.split_whitespace().collect::<Vec<_>>().join(" ");
+	let fields: Vec<_> = schedule.split(' ').collect();
+	let valid = fields.len() == 5
+		&& fields.iter().all(|field| {
+			!field.is_empty()
+				&& field.chars().all(|character| {
+					character.is_ascii_digit() || matches!(character, '*' | '/' | ',' | '-')
+				})
+		});
+	if !valid {
+		return Err(node_diagnostic(
+			node,
+			"BACKEND_DSL.CRON_SCHEDULE_INVALID",
+			"Cron schedule must contain five fields using digits, '*', '/', ',', and '-'.",
+		));
+	}
+	Ok(schedule)
+}
+
 fn route_properties(node: &Node) -> Result<RouteProperties, Box<Diagnostic>> {
 	let method = match node.properties().get("method") {
 		Some(Value::String(value)) => value.to_ascii_uppercase(),
@@ -1381,9 +1472,23 @@ mod tests {
 	#[test]
 	fn exposes_route_and_response_descriptors() {
 		let plugin = BackendDslPlugin::new();
-		assert_eq!(plugin.descriptors().len(), 9);
+		assert_eq!(plugin.descriptors().len(), 10);
 		assert_eq!(plugin.descriptors()[0].label(), "HTTP Route");
 		assert_eq!(plugin.descriptors()[0].properties().len(), 2);
+		let cron = plugin
+			.descriptors()
+			.iter()
+			.find(|descriptor| descriptor.type_id().as_str() == CRON_NODE_TYPE)
+			.expect("cron descriptor should be registered");
+		assert_eq!(cron.label(), "Cron");
+		assert_eq!(cron.category(), "Entry");
+		assert!(cron.inputs().is_empty());
+		assert_eq!(cron.outputs().len(), 1);
+		assert_eq!(cron.properties().len(), 1);
+		assert_eq!(cron.properties()[0].key(), CRON_SCHEDULE_PROPERTY);
+		assert_eq!(cron.properties()[0].kind(), &BackendPropertyKind::STRING);
+		assert!(cron.properties()[0].required());
+		assert!(cron.properties()[0].default().is_none());
 		let branch = plugin
 			.descriptors()
 			.iter()
@@ -1793,6 +1898,61 @@ mod tests {
 	}
 
 	#[test]
+	fn lowers_a_valid_cron_with_target_neutral_schedule_metadata() {
+		let plugin = BackendDslPlugin::new();
+		let node = Node::new(
+			NodeId::new(2).unwrap(),
+			NodeTypeId::new(CRON_NODE_TYPE).unwrap(),
+		)
+		.with_property(
+			CRON_SCHEDULE_PROPERTY,
+			Value::String("*/5 * * * *".to_string()),
+		)
+		.unwrap();
+		let contract = plugin.contract(&node);
+		let lowered = plugin.lower_node(&node).unwrap();
+
+		assert!(contract.is_entry());
+		assert_eq!(lowered.operation().as_str(), CRON_NODE_TYPE);
+		assert!(lowered.input_types().is_empty());
+		assert!(lowered.output_types().is_empty());
+		assert_eq!(lowered.attributes()["backend.cron.schedule"], "*/5 * * * *");
+	}
+
+	#[test]
+	fn rejects_invalid_cron_schedules() {
+		let plugin = BackendDslPlugin::new();
+		let missing = Node::new(
+			NodeId::new(2).unwrap(),
+			NodeTypeId::new(CRON_NODE_TYPE).unwrap(),
+		);
+		let wrong_type = missing
+			.clone()
+			.with_property(CRON_SCHEDULE_PROPERTY, Value::Bool(true))
+			.unwrap();
+		let invalid = missing
+			.clone()
+			.with_property(
+				CRON_SCHEDULE_PROPERTY,
+				Value::String("every-five-minutes".to_string()),
+			)
+			.unwrap();
+
+		assert_eq!(
+			plugin.analyze_node(&missing)[0].code().as_str(),
+			"BACKEND_DSL.CRON_SCHEDULE_MISSING"
+		);
+		assert_eq!(
+			plugin.analyze_node(&wrong_type)[0].code().as_str(),
+			"BACKEND_DSL.CRON_SCHEDULE_TYPE"
+		);
+		assert_eq!(
+			plugin.analyze_node(&invalid)[0].code().as_str(),
+			"BACKEND_DSL.CRON_SCHEDULE_INVALID"
+		);
+	}
+
+	#[test]
 	fn invalid_route_properties_return_stable_diagnostics() {
 		let plugin = BackendDslPlugin::new();
 		let diagnostics =
@@ -1827,6 +1987,44 @@ mod tests {
 		assert_eq!(
 			diagnostics[0].code().as_str(),
 			"BACKEND_DSL.HTTP_ROUTE_MISSING_RESPONSE"
+		);
+	}
+
+	#[test]
+	fn rejects_a_cron_with_an_unconnected_execution_output() {
+		let metadata = krunt_graph_model::GraphMetadata::new(
+			krunt_graph_model::GraphId::new(5).unwrap(),
+			"backend-v1",
+			"krunt-test",
+		)
+		.unwrap();
+		let mut cron = Node::new(
+			NodeId::new(2).unwrap(),
+			NodeTypeId::new(CRON_NODE_TYPE).unwrap(),
+		)
+		.with_property(
+			CRON_SCHEDULE_PROPERTY,
+			Value::String("0 * * * *".to_string()),
+		)
+		.unwrap();
+		cron.add_port(krunt_graph_model::Port::new(
+			PortId::new(21).unwrap(),
+			PortDirection::OUTPUT,
+			PortKind::EXECUTION,
+		))
+		.unwrap();
+		let mut builder = krunt_graph_model::GraphBuilder::new(metadata);
+		builder.add_node(cron).unwrap();
+		let diagnostics = BackendDslPlugin::new().analyze_graph(&builder.build().unwrap());
+
+		assert_eq!(diagnostics.len(), 1);
+		assert_eq!(
+			diagnostics[0].code().as_str(),
+			"BACKEND_DSL.CRON_OUTPUT_UNCONNECTED"
+		);
+		assert_eq!(
+			diagnostics[0].primary(),
+			GraphElementId::PORT(PortId::new(21).unwrap())
 		);
 	}
 
