@@ -2,7 +2,7 @@
 //!
 //! This crate owns backend meaning for the first vertical slice. It describes
 //! HTTP Route, Cron, Branch, Merge, Loop, Subgraph, Entity, Repository, Query,
-//! Identity Transform, Success Response, Error Response, Try/Catch, and Validation Error nodes, validates their properties
+//! Mutation, Identity Transform, Success Response, Error Response, Try/Catch, and Validation Error nodes, validates their properties
 //! and typed data contracts, and lowers them into target-neutral operations with
 //! namespaced metadata. It does not emit TypeScript or NestJS code.
 
@@ -32,6 +32,7 @@ pub const SUBGRAPH_NODE_TYPE: &str = "backend.subgraph";
 pub const ENTITY_NODE_TYPE: &str = "backend.entity";
 pub const REPOSITORY_NODE_TYPE: &str = "backend.repository";
 pub const QUERY_NODE_TYPE: &str = "backend.query";
+pub const MUTATION_NODE_TYPE: &str = "backend.mutation";
 pub const TRANSFORM_NODE_TYPE: &str = "backend.transform";
 pub const SUCCESS_RESPONSE_NODE_TYPE: &str = "backend.success_response";
 pub const ERROR_RESPONSE_NODE_TYPE: &str = "backend.error_response";
@@ -51,6 +52,8 @@ pub const REPOSITORY_NAME_PROPERTY: &str = "name";
 pub const REPOSITORY_ENTITY_PROPERTY: &str = "entity";
 pub const QUERY_NAME_PROPERTY: &str = "name";
 pub const QUERY_REPOSITORY_PROPERTY: &str = "repository";
+pub const MUTATION_NAME_PROPERTY: &str = "name";
+pub const MUTATION_REPOSITORY_PROPERTY: &str = "repository";
 
 const HTTP_METHODS: [&str; 7] = ["DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT"];
 
@@ -183,6 +186,7 @@ impl BackendDslPlugin {
 		let repository_type =
 			NodeTypeId::new(REPOSITORY_NODE_TYPE).expect("static node type is valid");
 		let query_type = NodeTypeId::new(QUERY_NODE_TYPE).expect("static node type is valid");
+		let mutation_type = NodeTypeId::new(MUTATION_NODE_TYPE).expect("static node type is valid");
 		let transform_type =
 			NodeTypeId::new(TRANSFORM_NODE_TYPE).expect("static node type is valid");
 		let response_type =
@@ -209,6 +213,7 @@ impl BackendDslPlugin {
 				entity_type.clone(),
 				repository_type.clone(),
 				query_type.clone(),
+				mutation_type.clone(),
 				transform_type.clone(),
 				response_type.clone(),
 				error_response_type.clone(),
@@ -420,6 +425,27 @@ impl BackendDslPlugin {
 				],
 			},
 			BackendNodeDescriptor {
+				type_id: mutation_type,
+				label: "Mutation".to_string(),
+				category: "Persistence".to_string(),
+				inputs: Vec::new(),
+				outputs: Vec::new(),
+				properties: vec![
+					BackendPropertyDescriptor::new(
+						MUTATION_NAME_PROPERTY,
+						BackendPropertyKind::STRING,
+						true,
+						None,
+					),
+					BackendPropertyDescriptor::new(
+						MUTATION_REPOSITORY_PROPERTY,
+						BackendPropertyKind::STRING,
+						true,
+						None,
+					),
+				],
+			},
+			BackendNodeDescriptor {
 				type_id: transform_type,
 				label: "Identity Transform".to_string(),
 				category: "Data".to_string(),
@@ -575,6 +601,7 @@ impl krunt_plugin_api::SemanticPlugin for BackendDslPlugin {
 			ENTITY_NODE_TYPE => entity_contract(),
 			REPOSITORY_NODE_TYPE => repository_contract(),
 			QUERY_NODE_TYPE => query_contract(),
+			MUTATION_NODE_TYPE => mutation_contract(),
 			TRANSFORM_NODE_TYPE => transform_contract(),
 			SUCCESS_RESPONSE_NODE_TYPE | ERROR_RESPONSE_NODE_TYPE => response_contract(),
 			TRY_CATCH_NODE_TYPE => try_catch_contract(),
@@ -631,6 +658,7 @@ impl krunt_plugin_api::SemanticPlugin for BackendDslPlugin {
 		diagnostics.extend(validate_entity_names(document));
 		diagnostics.extend(validate_repository_references(document));
 		diagnostics.extend(validate_query_references(document));
+		diagnostics.extend(validate_mutation_references(document));
 		diagnostics.extend(validate_try_catch_branches(document));
 		diagnostics.extend(validate_route_response_paths(document));
 		diagnostics
@@ -664,6 +692,11 @@ impl krunt_plugin_api::SemanticPlugin for BackendDslPlugin {
 				.into_iter()
 				.collect(),
 			QUERY_NODE_TYPE => query_properties(node)
+				.err()
+				.map(|diagnostic| *diagnostic)
+				.into_iter()
+				.collect(),
+			MUTATION_NODE_TYPE => mutation_properties(node)
 				.err()
 				.map(|diagnostic| *diagnostic)
 				.into_iter()
@@ -792,6 +825,18 @@ impl krunt_plugin_api::SemanticPlugin for BackendDslPlugin {
 				)
 				.with_attribute("backend.query.name", properties.name)
 				.with_attribute("backend.query.repository", properties.repository))
+			}
+			MUTATION_NODE_TYPE => {
+				let properties = mutation_properties(node).map_err(|error| vec![*error])?;
+				Ok(LoweredOperation::new(
+					OperationId::new(MUTATION_NODE_TYPE).expect("static operation is valid"),
+					[],
+					[],
+					AsyncKind::SYNC,
+					[],
+				)
+				.with_attribute("backend.mutation.name", properties.name)
+				.with_attribute("backend.mutation.repository", properties.repository))
 			}
 			TRANSFORM_NODE_TYPE => {
 				let (input_type, output_type) =
@@ -983,6 +1028,10 @@ fn repository_contract() -> NodeContract {
 }
 
 fn query_contract() -> NodeContract {
+	NodeContract::new([], [], [], [], [], AsyncKind::SYNC, [])
+}
+
+fn mutation_contract() -> NodeContract {
 	NodeContract::new([], [], [], [], [], AsyncKind::SYNC, [])
 }
 
@@ -1468,6 +1517,53 @@ fn validate_query_references(document: &GraphDocument) -> Vec<Diagnostic> {
 	diagnostics
 }
 
+fn validate_mutation_references(document: &GraphDocument) -> Vec<Diagnostic> {
+	let repository_names: BTreeSet<_> = document
+		.nodes()
+		.iter()
+		.filter(|node| node.type_id().as_str() == REPOSITORY_NODE_TYPE)
+		.filter_map(|node| {
+			repository_properties(node)
+				.ok()
+				.map(|properties| properties.name)
+		})
+		.collect();
+	let mut mutation_names = BTreeMap::<String, NodeId>::new();
+	let mut diagnostics = Vec::new();
+
+	for node in document
+		.nodes()
+		.iter()
+		.filter(|node| node.type_id().as_str() == MUTATION_NODE_TYPE)
+	{
+		let Ok(properties) = mutation_properties(node) else {
+			continue;
+		};
+		if !repository_names.contains(&properties.repository) {
+			diagnostics.push(*node_diagnostic(
+				node,
+				"BACKEND_DSL.MUTATION_REPOSITORY_NOT_FOUND",
+				format!(
+					"Mutation references repository '{}', but that repository is not declared.",
+					properties.repository
+				),
+			));
+		}
+		if mutation_names
+			.insert(properties.name.clone(), node.id())
+			.is_some()
+		{
+			diagnostics.push(*node_diagnostic(
+				node,
+				"BACKEND_DSL.MUTATION_NAME_DUPLICATE",
+				format!("Mutation name '{}' is already declared.", properties.name),
+			));
+		}
+	}
+
+	diagnostics
+}
+
 fn validate_required_execution_ports(
 	document: &GraphDocument,
 	node_type: &str,
@@ -1726,6 +1822,34 @@ fn query_properties(node: &Node) -> Result<QueryProperties, Box<Diagnostic>> {
 		"BACKEND_DSL.QUERY_REPOSITORY_INVALID",
 	)?;
 	Ok(QueryProperties { name, repository })
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct MutationProperties {
+	name: String,
+	repository: String,
+}
+
+fn mutation_properties(node: &Node) -> Result<MutationProperties, Box<Diagnostic>> {
+	let name = identifier_property(
+		node,
+		"Mutation",
+		MUTATION_NAME_PROPERTY,
+		"name",
+		"BACKEND_DSL.MUTATION_NAME_MISSING",
+		"BACKEND_DSL.MUTATION_NAME_TYPE",
+		"BACKEND_DSL.MUTATION_NAME_INVALID",
+	)?;
+	let repository = identifier_property(
+		node,
+		"Mutation",
+		MUTATION_REPOSITORY_PROPERTY,
+		"repository",
+		"BACKEND_DSL.MUTATION_REPOSITORY_MISSING",
+		"BACKEND_DSL.MUTATION_REPOSITORY_TYPE",
+		"BACKEND_DSL.MUTATION_REPOSITORY_INVALID",
+	)?;
+	Ok(MutationProperties { name, repository })
 }
 
 fn identifier_property(
@@ -2015,7 +2139,7 @@ mod tests {
 	#[test]
 	fn exposes_route_and_response_descriptors() {
 		let plugin = BackendDslPlugin::new();
-		assert_eq!(plugin.descriptors().len(), 14);
+		assert_eq!(plugin.descriptors().len(), 15);
 		assert_eq!(plugin.descriptors()[0].label(), "HTTP Route");
 		assert_eq!(plugin.descriptors()[0].properties().len(), 2);
 		let cron = plugin
@@ -2647,6 +2771,156 @@ mod tests {
 		}));
 		assert!(diagnostics.iter().any(|diagnostic| {
 			diagnostic.code().as_str() == "BACKEND_DSL.QUERY_NAME_DUPLICATE"
+		}));
+	}
+
+	#[test]
+	fn exposes_and_lowers_mutations_bound_to_repositories() {
+		let plugin = BackendDslPlugin::new();
+		let descriptor = plugin
+			.descriptors()
+			.iter()
+			.find(|descriptor| descriptor.type_id().as_str() == MUTATION_NODE_TYPE)
+			.expect("mutation descriptor should be registered");
+		assert_eq!(descriptor.label(), "Mutation");
+		assert_eq!(descriptor.category(), "Persistence");
+		assert!(descriptor.inputs().is_empty());
+		assert!(descriptor.outputs().is_empty());
+		assert_eq!(descriptor.properties().len(), 2);
+		assert_eq!(descriptor.properties()[0].key(), MUTATION_NAME_PROPERTY);
+		assert_eq!(
+			descriptor.properties()[1].key(),
+			MUTATION_REPOSITORY_PROPERTY
+		);
+		assert!(descriptor
+			.properties()
+			.iter()
+			.all(|property| property.required()));
+
+		let node = Node::new(
+			NodeId::new(2).unwrap(),
+			NodeTypeId::new(MUTATION_NODE_TYPE).unwrap(),
+		)
+		.with_property(
+			MUTATION_NAME_PROPERTY,
+			Value::String("CreateUser".to_string()),
+		)
+		.unwrap()
+		.with_property(
+			MUTATION_REPOSITORY_PROPERTY,
+			Value::String("UserRepository".to_string()),
+		)
+		.unwrap();
+		let lowered = plugin.lower_node(&node).unwrap();
+		assert_eq!(lowered.operation().as_str(), MUTATION_NODE_TYPE);
+		assert_eq!(lowered.attributes()["backend.mutation.name"], "CreateUser");
+		assert_eq!(
+			lowered.attributes()["backend.mutation.repository"],
+			"UserRepository"
+		);
+	}
+
+	#[test]
+	fn rejects_invalid_mutation_properties_and_references() {
+		let plugin = BackendDslPlugin::new();
+		let missing = Node::new(
+			NodeId::new(2).unwrap(),
+			NodeTypeId::new(MUTATION_NODE_TYPE).unwrap(),
+		);
+		let wrong_name_type = missing
+			.clone()
+			.with_property(MUTATION_NAME_PROPERTY, Value::Bool(true))
+			.unwrap();
+		let missing_repository = missing
+			.clone()
+			.with_property(
+				MUTATION_NAME_PROPERTY,
+				Value::String("CreateUser".to_string()),
+			)
+			.unwrap();
+		let invalid_repository = missing_repository
+			.clone()
+			.with_property(
+				MUTATION_REPOSITORY_PROPERTY,
+				Value::String("User Repository".to_string()),
+			)
+			.unwrap();
+
+		assert_eq!(
+			plugin.analyze_node(&missing)[0].code().as_str(),
+			"BACKEND_DSL.MUTATION_NAME_MISSING"
+		);
+		assert_eq!(
+			plugin.analyze_node(&wrong_name_type)[0].code().as_str(),
+			"BACKEND_DSL.MUTATION_NAME_TYPE"
+		);
+		assert_eq!(
+			plugin.analyze_node(&missing_repository)[0].code().as_str(),
+			"BACKEND_DSL.MUTATION_REPOSITORY_MISSING"
+		);
+		assert_eq!(
+			plugin.analyze_node(&invalid_repository)[0].code().as_str(),
+			"BACKEND_DSL.MUTATION_REPOSITORY_INVALID"
+		);
+
+		let metadata = krunt_graph_model::GraphMetadata::new(
+			krunt_graph_model::GraphId::new(33).unwrap(),
+			"backend-v1",
+			"krunt-test",
+		)
+		.unwrap();
+		let repository = Node::new(
+			NodeId::new(3).unwrap(),
+			NodeTypeId::new(REPOSITORY_NODE_TYPE).unwrap(),
+		)
+		.with_property(
+			REPOSITORY_NAME_PROPERTY,
+			Value::String("UserRepository".to_string()),
+		)
+		.unwrap()
+		.with_property(
+			REPOSITORY_ENTITY_PROPERTY,
+			Value::String("User".to_string()),
+		)
+		.unwrap();
+		let mutation = Node::new(
+			NodeId::new(4).unwrap(),
+			NodeTypeId::new(MUTATION_NODE_TYPE).unwrap(),
+		)
+		.with_property(
+			MUTATION_NAME_PROPERTY,
+			Value::String("CreateUser".to_string()),
+		)
+		.unwrap()
+		.with_property(
+			MUTATION_REPOSITORY_PROPERTY,
+			Value::String("MissingRepository".to_string()),
+		)
+		.unwrap();
+		let duplicate = Node::new(
+			NodeId::new(5).unwrap(),
+			NodeTypeId::new(MUTATION_NODE_TYPE).unwrap(),
+		)
+		.with_property(
+			MUTATION_NAME_PROPERTY,
+			Value::String("CreateUser".to_string()),
+		)
+		.unwrap()
+		.with_property(
+			MUTATION_REPOSITORY_PROPERTY,
+			Value::String("UserRepository".to_string()),
+		)
+		.unwrap();
+		let mut builder = krunt_graph_model::GraphBuilder::new(metadata);
+		for node in [repository, mutation, duplicate] {
+			builder.add_node(node).unwrap();
+		}
+		let diagnostics = BackendDslPlugin::new().analyze_graph(&builder.build().unwrap());
+		assert!(diagnostics.iter().any(|diagnostic| {
+			diagnostic.code().as_str() == "BACKEND_DSL.MUTATION_REPOSITORY_NOT_FOUND"
+		}));
+		assert!(diagnostics.iter().any(|diagnostic| {
+			diagnostic.code().as_str() == "BACKEND_DSL.MUTATION_NAME_DUPLICATE"
 		}));
 	}
 
