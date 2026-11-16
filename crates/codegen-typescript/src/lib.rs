@@ -149,6 +149,11 @@ impl TypeScriptOperation {
 	pub fn source(&self) -> &SourceMap {
 		&self.source
 	}
+
+	/// Whether this operation requires the generated runtime adapter.
+	pub fn requires_runtime(&self) -> bool {
+		is_runtime_operation(self)
+	}
 }
 
 /// Stable operation identity within the TypeScript language IR.
@@ -508,6 +513,10 @@ fn render_module(module: &TypeScriptModule) -> String {
 	if !module.imports().is_empty() {
 		source.push('\n');
 	}
+	if module.functions().iter().any(function_requires_runtime) {
+		source.push_str(&runtime_interface());
+		source.push('\n');
+	}
 
 	for function in module.functions() {
 		source.push_str(&render_function(function));
@@ -530,6 +539,7 @@ fn render_function(function: &TypeScriptFunction) -> String {
 
 	let function_name = sanitize_identifier(&function.name, "execute");
 	let accepts_request = function.operations.iter().any(is_http_entry);
+	let requires_runtime = function_requires_runtime(function);
 	let async_prefix = if function.async_kind == AsyncKind::ASYNC {
 		"async "
 	} else {
@@ -540,16 +550,15 @@ fn render_function(function: &TypeScriptFunction) -> String {
 	} else {
 		"unknown"
 	};
+	let parameters = match (accepts_request, requires_runtime) {
+		(true, true) => "request: unknown, runtime: KruntRuntime".to_string(),
+		(true, false) => "request: unknown = undefined".to_string(),
+		(false, true) => "runtime: KruntRuntime".to_string(),
+		(false, false) => String::new(),
+	};
 	source.push_str(&format!(
 		"export {}function {}({}): {} {{\n",
-		async_prefix,
-		function_name,
-		if accepts_request {
-			"request: unknown = undefined"
-		} else {
-			""
-		},
-		return_type,
+		async_prefix, function_name, parameters, return_type,
 	));
 
 	let data_inputs = data_inputs(function);
@@ -609,7 +618,7 @@ fn operation_declarations(function: &TypeScriptFunction) -> BTreeMap<String, Str
 		.operations
 		.iter()
 		.filter_map(|operation| {
-			if is_identity_transform(operation) {
+			if is_identity_transform(operation) || operation.requires_runtime() {
 				return None;
 			}
 			match operation.kind() {
@@ -635,6 +644,41 @@ fn is_identity_transform(operation: &TypeScriptOperation) -> bool {
 		.is_some_and(|kind| kind == "IDENTITY")
 }
 
+fn function_requires_runtime(function: &TypeScriptFunction) -> bool {
+	function
+		.operations
+		.iter()
+		.any(TypeScriptOperation::requires_runtime)
+}
+
+fn is_runtime_operation(operation: &TypeScriptOperation) -> bool {
+	if operation
+		.attributes()
+		.contains_key("backend.persistence.kind")
+	{
+		return true;
+	}
+	matches!(
+		operation
+			.attributes()
+			.get("backend.effect.kind")
+			.map(String::as_str),
+		Some("HTTP_REQUEST" | "LOGGING" | "STORAGE")
+	)
+}
+
+fn runtime_interface() -> &'static str {
+	r#"export interface KruntRuntime {
+  httpRequest(method: string, url: string, request: unknown): Promise<unknown>;
+  query(name: string, repository: string): Promise<unknown>;
+  mutation(name: string, repository: string, value: unknown): Promise<unknown>;
+  log(level: string, message: unknown): void;
+  storageRead(key: string): Promise<unknown>;
+  storageWrite(key: string, value: unknown): Promise<unknown>;
+}
+"#
+}
+
 fn render_named_operation(
 	source: &mut String,
 	operation: &TypeScriptOperation,
@@ -653,6 +697,10 @@ fn render_named_operation(
 		source.push_str(";\n");
 		return;
 	}
+	if let Some(invocation) = runtime_invocation(operation, data_inputs) {
+		render_invocation(source, operation, &invocation);
+		return;
+	}
 
 	let callee = operation_callee(operation.id, name);
 	let arguments = data_inputs
@@ -669,12 +717,16 @@ fn render_named_operation(
 				.join(", ")
 		})
 		.unwrap_or_default();
+	render_invocation(source, operation, &format!("{}({})", callee, arguments));
+}
+
+fn render_invocation(source: &mut String, operation: &TypeScriptOperation, invocation: &str) {
 	let await_prefix = if operation.async_kind == AsyncKind::ASYNC {
 		"await "
 	} else {
 		""
 	};
-	let invocation = format!("{await_prefix}{callee}({arguments})");
+	let invocation = format!("{await_prefix}{invocation}");
 	if operation.output_types.is_empty() {
 		source.push_str("  ");
 		source.push_str(&invocation);
@@ -686,6 +738,100 @@ fn render_named_operation(
 		source.push_str(&invocation);
 		source.push_str(";\n");
 	}
+}
+
+fn runtime_invocation(
+	operation: &TypeScriptOperation,
+	data_inputs: &BTreeMap<TypeScriptOperationId, Vec<Option<TypeScriptOperationId>>>,
+) -> Option<String> {
+	let input = |index| data_input_expression(operation.id, index, data_inputs);
+	let attributes = operation.attributes();
+	if attributes
+		.get("backend.persistence.kind")
+		.map(String::as_str)
+		== Some("QUERY")
+	{
+		return Some(format!(
+			"runtime.query({}, {})",
+			string_literal(attributes.get("backend.query.name")?),
+			string_literal(attributes.get("backend.query.repository")?),
+		));
+	}
+	if attributes
+		.get("backend.persistence.kind")
+		.map(String::as_str)
+		== Some("MUTATION")
+	{
+		return Some(format!(
+			"runtime.mutation({}, {}, {})",
+			string_literal(attributes.get("backend.mutation.name")?),
+			string_literal(attributes.get("backend.mutation.repository")?),
+			input(0),
+		));
+	}
+
+	match attributes.get("backend.effect.kind").map(String::as_str) {
+		Some("HTTP_REQUEST") => Some(format!(
+			"runtime.httpRequest({}, {}, {})",
+			string_literal(attributes.get("backend.http_request.method")?),
+			string_literal(attributes.get("backend.http_request.url")?),
+			input(0),
+		)),
+		Some("LOGGING") => Some(format!(
+			"runtime.log({}, {})",
+			string_literal(attributes.get("backend.logging.level")?),
+			input(0),
+		)),
+		Some("STORAGE") => match attributes
+			.get("backend.storage.operation")
+			.map(String::as_str)
+		{
+			Some("READ") => Some(format!(
+				"runtime.storageRead({})",
+				string_literal(attributes.get("backend.storage.key")?),
+			)),
+			Some("WRITE") => Some(format!(
+				"runtime.storageWrite({}, {})",
+				string_literal(attributes.get("backend.storage.key")?),
+				input(0),
+			)),
+			_ => None,
+		},
+		_ => None,
+	}
+}
+
+fn data_input_expression(
+	operation: TypeScriptOperationId,
+	index: usize,
+	data_inputs: &BTreeMap<TypeScriptOperationId, Vec<Option<TypeScriptOperationId>>>,
+) -> String {
+	data_inputs
+		.get(&operation)
+		.and_then(|inputs| inputs.get(index))
+		.and_then(|input| input.map(operation_variable))
+		.unwrap_or_else(|| "undefined".to_string())
+}
+
+fn string_literal(value: &str) -> String {
+	format!("\"{}\"", escape_double_quoted(value))
+}
+
+fn escape_double_quoted(value: &str) -> String {
+	value
+		.chars()
+		.flat_map(|character| match character {
+			'\\' => "\\\\".chars().collect::<Vec<_>>(),
+			'"' => "\\\"".chars().collect::<Vec<_>>(),
+			'\n' => "\\n".chars().collect::<Vec<_>>(),
+			'\r' => "\\r".chars().collect::<Vec<_>>(),
+			'\t' => "\\t".chars().collect::<Vec<_>>(),
+			character if character.is_control() => {
+				format!("\\u{:04x}", character as u32).chars().collect()
+			}
+			character => vec![character],
+		})
+		.collect()
 }
 
 fn data_inputs(
@@ -1148,5 +1294,148 @@ mod tests {
 		assert!(source.contains("return operation_1;"));
 		assert!(source.contains("return operation_3;"));
 		assert!(!source.contains("declare function krunt_backend_http_route"));
+	}
+
+	#[test]
+	fn renders_runtime_backed_operations_with_traceable_calls() {
+		let mut builder = IRBuilder::new();
+		let mut http_attributes = BTreeMap::new();
+		http_attributes.insert("backend.http.method".to_string(), "GET".to_string());
+		http_attributes.insert("backend.http.path".to_string(), "/effects".to_string());
+		let nodes = vec![
+			IRNode {
+				id: krunt_ir::IrNodeId(1),
+				op: IROp::ENTRY {
+					name: OperationId::new("backend.http_route").unwrap(),
+				},
+				input_types: Vec::new(),
+				output_types: vec![TypeId::new("Request").unwrap()],
+				async_kind: AsyncKind::ASYNC,
+				effects: Vec::new(),
+				attributes: http_attributes,
+				returns: false,
+				source: SourceMap::node(GraphNodeId(10)),
+			},
+			IRNode {
+				id: krunt_ir::IrNodeId(2),
+				op: IROp::OPERATION {
+					name: OperationId::new("backend.http_request").unwrap(),
+				},
+				input_types: vec![TypeId::new("Request").unwrap()],
+				output_types: vec![TypeId::new("Response").unwrap()],
+				async_kind: AsyncKind::ASYNC,
+				effects: Vec::new(),
+				attributes: BTreeMap::from([
+					(
+						"backend.effect.kind".to_string(),
+						"HTTP_REQUEST".to_string(),
+					),
+					(
+						"backend.http_request.method".to_string(),
+						"POST".to_string(),
+					),
+					(
+						"backend.http_request.url".to_string(),
+						"https://example.test/items".to_string(),
+					),
+				]),
+				returns: false,
+				source: SourceMap::node(GraphNodeId(20)),
+			},
+			IRNode {
+				id: krunt_ir::IrNodeId(3),
+				op: IROp::OPERATION {
+					name: OperationId::new("backend.logging").unwrap(),
+				},
+				input_types: vec![TypeId::new("Response").unwrap()],
+				output_types: Vec::new(),
+				async_kind: AsyncKind::SYNC,
+				effects: Vec::new(),
+				attributes: BTreeMap::from([
+					("backend.effect.kind".to_string(), "LOGGING".to_string()),
+					("backend.logging.level".to_string(), "INFO".to_string()),
+				]),
+				returns: false,
+				source: SourceMap::node(GraphNodeId(30)),
+			},
+			IRNode {
+				id: krunt_ir::IrNodeId(4),
+				op: IROp::OPERATION {
+					name: OperationId::new("backend.storage").unwrap(),
+				},
+				input_types: Vec::new(),
+				output_types: vec![TypeId::new("Response").unwrap()],
+				async_kind: AsyncKind::ASYNC,
+				effects: Vec::new(),
+				attributes: BTreeMap::from([
+					("backend.effect.kind".to_string(), "STORAGE".to_string()),
+					("backend.storage.operation".to_string(), "READ".to_string()),
+					(
+						"backend.storage.key".to_string(),
+						"last-response".to_string(),
+					),
+				]),
+				returns: false,
+				source: SourceMap::node(GraphNodeId(40)),
+			},
+			IRNode {
+				id: krunt_ir::IrNodeId(5),
+				op: IROp::RETURN,
+				input_types: vec![TypeId::new("Response").unwrap()],
+				output_types: Vec::new(),
+				async_kind: AsyncKind::ASYNC,
+				effects: Vec::new(),
+				attributes: BTreeMap::new(),
+				returns: true,
+				source: SourceMap::node(GraphNodeId(50)),
+			},
+		];
+		for node in nodes {
+			builder.add_node(node).unwrap();
+		}
+		for (from, to) in [(1, 2), (2, 3), (3, 4), (4, 5)] {
+			builder
+				.add_control_edge(ControlEdge {
+					from: PortRef {
+						node: krunt_ir::IrNodeId(from),
+						index: 0,
+					},
+					to: PortRef {
+						node: krunt_ir::IrNodeId(to),
+						index: 0,
+					},
+				})
+				.unwrap();
+		}
+		for (from, to) in [(1, 2), (2, 3), (4, 5)] {
+			builder
+				.add_data_edge(DataEdge {
+					from: PortRef {
+						node: krunt_ir::IrNodeId(from),
+						index: 0,
+					},
+					to: PortRef {
+						node: krunt_ir::IrNodeId(to),
+						index: 0,
+					},
+				})
+				.unwrap();
+		}
+
+		let program = TypeScriptBackend::lower_graph(&builder.build().unwrap()).unwrap();
+		let source = TypeScriptSourceRenderer::render_program(&program)
+			.unwrap()
+			.remove("generated.ts")
+			.unwrap();
+
+		assert!(source.contains("export interface KruntRuntime"));
+		assert!(source.contains("runtime: KruntRuntime"));
+		assert!(source.contains(
+			"runtime.httpRequest(\"POST\", \"https://example.test/items\", operation_1)"
+		));
+		assert!(source.contains("runtime.log(\"INFO\", operation_2);"));
+		assert!(source.contains("runtime.storageRead(\"last-response\")"));
+		assert!(!source.contains("declare function krunt_backend_http_request"));
+		assert!(source.contains("// krunt:source=node:20"));
 	}
 }

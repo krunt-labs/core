@@ -1,10 +1,9 @@
 //! NestJS framework backend for Krunt.
 //!
 //! This backend consumes TypeScript language IR, lowers it into a versioned
-//! NestJS framework semantic model, and produces a deterministic project
-//! scaffold. Semantic operation implementations are deliberately not invented
-//! here; the Backend DSL and future framework contracts will map those
-//! operations to concrete controllers, providers, and repositories.
+//! NestJS framework semantic model, and produces a deterministic project.
+//! Runtime-backed operations use a generated adapter so emitted code remains
+//! executable while persistence-specific infrastructure stays explicit.
 
 use krunt_codegen_typescript::{
 	TypeScriptFunction, TypeScriptOperationKind, TypeScriptProgram, TypeScriptRenderError,
@@ -23,6 +22,7 @@ pub const NESTJS_PROGRAM_VERSION: u32 = 1;
 pub struct NestJsProgram {
 	version: u32,
 	fallback_execution_name: String,
+	requires_runtime: bool,
 	routes: Vec<NestJsRoute>,
 }
 
@@ -45,6 +45,10 @@ impl NestJsProgram {
 		&self.fallback_execution_name
 	}
 
+	pub fn requires_runtime(&self) -> bool {
+		self.requires_runtime
+	}
+
 	pub fn routes(&self) -> &[NestJsRoute] {
 		&self.routes
 	}
@@ -60,6 +64,7 @@ pub struct NestJsRoute {
 	execution_name: String,
 	status_code: u16,
 	response_kind: NestJsResponseKind,
+	requires_runtime: bool,
 }
 
 impl NestJsRoute {
@@ -89,6 +94,10 @@ impl NestJsRoute {
 
 	pub fn response_kind(&self) -> NestJsResponseKind {
 		self.response_kind
+	}
+
+	pub fn requires_runtime(&self) -> bool {
+		self.requires_runtime
 	}
 }
 
@@ -187,6 +196,16 @@ fn lower_nestjs_program(
 	Ok(NestJsProgram {
 		version: NestJsProgram::CURRENT_VERSION,
 		fallback_execution_name,
+		requires_runtime: program
+			.modules()
+			.iter()
+			.flat_map(|module| module.functions())
+			.any(|function| {
+				function
+					.operations()
+					.iter()
+					.any(|operation| operation.requires_runtime())
+			}),
 		routes: lower_routes(program)?,
 	})
 }
@@ -225,6 +244,10 @@ fn lower_routes(program: &TypeScriptProgram) -> Result<Vec<NestJsRoute>, NestJsG
 				execution_name: function.name().to_string(),
 				status_code,
 				response_kind: response_kind(function)?,
+				requires_runtime: function
+					.operations()
+					.iter()
+					.any(|operation| operation.requires_runtime()),
 			});
 		}
 	}
@@ -253,13 +276,21 @@ fn response_kind(
 fn static_project_files(program: &NestJsProgram) -> Vec<(String, String)> {
 	vec![
 		("src/app.controller.ts".to_string(), app_controller(program)),
-		("src/app.module.ts".to_string(), app_module()),
+		("src/app.module.ts".to_string(), app_module(program)),
 		("src/main.ts".to_string(), main_module()),
 		("package.json".to_string(), package_json()),
-		("README.md".to_string(), project_readme()),
+		("README.md".to_string(), project_readme(program)),
 		("tsconfig.json".to_string(), tsconfig()),
 		("tsconfig.build.json".to_string(), tsconfig_build()),
 	]
+	.into_iter()
+	.chain(program.requires_runtime().then(|| {
+		(
+			"src/krunt-runtime.ts".to_string(),
+			krunt_runtime().to_string(),
+		)
+	}))
+	.collect()
 }
 
 fn app_controller(program: &NestJsProgram) -> String {
@@ -273,21 +304,34 @@ fn app_controller(program: &NestJsProgram) -> String {
 			.collect::<Vec<_>>()
 			.join(", ")
 	};
+	let runtime_import = if program.requires_runtime() {
+		"import { KruntRuntimeService } from './krunt-runtime';\n"
+	} else {
+		""
+	};
 	let mut source = format!(
 		r#"import {{ Controller, Delete, Get, Head, HttpCode, Options, Patch, Post, Put, Req }} from '@nestjs/common';
 import {{ {execution_imports} }} from './generated';
+{runtime_import}
 
 @Controller()
 export class AppController {{
 "#
 	);
+	if program.requires_runtime() {
+		source.push_str("  constructor(private readonly runtime: KruntRuntimeService) {}\n\n");
+	}
 
 	if program.routes().is_empty() {
 		source.push_str(
 			"  @Get()\n  async execute(@Req() request: unknown): Promise<unknown> {\n    return ",
 		);
 		source.push_str(program.fallback_execution_name());
-		source.push_str("(request);\n  }\n");
+		if program.requires_runtime() {
+			source.push_str("(request, this.runtime);\n  }\n");
+		} else {
+			source.push_str("(request);\n  }\n");
+		}
 	} else {
 		for route in program.routes() {
 			source.push_str("  // krunt:source=");
@@ -304,7 +348,11 @@ export class AppController {{
 			source.push_str(&route.operation_id().to_string());
 			source.push_str("(@Req() request: unknown): Promise<unknown> {\n    return ");
 			source.push_str(route.execution_name());
-			source.push_str("(request);\n  }\n");
+			if route.requires_runtime() {
+				source.push_str("(request, this.runtime);\n  }\n");
+			} else {
+				source.push_str("(request);\n  }\n");
+			}
 		}
 	}
 	source.push_str("}\n");
@@ -350,7 +398,20 @@ fn graph_element_marker(element: &GraphElementId) -> String {
 	}
 }
 
-fn app_module() -> String {
+fn app_module(program: &NestJsProgram) -> String {
+	if program.requires_runtime() {
+		return r#"import { Module } from '@nestjs/common';
+import { AppController } from './app.controller';
+import { KruntRuntimeService } from './krunt-runtime';
+
+@Module({
+  controllers: [AppController],
+  providers: [KruntRuntimeService],
+})
+export class AppModule {}
+"#
+		.to_string();
+	}
 	r#"import { Module } from '@nestjs/common';
 import { AppController } from './app.controller';
 
@@ -403,8 +464,13 @@ fn package_json() -> String {
 	.to_string()
 }
 
-fn project_readme() -> String {
-	r#"# Generated Krunt NestJS backend
+fn project_readme(program: &NestJsProgram) -> String {
+	let runtime_note = if program.requires_runtime() {
+		"\n`src/krunt-runtime.ts` is the generated runtime adapter. Replace or extend its persistence methods with the application's repository and database integrations before production deployment.\n"
+	} else {
+		""
+	};
+	let mut readme = r#"# Generated Krunt NestJS backend
 
 This project was generated by Krunt from validated TypeScript language IR.
 Generated files are user-owned artifacts and can be built independently of the
@@ -419,12 +485,72 @@ npm start
 ```
 
 `src/generated.ts` contains source-linked operation markers and one execution
-function per HTTP route. The initial Backend DSL slice generates route-specific
-handlers with the declared success or error HTTP status; additional semantic
-operation implementations will be added as more Backend DSL nodes are
-introduced.
+function per HTTP route. Runtime-backed operations receive a deterministic
+`KruntRuntime` adapter and retain source-node traceability in the generated
+comments. Route handlers preserve the declared success or error HTTP status.
 "#
-	.to_string()
+	.to_string();
+	readme.push_str(runtime_note);
+	readme
+}
+
+fn krunt_runtime() -> &'static str {
+	r#"import type { KruntRuntime } from './generated';
+
+export class KruntRuntimeService implements KruntRuntime {
+  private readonly storage = new Map<string, unknown>();
+
+  async httpRequest(method: string, url: string, request: unknown): Promise<unknown> {
+    const response = await fetch(url, {
+      method,
+      body: request === undefined ? undefined : JSON.stringify(request),
+      headers: request === undefined ? undefined : { 'content-type': 'application/json' },
+    });
+    const text = await response.text();
+    if (text.length === 0) {
+      return undefined;
+    }
+    try {
+      return JSON.parse(text) as unknown;
+    } catch {
+      return text;
+    }
+  }
+
+  async query(name: string, repository: string): Promise<unknown> {
+    throw new Error(`No persistence adapter configured for query ${repository}.${name}`);
+  }
+
+  async mutation(name: string, repository: string, _value: unknown): Promise<unknown> {
+    throw new Error(`No persistence adapter configured for mutation ${repository}.${name}`);
+  }
+
+  log(level: string, message: unknown): void {
+    switch (level) {
+      case 'ERROR':
+        console.error(message);
+        break;
+      case 'WARN':
+        console.warn(message);
+        break;
+      case 'DEBUG':
+        console.debug(message);
+        break;
+      default:
+        console.info(message);
+    }
+  }
+
+  async storageRead(key: string): Promise<unknown> {
+    return this.storage.get(key);
+  }
+
+  async storageWrite(key: string, value: unknown): Promise<unknown> {
+    this.storage.set(key, value);
+    return value;
+  }
+}
+"#
 }
 
 fn tsconfig() -> String {
@@ -473,7 +599,10 @@ mod tests {
 		Edge, EdgeId, EdgeKind, GraphBuilder, GraphId, GraphMetadata, Node, NodeId, NodeTypeId,
 		Port, PortDirection, PortId, PortKind, TypeReference,
 	};
-	use krunt_ir::{GraphNodeId, IRBuilder, IRNode, IROp, OperationId, SourceMap, TypeId};
+	use krunt_ir::{
+		AsyncKind, ControlEdge, DataEdge, GraphNodeId, IRBuilder, IRNode, IROp, OperationId,
+		PortRef, SourceMap, TypeId,
+	};
 	use krunt_plugin_api::PluginRegistry;
 	use serde_json::Value;
 
@@ -496,6 +625,99 @@ mod tests {
 			.unwrap();
 		let graph = builder.build().unwrap();
 		TypeScriptBackend::lower_graph(&graph).unwrap()
+	}
+
+	fn runtime_program() -> TypeScriptProgram {
+		let mut builder = IRBuilder::new();
+		let mut route_attributes = std::collections::BTreeMap::new();
+		route_attributes.insert("backend.http.method".to_string(), "GET".to_string());
+		route_attributes.insert("backend.http.path".to_string(), "/effects".to_string());
+		builder
+			.add_node(IRNode {
+				id: krunt_ir::IrNodeId(1),
+				op: IROp::ENTRY {
+					name: OperationId::new("backend.http_route").unwrap(),
+				},
+				input_types: Vec::new(),
+				output_types: vec![TypeId::new("Request").unwrap()],
+				async_kind: AsyncKind::ASYNC,
+				effects: Vec::new(),
+				attributes: route_attributes,
+				returns: false,
+				source: SourceMap::node(GraphNodeId(10)),
+			})
+			.unwrap();
+		builder
+			.add_node(IRNode {
+				id: krunt_ir::IrNodeId(2),
+				op: IROp::OPERATION {
+					name: OperationId::new("backend.http_request").unwrap(),
+				},
+				input_types: vec![TypeId::new("Request").unwrap()],
+				output_types: vec![TypeId::new("Response").unwrap()],
+				async_kind: AsyncKind::ASYNC,
+				effects: Vec::new(),
+				attributes: std::collections::BTreeMap::from([
+					(
+						"backend.effect.kind".to_string(),
+						"HTTP_REQUEST".to_string(),
+					),
+					(
+						"backend.http_request.method".to_string(),
+						"POST".to_string(),
+					),
+					(
+						"backend.http_request.url".to_string(),
+						"https://example.test/items".to_string(),
+					),
+				]),
+				returns: false,
+				source: SourceMap::node(GraphNodeId(20)),
+			})
+			.unwrap();
+		builder
+			.add_node(IRNode {
+				id: krunt_ir::IrNodeId(3),
+				op: IROp::RETURN,
+				input_types: vec![TypeId::new("Response").unwrap()],
+				output_types: Vec::new(),
+				async_kind: AsyncKind::ASYNC,
+				effects: Vec::new(),
+				attributes: std::collections::BTreeMap::from([
+					("response.kind".to_string(), "SUCCESS".to_string()),
+					("response.status_code".to_string(), "200".to_string()),
+				]),
+				returns: true,
+				source: SourceMap::node(GraphNodeId(30)),
+			})
+			.unwrap();
+		for (from, to) in [(1, 2), (2, 3)] {
+			builder
+				.add_control_edge(ControlEdge {
+					from: PortRef {
+						node: krunt_ir::IrNodeId(from),
+						index: 0,
+					},
+					to: PortRef {
+						node: krunt_ir::IrNodeId(to),
+						index: 0,
+					},
+				})
+				.unwrap();
+			builder
+				.add_data_edge(DataEdge {
+					from: PortRef {
+						node: krunt_ir::IrNodeId(from),
+						index: 0,
+					},
+					to: PortRef {
+						node: krunt_ir::IrNodeId(to),
+						index: 0,
+					},
+				})
+				.unwrap();
+		}
+		TypeScriptBackend::lower_graph(&builder.build().unwrap()).unwrap()
 	}
 
 	fn backend_dsl_program() -> TypeScriptProgram {
@@ -822,6 +1044,42 @@ mod tests {
 			framework_program.routes()[0].response_kind(),
 			NestJsResponseKind::ERROR
 		);
+	}
+
+	#[test]
+	fn generates_a_runtime_adapter_for_effect_backed_routes() {
+		let first = NestJsBackend::generate_project(&runtime_program()).unwrap();
+		let second = NestJsBackend::generate_project(&runtime_program()).unwrap();
+
+		assert_eq!(first, second);
+		assert!(first.file("src/krunt-runtime.ts").is_some());
+		assert!(first
+			.file("src/generated.ts")
+			.unwrap()
+			.contains("export interface KruntRuntime"));
+		assert!(first.file("src/generated.ts").unwrap().contains(
+			"runtime.httpRequest(\"POST\", \"https://example.test/items\", operation_1)"
+		));
+		assert!(first
+			.file("src/app.controller.ts")
+			.unwrap()
+			.contains("import { KruntRuntimeService } from './krunt-runtime';"));
+		assert!(first
+			.file("src/app.controller.ts")
+			.unwrap()
+			.contains("constructor(private readonly runtime: KruntRuntimeService) {}"));
+		assert!(first
+			.file("src/app.controller.ts")
+			.unwrap()
+			.contains("return execute_1(request, this.runtime);"));
+		assert!(first
+			.file("src/app.module.ts")
+			.unwrap()
+			.contains("providers: [KruntRuntimeService]"));
+		assert!(first
+			.file("src/krunt-runtime.ts")
+			.unwrap()
+			.contains("No persistence adapter configured"));
 	}
 
 	#[test]
