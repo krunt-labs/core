@@ -11,7 +11,7 @@ use krunt_graph_model::{
 	EdgeKind, GraphDocument, Node, NodeId, NodeTypeId, PluginReference, PortDirection, PortId,
 	PortKind, SubgraphId,
 };
-use krunt_ir::{AsyncKind, OperationId, TypeId};
+use krunt_ir::{AsyncKind, EffectId, OperationId, TypeId};
 use krunt_plugin_api::{
 	LoweredOperation, LoweredOperationKind, NodeContract, PluginApiError, PluginManifest,
 	PluginRegistry, PortContract,
@@ -41,6 +41,8 @@ pub const VALIDATION_ERROR_NODE_TYPE: &str = "backend.validation_error";
 pub const HTTP_REQUEST_TYPE: &str = "HttpRequest";
 pub const BOOLEAN_TYPE: &str = "Boolean";
 pub const RESPONSE_BODY_TYPE: &str = "ANY";
+pub const DATABASE_READ_EFFECT: &str = "database.read";
+pub const DATABASE_WRITE_EFFECT: &str = "database.write";
 pub const SUCCESS_RESPONSE_DEFAULT_STATUS_CODE: u16 = 200;
 pub const ERROR_RESPONSE_DEFAULT_STATUS_CODE: u16 = 500;
 pub const VALIDATION_ERROR_DEFAULT_STATUS_CODE: u16 = 400;
@@ -407,8 +409,20 @@ impl BackendDslPlugin {
 				type_id: query_type,
 				label: "Query".to_string(),
 				category: "Persistence".to_string(),
-				inputs: Vec::new(),
-				outputs: Vec::new(),
+				inputs: vec![BackendPortDescriptor::new(
+					"in",
+					PortContract::new(PortKind::EXECUTION, None, true),
+				)],
+				outputs: vec![
+					BackendPortDescriptor::new(
+						"next",
+						PortContract::new(PortKind::EXECUTION, None, true),
+					),
+					BackendPortDescriptor::new(
+						"result",
+						PortContract::new(PortKind::DATA, Some(response_body_type.clone()), true),
+					),
+				],
 				properties: vec![
 					BackendPropertyDescriptor::new(
 						QUERY_NAME_PROPERTY,
@@ -428,8 +442,26 @@ impl BackendDslPlugin {
 				type_id: mutation_type,
 				label: "Mutation".to_string(),
 				category: "Persistence".to_string(),
-				inputs: Vec::new(),
-				outputs: Vec::new(),
+				inputs: vec![
+					BackendPortDescriptor::new(
+						"in",
+						PortContract::new(PortKind::EXECUTION, None, true),
+					),
+					BackendPortDescriptor::new(
+						"value",
+						PortContract::new(PortKind::DATA, Some(response_body_type.clone()), true),
+					),
+				],
+				outputs: vec![
+					BackendPortDescriptor::new(
+						"next",
+						PortContract::new(PortKind::EXECUTION, None, true),
+					),
+					BackendPortDescriptor::new(
+						"result",
+						PortContract::new(PortKind::DATA, Some(response_body_type.clone()), true),
+					),
+				],
 				properties: vec![
 					BackendPropertyDescriptor::new(
 						MUTATION_NAME_PROPERTY,
@@ -654,6 +686,20 @@ impl krunt_plugin_api::SemanticPlugin for BackendDslPlugin {
 			"BACKEND_DSL.SUBGRAPH_OUTPUT_UNCONNECTED",
 			"Subgraph requires its execution output to be connected.",
 		));
+		diagnostics.extend(validate_required_execution_ports(
+			document,
+			QUERY_NODE_TYPE,
+			PortDirection::OUTPUT,
+			"BACKEND_DSL.QUERY_OUTPUT_UNCONNECTED",
+			"Query requires its execution output to be connected.",
+		));
+		diagnostics.extend(validate_required_execution_ports(
+			document,
+			MUTATION_NODE_TYPE,
+			PortDirection::OUTPUT,
+			"BACKEND_DSL.MUTATION_OUTPUT_UNCONNECTED",
+			"Mutation requires its execution output to be connected.",
+		));
 		diagnostics.extend(validate_subgraph_references(document));
 		diagnostics.extend(validate_entity_names(document));
 		diagnostics.extend(validate_repository_references(document));
@@ -819,10 +865,11 @@ impl krunt_plugin_api::SemanticPlugin for BackendDslPlugin {
 				Ok(LoweredOperation::new(
 					OperationId::new(QUERY_NODE_TYPE).expect("static operation is valid"),
 					[],
-					[],
-					AsyncKind::SYNC,
-					[],
+					[TypeId::new(RESPONSE_BODY_TYPE).expect("static type is valid")],
+					AsyncKind::ASYNC,
+					[EffectId::new(DATABASE_READ_EFFECT).expect("static effect is valid")],
 				)
+				.with_attribute("backend.persistence.kind", "QUERY")
 				.with_attribute("backend.query.name", properties.name)
 				.with_attribute("backend.query.repository", properties.repository))
 			}
@@ -830,11 +877,12 @@ impl krunt_plugin_api::SemanticPlugin for BackendDslPlugin {
 				let properties = mutation_properties(node).map_err(|error| vec![*error])?;
 				Ok(LoweredOperation::new(
 					OperationId::new(MUTATION_NODE_TYPE).expect("static operation is valid"),
-					[],
-					[],
-					AsyncKind::SYNC,
-					[],
+					[TypeId::new(RESPONSE_BODY_TYPE).expect("static type is valid")],
+					[TypeId::new(RESPONSE_BODY_TYPE).expect("static type is valid")],
+					AsyncKind::ASYNC,
+					[EffectId::new(DATABASE_WRITE_EFFECT).expect("static effect is valid")],
 				)
+				.with_attribute("backend.persistence.kind", "MUTATION")
 				.with_attribute("backend.mutation.name", properties.name)
 				.with_attribute("backend.mutation.repository", properties.repository))
 			}
@@ -1028,11 +1076,48 @@ fn repository_contract() -> NodeContract {
 }
 
 fn query_contract() -> NodeContract {
-	NodeContract::new([], [], [], [], [], AsyncKind::SYNC, [])
+	NodeContract::new(
+		[PortContract::new(PortKind::EXECUTION, None, true)],
+		[
+			PortContract::new(PortKind::EXECUTION, None, true),
+			PortContract::new(
+				PortKind::DATA,
+				Some(TypeId::new(RESPONSE_BODY_TYPE).expect("static type is valid")),
+				true,
+			),
+		],
+		[],
+		[],
+		[],
+		AsyncKind::ASYNC,
+		[EffectId::new(DATABASE_READ_EFFECT).expect("static effect is valid")],
+	)
 }
 
 fn mutation_contract() -> NodeContract {
-	NodeContract::new([], [], [], [], [], AsyncKind::SYNC, [])
+	NodeContract::new(
+		[
+			PortContract::new(PortKind::EXECUTION, None, true),
+			PortContract::new(
+				PortKind::DATA,
+				Some(TypeId::new(RESPONSE_BODY_TYPE).expect("static type is valid")),
+				true,
+			),
+		],
+		[
+			PortContract::new(PortKind::EXECUTION, None, true),
+			PortContract::new(
+				PortKind::DATA,
+				Some(TypeId::new(RESPONSE_BODY_TYPE).expect("static type is valid")),
+				true,
+			),
+		],
+		[],
+		[],
+		[],
+		AsyncKind::ASYNC,
+		[EffectId::new(DATABASE_WRITE_EFFECT).expect("static effect is valid")],
+	)
 }
 
 fn transform_contract() -> NodeContract {
@@ -2649,8 +2734,11 @@ mod tests {
 			.expect("query descriptor should be registered");
 		assert_eq!(descriptor.label(), "Query");
 		assert_eq!(descriptor.category(), "Persistence");
-		assert!(descriptor.inputs().is_empty());
-		assert!(descriptor.outputs().is_empty());
+		assert_eq!(descriptor.inputs().len(), 1);
+		assert_eq!(descriptor.outputs().len(), 2);
+		assert_eq!(descriptor.inputs()[0].name(), "in");
+		assert_eq!(descriptor.outputs()[0].name(), "next");
+		assert_eq!(descriptor.outputs()[1].name(), "result");
 		assert_eq!(descriptor.properties().len(), 2);
 		assert_eq!(descriptor.properties()[0].key(), QUERY_NAME_PROPERTY);
 		assert_eq!(descriptor.properties()[1].key(), QUERY_REPOSITORY_PROPERTY);
@@ -2672,6 +2760,17 @@ mod tests {
 		.unwrap();
 		let lowered = plugin.lower_node(&node).unwrap();
 		assert_eq!(lowered.operation().as_str(), QUERY_NODE_TYPE);
+		assert_eq!(lowered.input_types().len(), 0);
+		assert_eq!(lowered.output_types().len(), 1);
+		assert_eq!(lowered.async_kind(), AsyncKind::ASYNC);
+		assert_eq!(
+			lowered.effects(),
+			&[EffectId::new(DATABASE_READ_EFFECT).unwrap()]
+		);
+		assert_eq!(
+			plugin.contract(&node).effects(),
+			&[EffectId::new(DATABASE_READ_EFFECT).unwrap()]
+		);
 		assert_eq!(lowered.attributes()["backend.query.name"], "ListUsers");
 		assert_eq!(
 			lowered.attributes()["backend.query.repository"],
@@ -2784,8 +2883,12 @@ mod tests {
 			.expect("mutation descriptor should be registered");
 		assert_eq!(descriptor.label(), "Mutation");
 		assert_eq!(descriptor.category(), "Persistence");
-		assert!(descriptor.inputs().is_empty());
-		assert!(descriptor.outputs().is_empty());
+		assert_eq!(descriptor.inputs().len(), 2);
+		assert_eq!(descriptor.outputs().len(), 2);
+		assert_eq!(descriptor.inputs()[0].name(), "in");
+		assert_eq!(descriptor.inputs()[1].name(), "value");
+		assert_eq!(descriptor.outputs()[0].name(), "next");
+		assert_eq!(descriptor.outputs()[1].name(), "result");
 		assert_eq!(descriptor.properties().len(), 2);
 		assert_eq!(descriptor.properties()[0].key(), MUTATION_NAME_PROPERTY);
 		assert_eq!(
@@ -2813,6 +2916,17 @@ mod tests {
 		.unwrap();
 		let lowered = plugin.lower_node(&node).unwrap();
 		assert_eq!(lowered.operation().as_str(), MUTATION_NODE_TYPE);
+		assert_eq!(lowered.input_types().len(), 1);
+		assert_eq!(lowered.output_types().len(), 1);
+		assert_eq!(lowered.async_kind(), AsyncKind::ASYNC);
+		assert_eq!(
+			lowered.effects(),
+			&[EffectId::new(DATABASE_WRITE_EFFECT).unwrap()]
+		);
+		assert_eq!(
+			plugin.contract(&node).effects(),
+			&[EffectId::new(DATABASE_WRITE_EFFECT).unwrap()]
+		);
 		assert_eq!(lowered.attributes()["backend.mutation.name"], "CreateUser");
 		assert_eq!(
 			lowered.attributes()["backend.mutation.repository"],

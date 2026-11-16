@@ -11,3 +11,7 @@ krunt-graph-model = { path = "../graph-model" }
 krunt-ir = { path = "../ir" }
 krunt-plugin-api = { path = "../plugin-api" }
 krunt-type-system = { path = "../type-system" }
+
+[dev-dependencies]
+krunt-backend-dsl = { path = "../backend-dsl" }
+serde_json = "1"

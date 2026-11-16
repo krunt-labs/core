@@ -49,11 +49,13 @@ dependencies = [
 name = "krunt-compiler"
 version = "0.1.0"
 dependencies = [
+ "krunt-backend-dsl",
  "krunt-diagnostics",
  "krunt-graph-model",
  "krunt-ir",
  "krunt-plugin-api",
  "krunt-type-system",
+ "serde_json",
 ]
 
 [[package]]

@@ -519,6 +519,12 @@ fn validate_whole_graph(
 			}
 		}
 		for node in document.nodes() {
+			if contracts
+				.get(&node.id())
+				.is_some_and(|contract| is_declaration_node(node, contract))
+			{
+				continue;
+			}
 			if !reachable.contains(&node.id()) {
 				diagnostics.push(
 					Diagnostic::new(
@@ -560,6 +566,10 @@ fn validate_whole_graph(
 			);
 		}
 	}
+}
+
+fn is_declaration_node(node: &Node, contract: &NodeContract) -> bool {
+	node.ports().is_empty() && contract.inputs().is_empty() && contract.outputs().is_empty()
 }
 
 fn validate_input_dependencies(
@@ -918,10 +928,17 @@ fn optimization_diagnostic(primary: GraphElementId, error: BuildError) -> Diagno
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use krunt_graph_model::{
-		GraphId, GraphMetadata, NodeId, NodeTypeId, PluginReference, Port, TypeReference,
+	use krunt_backend_dsl::{
+		BackendDslPlugin, DATABASE_READ_EFFECT, ENTITY_NAME_PROPERTY, ENTITY_NODE_TYPE,
+		HTTP_REQUEST_TYPE, HTTP_ROUTE_NODE_TYPE, QUERY_NAME_PROPERTY, QUERY_NODE_TYPE,
+		QUERY_REPOSITORY_PROPERTY, REPOSITORY_ENTITY_PROPERTY, REPOSITORY_NAME_PROPERTY,
+		REPOSITORY_NODE_TYPE, SUCCESS_RESPONSE_NODE_TYPE,
 	};
-	use krunt_ir::AsyncKind;
+	use krunt_graph_model::{
+		Edge, EdgeId, EdgeKind, GraphBuilder, GraphId, GraphMetadata, NodeId, NodeTypeId,
+		PluginReference, Port, PortDirection, PortId, PortKind, TypeReference,
+	};
+	use krunt_ir::{AsyncKind, EffectId, IROp};
 	use krunt_plugin_api::{
 		CapabilityId, NodeContract, PluginManifest, PortContract, SemanticPlugin,
 	};
@@ -1021,6 +1038,149 @@ mod tests {
 
 	fn document() -> GraphDocument {
 		document_with_response_type(Some("Request"))
+	}
+
+	fn persistence_document() -> GraphDocument {
+		let metadata =
+			GraphMetadata::new(GraphId::new(3).unwrap(), "backend-v1", "krunt-dev").unwrap();
+		let mut route = Node::new(
+			NodeId::new(1).unwrap(),
+			NodeTypeId::new(HTTP_ROUTE_NODE_TYPE).unwrap(),
+		)
+		.with_property("method", serde_json::Value::String("GET".into()))
+		.unwrap()
+		.with_property("path", serde_json::Value::String("/users".into()))
+		.unwrap();
+		route
+			.add_port(Port::new(
+				PortId::new(11).unwrap(),
+				PortDirection::OUTPUT,
+				PortKind::EXECUTION,
+			))
+			.unwrap();
+		route
+			.add_port(
+				Port::new(
+					PortId::new(12).unwrap(),
+					PortDirection::OUTPUT,
+					PortKind::DATA,
+				)
+				.with_type_reference(TypeReference::new(HTTP_REQUEST_TYPE).unwrap()),
+			)
+			.unwrap();
+
+		let mut query = Node::new(
+			NodeId::new(2).unwrap(),
+			NodeTypeId::new(QUERY_NODE_TYPE).unwrap(),
+		)
+		.with_property(
+			QUERY_NAME_PROPERTY,
+			serde_json::Value::String("ListUsers".into()),
+		)
+		.unwrap()
+		.with_property(
+			QUERY_REPOSITORY_PROPERTY,
+			serde_json::Value::String("UserRepository".into()),
+		)
+		.unwrap();
+		query
+			.add_port(Port::new(
+				PortId::new(21).unwrap(),
+				PortDirection::INPUT,
+				PortKind::EXECUTION,
+			))
+			.unwrap();
+		query
+			.add_port(Port::new(
+				PortId::new(22).unwrap(),
+				PortDirection::OUTPUT,
+				PortKind::EXECUTION,
+			))
+			.unwrap();
+		query
+			.add_port(
+				Port::new(
+					PortId::new(23).unwrap(),
+					PortDirection::OUTPUT,
+					PortKind::DATA,
+				)
+				.with_type_reference(TypeReference::new("ANY").unwrap()),
+			)
+			.unwrap();
+
+		let mut response = Node::new(
+			NodeId::new(3).unwrap(),
+			NodeTypeId::new(SUCCESS_RESPONSE_NODE_TYPE).unwrap(),
+		);
+		response
+			.add_port(Port::new(
+				PortId::new(31).unwrap(),
+				PortDirection::INPUT,
+				PortKind::EXECUTION,
+			))
+			.unwrap();
+		response
+			.add_port(
+				Port::new(
+					PortId::new(32).unwrap(),
+					PortDirection::INPUT,
+					PortKind::DATA,
+				)
+				.with_type_reference(TypeReference::new("ANY").unwrap()),
+			)
+			.unwrap();
+
+		let entity = Node::new(
+			NodeId::new(4).unwrap(),
+			NodeTypeId::new(ENTITY_NODE_TYPE).unwrap(),
+		)
+		.with_property(
+			ENTITY_NAME_PROPERTY,
+			serde_json::Value::String("User".into()),
+		)
+		.unwrap();
+		let repository = Node::new(
+			NodeId::new(5).unwrap(),
+			NodeTypeId::new(REPOSITORY_NODE_TYPE).unwrap(),
+		)
+		.with_property(
+			REPOSITORY_NAME_PROPERTY,
+			serde_json::Value::String("UserRepository".into()),
+		)
+		.unwrap()
+		.with_property(
+			REPOSITORY_ENTITY_PROPERTY,
+			serde_json::Value::String("User".into()),
+		)
+		.unwrap();
+
+		let mut builder = GraphBuilder::new(metadata);
+		for node in [route, query, response, entity, repository] {
+			builder.add_node(node).unwrap();
+		}
+		for edge in [
+			Edge::new(
+				EdgeId::new(101).unwrap(),
+				PortId::new(11).unwrap(),
+				PortId::new(21).unwrap(),
+				EdgeKind::EXECUTION,
+			),
+			Edge::new(
+				EdgeId::new(102).unwrap(),
+				PortId::new(22).unwrap(),
+				PortId::new(31).unwrap(),
+				EdgeKind::EXECUTION,
+			),
+			Edge::new(
+				EdgeId::new(103).unwrap(),
+				PortId::new(23).unwrap(),
+				PortId::new(32).unwrap(),
+				EdgeKind::DATA,
+			),
+		] {
+			builder.add_edge(edge).unwrap();
+		}
+		builder.build().unwrap()
 	}
 
 	fn document_with_response_type(response_type: Option<&str>) -> GraphDocument {
@@ -1236,6 +1396,32 @@ mod tests {
 			result.ir().unwrap().node(krunt_ir::IrNodeId(1)).unwrap().op,
 			IROp::ENTRY { .. }
 		));
+	}
+
+	#[test]
+	fn compiles_query_persistence_effect_into_canonical_ir() {
+		let mut registry = PluginRegistry::new();
+		BackendDslPlugin::register(&mut registry).unwrap();
+
+		let result = compile(&persistence_document(), &registry);
+
+		assert!(!result.has_errors(), "{:#?}", result.diagnostics());
+		let query = result
+			.ir()
+			.unwrap()
+			.nodes()
+			.iter()
+			.find(
+				|node| matches!(&node.op, IROp::OPERATION { name } if name.as_str() == QUERY_NODE_TYPE),
+			)
+			.expect("query should be lowered into IR");
+		assert_eq!(query.async_kind, AsyncKind::ASYNC);
+		assert_eq!(query.output_types.len(), 1);
+		assert_eq!(
+			query.effects,
+			vec![EffectId::new(DATABASE_READ_EFFECT).unwrap()]
+		);
+		assert_eq!(query.attributes["backend.persistence.kind"], "QUERY");
 	}
 
 	#[test]
