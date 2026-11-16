@@ -930,9 +930,12 @@ mod tests {
 	use super::*;
 	use krunt_backend_dsl::{
 		BackendDslPlugin, DATABASE_READ_EFFECT, ENTITY_NAME_PROPERTY, ENTITY_NODE_TYPE,
-		HTTP_REQUEST_TYPE, HTTP_ROUTE_NODE_TYPE, QUERY_NAME_PROPERTY, QUERY_NODE_TYPE,
+		HTTP_REQUEST_EFFECT, HTTP_REQUEST_METHOD_PROPERTY, HTTP_REQUEST_NODE_TYPE,
+		HTTP_REQUEST_TYPE, HTTP_REQUEST_URL_PROPERTY, HTTP_ROUTE_NODE_TYPE, LOGGING_EFFECT,
+		LOGGING_LEVEL_PROPERTY, LOGGING_NODE_TYPE, QUERY_NAME_PROPERTY, QUERY_NODE_TYPE,
 		QUERY_REPOSITORY_PROPERTY, REPOSITORY_ENTITY_PROPERTY, REPOSITORY_NAME_PROPERTY,
-		REPOSITORY_NODE_TYPE, SUCCESS_RESPONSE_NODE_TYPE,
+		REPOSITORY_NODE_TYPE, STORAGE_KEY_PROPERTY, STORAGE_NODE_TYPE, STORAGE_OPERATION_PROPERTY,
+		STORAGE_READ_EFFECT, SUCCESS_RESPONSE_NODE_TYPE,
 	};
 	use krunt_graph_model::{
 		Edge, EdgeId, EdgeKind, GraphBuilder, GraphId, GraphMetadata, NodeId, NodeTypeId,
@@ -1183,6 +1186,230 @@ mod tests {
 		builder.build().unwrap()
 	}
 
+	fn effects_document() -> GraphDocument {
+		let metadata =
+			GraphMetadata::new(GraphId::new(4).unwrap(), "backend-v1", "krunt-dev").unwrap();
+		let mut route = Node::new(
+			NodeId::new(1).unwrap(),
+			NodeTypeId::new(HTTP_ROUTE_NODE_TYPE).unwrap(),
+		)
+		.with_property("method", serde_json::Value::String("GET".into()))
+		.unwrap()
+		.with_property("path", serde_json::Value::String("/effects".into()))
+		.unwrap();
+		route
+			.add_port(Port::new(
+				PortId::new(11).unwrap(),
+				PortDirection::OUTPUT,
+				PortKind::EXECUTION,
+			))
+			.unwrap();
+		route
+			.add_port(
+				Port::new(
+					PortId::new(12).unwrap(),
+					PortDirection::OUTPUT,
+					PortKind::DATA,
+				)
+				.with_type_reference(TypeReference::new(HTTP_REQUEST_TYPE).unwrap()),
+			)
+			.unwrap();
+
+		let mut http_request = Node::new(
+			NodeId::new(2).unwrap(),
+			NodeTypeId::new(HTTP_REQUEST_NODE_TYPE).unwrap(),
+		)
+		.with_property(
+			HTTP_REQUEST_METHOD_PROPERTY,
+			serde_json::Value::String("GET".into()),
+		)
+		.unwrap()
+		.with_property(
+			HTTP_REQUEST_URL_PROPERTY,
+			serde_json::Value::String("https://example.test/users".into()),
+		)
+		.unwrap();
+		http_request
+			.add_port(Port::new(
+				PortId::new(21).unwrap(),
+				PortDirection::INPUT,
+				PortKind::EXECUTION,
+			))
+			.unwrap();
+		http_request
+			.add_port(
+				Port::new(
+					PortId::new(22).unwrap(),
+					PortDirection::INPUT,
+					PortKind::DATA,
+				)
+				.with_type_reference(TypeReference::new("ANY").unwrap()),
+			)
+			.unwrap();
+		http_request
+			.add_port(Port::new(
+				PortId::new(23).unwrap(),
+				PortDirection::OUTPUT,
+				PortKind::EXECUTION,
+			))
+			.unwrap();
+		http_request
+			.add_port(
+				Port::new(
+					PortId::new(24).unwrap(),
+					PortDirection::OUTPUT,
+					PortKind::DATA,
+				)
+				.with_type_reference(TypeReference::new("ANY").unwrap()),
+			)
+			.unwrap();
+
+		let mut storage = Node::new(
+			NodeId::new(3).unwrap(),
+			NodeTypeId::new(STORAGE_NODE_TYPE).unwrap(),
+		)
+		.with_property(
+			STORAGE_OPERATION_PROPERTY,
+			serde_json::Value::String("READ".into()),
+		)
+		.unwrap()
+		.with_property(
+			STORAGE_KEY_PROPERTY,
+			serde_json::Value::String("users".into()),
+		)
+		.unwrap();
+		storage
+			.add_port(Port::new(
+				PortId::new(31).unwrap(),
+				PortDirection::INPUT,
+				PortKind::EXECUTION,
+			))
+			.unwrap();
+		storage
+			.add_port(
+				Port::new(
+					PortId::new(32).unwrap(),
+					PortDirection::INPUT,
+					PortKind::DATA,
+				)
+				.with_type_reference(TypeReference::new("ANY").unwrap()),
+			)
+			.unwrap();
+		storage
+			.add_port(Port::new(
+				PortId::new(33).unwrap(),
+				PortDirection::OUTPUT,
+				PortKind::EXECUTION,
+			))
+			.unwrap();
+		storage
+			.add_port(
+				Port::new(
+					PortId::new(34).unwrap(),
+					PortDirection::OUTPUT,
+					PortKind::DATA,
+				)
+				.with_type_reference(TypeReference::new("ANY").unwrap()),
+			)
+			.unwrap();
+
+		let mut logging = Node::new(
+			NodeId::new(4).unwrap(),
+			NodeTypeId::new(LOGGING_NODE_TYPE).unwrap(),
+		)
+		.with_property(
+			LOGGING_LEVEL_PROPERTY,
+			serde_json::Value::String("INFO".into()),
+		)
+		.unwrap();
+		logging
+			.add_port(Port::new(
+				PortId::new(41).unwrap(),
+				PortDirection::INPUT,
+				PortKind::EXECUTION,
+			))
+			.unwrap();
+		logging
+			.add_port(
+				Port::new(
+					PortId::new(42).unwrap(),
+					PortDirection::INPUT,
+					PortKind::DATA,
+				)
+				.with_type_reference(TypeReference::new("ANY").unwrap()),
+			)
+			.unwrap();
+		logging
+			.add_port(Port::new(
+				PortId::new(43).unwrap(),
+				PortDirection::OUTPUT,
+				PortKind::EXECUTION,
+			))
+			.unwrap();
+
+		let mut response = Node::new(
+			NodeId::new(5).unwrap(),
+			NodeTypeId::new(SUCCESS_RESPONSE_NODE_TYPE).unwrap(),
+		);
+		response
+			.add_port(Port::new(
+				PortId::new(51).unwrap(),
+				PortDirection::INPUT,
+				PortKind::EXECUTION,
+			))
+			.unwrap();
+		response
+			.add_port(
+				Port::new(
+					PortId::new(52).unwrap(),
+					PortDirection::INPUT,
+					PortKind::DATA,
+				)
+				.with_type_reference(TypeReference::new("ANY").unwrap()),
+			)
+			.unwrap();
+
+		let mut builder = GraphBuilder::new(metadata);
+		for node in [route, http_request, storage, logging, response] {
+			builder.add_node(node).unwrap();
+		}
+		for edge in [
+			Edge::new(
+				EdgeId::new(201).unwrap(),
+				PortId::new(11).unwrap(),
+				PortId::new(21).unwrap(),
+				EdgeKind::EXECUTION,
+			),
+			Edge::new(
+				EdgeId::new(202).unwrap(),
+				PortId::new(23).unwrap(),
+				PortId::new(31).unwrap(),
+				EdgeKind::EXECUTION,
+			),
+			Edge::new(
+				EdgeId::new(203).unwrap(),
+				PortId::new(33).unwrap(),
+				PortId::new(41).unwrap(),
+				EdgeKind::EXECUTION,
+			),
+			Edge::new(
+				EdgeId::new(204).unwrap(),
+				PortId::new(43).unwrap(),
+				PortId::new(51).unwrap(),
+				EdgeKind::EXECUTION,
+			),
+			Edge::new(
+				EdgeId::new(205).unwrap(),
+				PortId::new(24).unwrap(),
+				PortId::new(42).unwrap(),
+				EdgeKind::DATA,
+			),
+		] {
+			builder.add_edge(edge).unwrap();
+		}
+		builder.build().unwrap()
+	}
+
 	fn document_with_response_type(response_type: Option<&str>) -> GraphDocument {
 		document_with_options(response_type, true)
 	}
@@ -1422,6 +1649,57 @@ mod tests {
 			vec![EffectId::new(DATABASE_READ_EFFECT).unwrap()]
 		);
 		assert_eq!(query.attributes["backend.persistence.kind"], "QUERY");
+	}
+
+	#[test]
+	fn compiles_effect_nodes_and_preserves_their_effect_metadata() {
+		let mut registry = PluginRegistry::new();
+		BackendDslPlugin::register(&mut registry).unwrap();
+
+		let result = compile(&effects_document(), &registry);
+
+		assert!(!result.has_errors(), "{:#?}", result.diagnostics());
+		let graph = result.ir().unwrap();
+		let http_request = graph
+			.nodes()
+			.iter()
+			.find(
+				|node| matches!(&node.op, IROp::OPERATION { name } if name.as_str() == HTTP_REQUEST_NODE_TYPE),
+			)
+			.expect("HTTP Request should be lowered into IR");
+		assert_eq!(http_request.async_kind, AsyncKind::ASYNC);
+		assert_eq!(
+			http_request.effects,
+			vec![EffectId::new(HTTP_REQUEST_EFFECT).unwrap()]
+		);
+
+		let storage = graph
+			.nodes()
+			.iter()
+			.find(
+				|node| matches!(&node.op, IROp::OPERATION { name } if name.as_str() == STORAGE_NODE_TYPE),
+			)
+			.expect("Storage should be lowered into IR");
+		assert_eq!(storage.async_kind, AsyncKind::ASYNC);
+		assert_eq!(
+			storage.effects,
+			vec![EffectId::new(STORAGE_READ_EFFECT).unwrap()]
+		);
+
+		let logging = graph
+			.nodes()
+			.iter()
+			.find(
+				|node| matches!(&node.op, IROp::OPERATION { name } if name.as_str() == LOGGING_NODE_TYPE),
+			)
+			.expect("Logging should be lowered into IR");
+		assert_eq!(logging.async_kind, AsyncKind::SYNC);
+		assert_eq!(
+			logging.effects,
+			vec![EffectId::new(LOGGING_EFFECT).unwrap()]
+		);
+		assert_eq!(graph.control_edges().len(), 4);
+		assert_eq!(graph.data_edges().len(), 1);
 	}
 
 	#[test]

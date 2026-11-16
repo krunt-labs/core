@@ -2,7 +2,8 @@
 //!
 //! This crate owns backend meaning for the first vertical slice. It describes
 //! HTTP Route, Cron, Branch, Merge, Loop, Subgraph, Entity, Repository, Query,
-//! Mutation, Identity Transform, Success Response, Error Response, Try/Catch, and Validation Error nodes, validates their properties
+//! Mutation, HTTP Request, Logging, Storage, Identity Transform, Success Response,
+//! Error Response, Try/Catch, and Validation Error nodes, validates their properties
 //! and typed data contracts, and lowers them into target-neutral operations with
 //! namespaced metadata. It does not emit TypeScript or NestJS code.
 
@@ -24,6 +25,7 @@ use std::fmt;
 pub const BACKEND_DSL_ID: &str = "krunt.backend-dsl";
 pub const BACKEND_DSL_VERSION: &str = "0.1.0";
 pub const HTTP_ROUTE_NODE_TYPE: &str = "backend.http_route";
+pub const HTTP_REQUEST_NODE_TYPE: &str = "backend.http_request";
 pub const CRON_NODE_TYPE: &str = "backend.cron";
 pub const BRANCH_NODE_TYPE: &str = "backend.branch";
 pub const MERGE_NODE_TYPE: &str = "backend.merge";
@@ -33,6 +35,8 @@ pub const ENTITY_NODE_TYPE: &str = "backend.entity";
 pub const REPOSITORY_NODE_TYPE: &str = "backend.repository";
 pub const QUERY_NODE_TYPE: &str = "backend.query";
 pub const MUTATION_NODE_TYPE: &str = "backend.mutation";
+pub const LOGGING_NODE_TYPE: &str = "backend.logging";
+pub const STORAGE_NODE_TYPE: &str = "backend.storage";
 pub const TRANSFORM_NODE_TYPE: &str = "backend.transform";
 pub const SUCCESS_RESPONSE_NODE_TYPE: &str = "backend.success_response";
 pub const ERROR_RESPONSE_NODE_TYPE: &str = "backend.error_response";
@@ -43,6 +47,10 @@ pub const BOOLEAN_TYPE: &str = "Boolean";
 pub const RESPONSE_BODY_TYPE: &str = "ANY";
 pub const DATABASE_READ_EFFECT: &str = "database.read";
 pub const DATABASE_WRITE_EFFECT: &str = "database.write";
+pub const HTTP_REQUEST_EFFECT: &str = "http.request";
+pub const LOGGING_EFFECT: &str = "logging.write";
+pub const STORAGE_READ_EFFECT: &str = "storage.read";
+pub const STORAGE_WRITE_EFFECT: &str = "storage.write";
 pub const SUCCESS_RESPONSE_DEFAULT_STATUS_CODE: u16 = 200;
 pub const ERROR_RESPONSE_DEFAULT_STATUS_CODE: u16 = 500;
 pub const VALIDATION_ERROR_DEFAULT_STATUS_CODE: u16 = 400;
@@ -56,8 +64,39 @@ pub const QUERY_NAME_PROPERTY: &str = "name";
 pub const QUERY_REPOSITORY_PROPERTY: &str = "repository";
 pub const MUTATION_NAME_PROPERTY: &str = "name";
 pub const MUTATION_REPOSITORY_PROPERTY: &str = "repository";
+pub const HTTP_REQUEST_METHOD_PROPERTY: &str = "method";
+pub const HTTP_REQUEST_URL_PROPERTY: &str = "url";
+pub const LOGGING_LEVEL_PROPERTY: &str = "level";
+pub const STORAGE_OPERATION_PROPERTY: &str = "operation";
+pub const STORAGE_KEY_PROPERTY: &str = "key";
 
 const HTTP_METHODS: [&str; 7] = ["DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT"];
+const LOG_LEVELS: [&str; 4] = ["DEBUG", "INFO", "WARN", "ERROR"];
+const STORAGE_OPERATIONS: [&str; 2] = ["READ", "WRITE"];
+
+#[allow(non_camel_case_types)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StorageOperation {
+	READ,
+	WRITE,
+}
+
+impl StorageOperation {
+	fn as_str(self) -> &'static str {
+		match self {
+			Self::READ => "READ",
+			Self::WRITE => "WRITE",
+		}
+	}
+
+	fn effect(self) -> EffectId {
+		let effect = match self {
+			Self::READ => STORAGE_READ_EFFECT,
+			Self::WRITE => STORAGE_WRITE_EFFECT,
+		};
+		EffectId::new(effect).expect("static effect is valid")
+	}
+}
 
 /// Serializable property kind exposed to editor and AI clients.
 #[allow(non_camel_case_types)]
@@ -179,6 +218,8 @@ pub struct BackendDslPlugin {
 impl BackendDslPlugin {
 	pub fn new() -> Self {
 		let route_type = NodeTypeId::new(HTTP_ROUTE_NODE_TYPE).expect("static node type is valid");
+		let http_request_type =
+			NodeTypeId::new(HTTP_REQUEST_NODE_TYPE).expect("static node type is valid");
 		let cron_type = NodeTypeId::new(CRON_NODE_TYPE).expect("static node type is valid");
 		let branch_type = NodeTypeId::new(BRANCH_NODE_TYPE).expect("static node type is valid");
 		let merge_type = NodeTypeId::new(MERGE_NODE_TYPE).expect("static node type is valid");
@@ -189,6 +230,8 @@ impl BackendDslPlugin {
 			NodeTypeId::new(REPOSITORY_NODE_TYPE).expect("static node type is valid");
 		let query_type = NodeTypeId::new(QUERY_NODE_TYPE).expect("static node type is valid");
 		let mutation_type = NodeTypeId::new(MUTATION_NODE_TYPE).expect("static node type is valid");
+		let logging_type = NodeTypeId::new(LOGGING_NODE_TYPE).expect("static node type is valid");
+		let storage_type = NodeTypeId::new(STORAGE_NODE_TYPE).expect("static node type is valid");
 		let transform_type =
 			NodeTypeId::new(TRANSFORM_NODE_TYPE).expect("static node type is valid");
 		let response_type =
@@ -207,6 +250,7 @@ impl BackendDslPlugin {
 				.expect("static plugin identity is valid"),
 			[
 				route_type.clone(),
+				http_request_type.clone(),
 				cron_type.clone(),
 				branch_type.clone(),
 				merge_type.clone(),
@@ -216,6 +260,8 @@ impl BackendDslPlugin {
 				repository_type.clone(),
 				query_type.clone(),
 				mutation_type.clone(),
+				logging_type.clone(),
+				storage_type.clone(),
 				transform_type.clone(),
 				response_type.clone(),
 				error_response_type.clone(),
@@ -261,6 +307,50 @@ impl BackendDslPlugin {
 				],
 			},
 			BackendNodeDescriptor {
+				type_id: http_request_type,
+				label: "HTTP Request".to_string(),
+				category: "Effects".to_string(),
+				inputs: vec![
+					BackendPortDescriptor::new(
+						"in",
+						PortContract::new(PortKind::EXECUTION, None, true),
+					),
+					BackendPortDescriptor::new(
+						"request",
+						PortContract::new(PortKind::DATA, Some(response_body_type.clone()), false),
+					),
+				],
+				outputs: vec![
+					BackendPortDescriptor::new(
+						"next",
+						PortContract::new(PortKind::EXECUTION, None, true),
+					),
+					BackendPortDescriptor::new(
+						"response",
+						PortContract::new(PortKind::DATA, Some(response_body_type.clone()), true),
+					),
+				],
+				properties: vec![
+					BackendPropertyDescriptor::new(
+						HTTP_REQUEST_METHOD_PROPERTY,
+						BackendPropertyKind::ENUM {
+							values: HTTP_METHODS
+								.iter()
+								.map(|value| (*value).to_string())
+								.collect(),
+						},
+						true,
+						Some(Value::String("GET".to_string())),
+					),
+					BackendPropertyDescriptor::new(
+						HTTP_REQUEST_URL_PROPERTY,
+						BackendPropertyKind::STRING,
+						true,
+						None,
+					),
+				],
+			},
+			BackendNodeDescriptor {
 				type_id: cron_type,
 				label: "Cron".to_string(),
 				category: "Entry".to_string(),
@@ -275,6 +365,80 @@ impl BackendDslPlugin {
 					true,
 					None,
 				)],
+			},
+			BackendNodeDescriptor {
+				type_id: logging_type,
+				label: "Logging".to_string(),
+				category: "Effects".to_string(),
+				inputs: vec![
+					BackendPortDescriptor::new(
+						"in",
+						PortContract::new(PortKind::EXECUTION, None, true),
+					),
+					BackendPortDescriptor::new(
+						"message",
+						PortContract::new(PortKind::DATA, Some(response_body_type.clone()), true),
+					),
+				],
+				outputs: vec![BackendPortDescriptor::new(
+					"next",
+					PortContract::new(PortKind::EXECUTION, None, true),
+				)],
+				properties: vec![BackendPropertyDescriptor::new(
+					LOGGING_LEVEL_PROPERTY,
+					BackendPropertyKind::ENUM {
+						values: LOG_LEVELS
+							.iter()
+							.map(|value| (*value).to_string())
+							.collect(),
+					},
+					false,
+					Some(Value::String("INFO".to_string())),
+				)],
+			},
+			BackendNodeDescriptor {
+				type_id: storage_type,
+				label: "Storage".to_string(),
+				category: "Effects".to_string(),
+				inputs: vec![
+					BackendPortDescriptor::new(
+						"in",
+						PortContract::new(PortKind::EXECUTION, None, true),
+					),
+					BackendPortDescriptor::new(
+						"value",
+						PortContract::new(PortKind::DATA, Some(response_body_type.clone()), false),
+					),
+				],
+				outputs: vec![
+					BackendPortDescriptor::new(
+						"next",
+						PortContract::new(PortKind::EXECUTION, None, true),
+					),
+					BackendPortDescriptor::new(
+						"result",
+						PortContract::new(PortKind::DATA, Some(response_body_type.clone()), false),
+					),
+				],
+				properties: vec![
+					BackendPropertyDescriptor::new(
+						STORAGE_OPERATION_PROPERTY,
+						BackendPropertyKind::ENUM {
+							values: STORAGE_OPERATIONS
+								.iter()
+								.map(|value| (*value).to_string())
+								.collect(),
+						},
+						true,
+						Some(Value::String("READ".to_string())),
+					),
+					BackendPropertyDescriptor::new(
+						STORAGE_KEY_PROPERTY,
+						BackendPropertyKind::STRING,
+						true,
+						None,
+					),
+				],
 			},
 			BackendNodeDescriptor {
 				type_id: branch_type,
@@ -625,6 +789,7 @@ impl krunt_plugin_api::SemanticPlugin for BackendDslPlugin {
 			HTTP_ROUTE_NODE_TYPE => {
 				route_contract(TypeId::new(HTTP_REQUEST_TYPE).expect("static type is valid"))
 			}
+			HTTP_REQUEST_NODE_TYPE => http_request_contract(),
 			CRON_NODE_TYPE => cron_contract(),
 			BRANCH_NODE_TYPE => branch_contract(),
 			MERGE_NODE_TYPE => merge_contract(),
@@ -634,6 +799,8 @@ impl krunt_plugin_api::SemanticPlugin for BackendDslPlugin {
 			REPOSITORY_NODE_TYPE => repository_contract(),
 			QUERY_NODE_TYPE => query_contract(),
 			MUTATION_NODE_TYPE => mutation_contract(),
+			LOGGING_NODE_TYPE => logging_contract(),
+			STORAGE_NODE_TYPE => storage_contract(node),
 			TRANSFORM_NODE_TYPE => transform_contract(),
 			SUCCESS_RESPONSE_NODE_TYPE | ERROR_RESPONSE_NODE_TYPE => response_contract(),
 			TRY_CATCH_NODE_TYPE => try_catch_contract(),
@@ -650,6 +817,27 @@ impl krunt_plugin_api::SemanticPlugin for BackendDslPlugin {
 			"BACKEND_DSL.CRON_OUTPUT_UNCONNECTED",
 			"Cron requires its execution output to be connected.",
 		);
+		diagnostics.extend(validate_required_execution_ports(
+			document,
+			HTTP_REQUEST_NODE_TYPE,
+			PortDirection::OUTPUT,
+			"BACKEND_DSL.HTTP_REQUEST_OUTPUT_UNCONNECTED",
+			"HTTP Request requires its execution output to be connected.",
+		));
+		diagnostics.extend(validate_required_execution_ports(
+			document,
+			LOGGING_NODE_TYPE,
+			PortDirection::OUTPUT,
+			"BACKEND_DSL.LOGGING_OUTPUT_UNCONNECTED",
+			"Logging requires its execution output to be connected.",
+		));
+		diagnostics.extend(validate_required_execution_ports(
+			document,
+			STORAGE_NODE_TYPE,
+			PortDirection::OUTPUT,
+			"BACKEND_DSL.STORAGE_OUTPUT_UNCONNECTED",
+			"Storage requires its execution output to be connected.",
+		));
 		diagnostics.extend(validate_required_execution_ports(
 			document,
 			BRANCH_NODE_TYPE,
@@ -717,6 +905,11 @@ impl krunt_plugin_api::SemanticPlugin for BackendDslPlugin {
 				.map(|diagnostic| *diagnostic)
 				.into_iter()
 				.collect(),
+			HTTP_REQUEST_NODE_TYPE => http_request_properties(node)
+				.err()
+				.map(|diagnostic| *diagnostic)
+				.into_iter()
+				.collect(),
 			CRON_NODE_TYPE => cron_schedule(node)
 				.err()
 				.map(|diagnostic| *diagnostic)
@@ -743,6 +936,16 @@ impl krunt_plugin_api::SemanticPlugin for BackendDslPlugin {
 				.into_iter()
 				.collect(),
 			MUTATION_NODE_TYPE => mutation_properties(node)
+				.err()
+				.map(|diagnostic| *diagnostic)
+				.into_iter()
+				.collect(),
+			LOGGING_NODE_TYPE => logging_level(node)
+				.err()
+				.map(|diagnostic| *diagnostic)
+				.into_iter()
+				.collect(),
+			STORAGE_NODE_TYPE => storage_properties(node)
 				.err()
 				.map(|diagnostic| *diagnostic)
 				.into_iter()
@@ -785,6 +988,19 @@ impl krunt_plugin_api::SemanticPlugin for BackendDslPlugin {
 				)
 				.with_attribute("backend.http.method", properties.method)
 				.with_attribute("backend.http.path", properties.path))
+			}
+			HTTP_REQUEST_NODE_TYPE => {
+				let properties = http_request_properties(node).map_err(|error| vec![*error])?;
+				Ok(LoweredOperation::new(
+					OperationId::new(HTTP_REQUEST_NODE_TYPE).expect("static operation is valid"),
+					[TypeId::new(RESPONSE_BODY_TYPE).expect("static type is valid")],
+					[TypeId::new(RESPONSE_BODY_TYPE).expect("static type is valid")],
+					AsyncKind::ASYNC,
+					[EffectId::new(HTTP_REQUEST_EFFECT).expect("static effect is valid")],
+				)
+				.with_attribute("backend.effect.kind", "HTTP_REQUEST")
+				.with_attribute("backend.http_request.method", properties.method)
+				.with_attribute("backend.http_request.url", properties.url))
 			}
 			CRON_NODE_TYPE => {
 				let schedule = cron_schedule(node).map_err(|error| vec![*error])?;
@@ -886,6 +1102,31 @@ impl krunt_plugin_api::SemanticPlugin for BackendDslPlugin {
 				.with_attribute("backend.mutation.name", properties.name)
 				.with_attribute("backend.mutation.repository", properties.repository))
 			}
+			LOGGING_NODE_TYPE => {
+				let level = logging_level(node).map_err(|error| vec![*error])?;
+				Ok(LoweredOperation::new(
+					OperationId::new(LOGGING_NODE_TYPE).expect("static operation is valid"),
+					[TypeId::new(RESPONSE_BODY_TYPE).expect("static type is valid")],
+					[],
+					AsyncKind::SYNC,
+					[EffectId::new(LOGGING_EFFECT).expect("static effect is valid")],
+				)
+				.with_attribute("backend.effect.kind", "LOGGING")
+				.with_attribute("backend.logging.level", level))
+			}
+			STORAGE_NODE_TYPE => {
+				let properties = storage_properties(node).map_err(|error| vec![*error])?;
+				Ok(LoweredOperation::new(
+					OperationId::new(STORAGE_NODE_TYPE).expect("static operation is valid"),
+					[TypeId::new(RESPONSE_BODY_TYPE).expect("static type is valid")],
+					[TypeId::new(RESPONSE_BODY_TYPE).expect("static type is valid")],
+					AsyncKind::ASYNC,
+					[properties.operation.effect()],
+				)
+				.with_attribute("backend.effect.kind", "STORAGE")
+				.with_attribute("backend.storage.operation", properties.operation.as_str())
+				.with_attribute("backend.storage.key", properties.key))
+			}
 			TRANSFORM_NODE_TYPE => {
 				let (input_type, output_type) =
 					transform_data_types(node).map_err(|error| vec![*error])?;
@@ -965,6 +1206,157 @@ struct RouteProperties {
 	path: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct HttpRequestProperties {
+	method: String,
+	url: String,
+}
+
+fn http_request_properties(node: &Node) -> Result<HttpRequestProperties, Box<Diagnostic>> {
+	let method = enum_property(
+		node,
+		"HTTP Request",
+		HTTP_REQUEST_METHOD_PROPERTY,
+		&HTTP_METHODS,
+		"BACKEND_DSL.HTTP_REQUEST_METHOD_MISSING",
+		"BACKEND_DSL.HTTP_REQUEST_METHOD_TYPE",
+		"BACKEND_DSL.HTTP_REQUEST_METHOD_INVALID",
+	)?;
+	let url = non_empty_string_property(
+		node,
+		"HTTP Request",
+		HTTP_REQUEST_URL_PROPERTY,
+		"BACKEND_DSL.HTTP_REQUEST_URL_MISSING",
+		"BACKEND_DSL.HTTP_REQUEST_URL_TYPE",
+		"BACKEND_DSL.HTTP_REQUEST_URL_INVALID",
+	)?;
+	Ok(HttpRequestProperties { method, url })
+}
+
+fn logging_level(node: &Node) -> Result<String, Box<Diagnostic>> {
+	let Some(value) = node.properties().get(LOGGING_LEVEL_PROPERTY) else {
+		return Ok("INFO".to_string());
+	};
+	let Some(level) = value.as_str() else {
+		return Err(node_diagnostic(
+			node,
+			"BACKEND_DSL.LOGGING_LEVEL_TYPE",
+			"Logging property 'level' must be one of DEBUG, INFO, WARN, or ERROR.",
+		));
+	};
+	if !LOG_LEVELS.contains(&level) {
+		return Err(node_diagnostic(
+			node,
+			"BACKEND_DSL.LOGGING_LEVEL_INVALID",
+			"Logging property 'level' must be one of DEBUG, INFO, WARN, or ERROR.",
+		));
+	}
+	Ok(level.to_string())
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct StorageProperties {
+	operation: StorageOperation,
+	key: String,
+}
+
+fn storage_properties(node: &Node) -> Result<StorageProperties, Box<Diagnostic>> {
+	let operation = enum_property(
+		node,
+		"Storage",
+		STORAGE_OPERATION_PROPERTY,
+		&STORAGE_OPERATIONS,
+		"BACKEND_DSL.STORAGE_OPERATION_MISSING",
+		"BACKEND_DSL.STORAGE_OPERATION_TYPE",
+		"BACKEND_DSL.STORAGE_OPERATION_INVALID",
+	)?;
+	let key = non_empty_string_property(
+		node,
+		"Storage",
+		STORAGE_KEY_PROPERTY,
+		"BACKEND_DSL.STORAGE_KEY_MISSING",
+		"BACKEND_DSL.STORAGE_KEY_TYPE",
+		"BACKEND_DSL.STORAGE_KEY_INVALID",
+	)?;
+	let operation = match operation.as_str() {
+		"READ" => StorageOperation::READ,
+		"WRITE" => StorageOperation::WRITE,
+		_ => unreachable!("enum_property validates storage operations"),
+	};
+	Ok(StorageProperties { operation, key })
+}
+
+fn enum_property(
+	node: &Node,
+	owner: &str,
+	key: &str,
+	values: &[&str],
+	missing_code: &str,
+	type_code: &str,
+	invalid_code: &str,
+) -> Result<String, Box<Diagnostic>> {
+	let Some(value) = node.properties().get(key) else {
+		return Err(node_diagnostic(
+			node,
+			missing_code,
+			format!("{owner} property '{key}' is required."),
+		));
+	};
+	let Some(value) = value.as_str() else {
+		return Err(node_diagnostic(
+			node,
+			type_code,
+			format!(
+				"{owner} property '{key}' must be one of {}.",
+				values.join(", ")
+			),
+		));
+	};
+	if !values.contains(&value) {
+		return Err(node_diagnostic(
+			node,
+			invalid_code,
+			format!(
+				"{owner} property '{key}' must be one of {}.",
+				values.join(", ")
+			),
+		));
+	}
+	Ok(value.to_string())
+}
+
+fn non_empty_string_property(
+	node: &Node,
+	owner: &str,
+	key: &str,
+	missing_code: &str,
+	type_code: &str,
+	invalid_code: &str,
+) -> Result<String, Box<Diagnostic>> {
+	let Some(value) = node.properties().get(key) else {
+		return Err(node_diagnostic(
+			node,
+			missing_code,
+			format!("{owner} property '{key}' is required."),
+		));
+	};
+	let Some(value) = value.as_str() else {
+		return Err(node_diagnostic(
+			node,
+			type_code,
+			format!("{owner} property '{key}' must be a non-empty string."),
+		));
+	};
+	if value.trim().is_empty() || value.chars().any(char::is_whitespace) {
+		return Err(node_diagnostic(
+			node,
+			invalid_code,
+			format!("{owner} property '{key}' must be a non-empty string without whitespace."),
+		));
+	}
+	Ok(value.to_string())
+}
+
 fn route_contract(request_type: TypeId) -> NodeContract {
 	NodeContract::new(
 		[],
@@ -979,6 +1371,32 @@ fn route_contract(request_type: TypeId) -> NodeContract {
 		[],
 	)
 	.with_entry(true)
+}
+
+fn http_request_contract() -> NodeContract {
+	NodeContract::new(
+		[
+			PortContract::new(PortKind::EXECUTION, None, true),
+			PortContract::new(
+				PortKind::DATA,
+				Some(TypeId::new(RESPONSE_BODY_TYPE).expect("static type is valid")),
+				false,
+			),
+		],
+		[
+			PortContract::new(PortKind::EXECUTION, None, true),
+			PortContract::new(
+				PortKind::DATA,
+				Some(TypeId::new(RESPONSE_BODY_TYPE).expect("static type is valid")),
+				true,
+			),
+		],
+		[],
+		[],
+		[],
+		AsyncKind::ASYNC,
+		[EffectId::new(HTTP_REQUEST_EFFECT).expect("static effect is valid")],
+	)
 }
 
 fn cron_contract() -> NodeContract {
@@ -1117,6 +1535,54 @@ fn mutation_contract() -> NodeContract {
 		[],
 		AsyncKind::ASYNC,
 		[EffectId::new(DATABASE_WRITE_EFFECT).expect("static effect is valid")],
+	)
+}
+
+fn logging_contract() -> NodeContract {
+	NodeContract::new(
+		[
+			PortContract::new(PortKind::EXECUTION, None, true),
+			PortContract::new(
+				PortKind::DATA,
+				Some(TypeId::new(RESPONSE_BODY_TYPE).expect("static type is valid")),
+				true,
+			),
+		],
+		[PortContract::new(PortKind::EXECUTION, None, true)],
+		[],
+		[],
+		[],
+		AsyncKind::SYNC,
+		[EffectId::new(LOGGING_EFFECT).expect("static effect is valid")],
+	)
+}
+
+fn storage_contract(node: &Node) -> NodeContract {
+	let operation = storage_properties(node)
+		.map(|properties| properties.operation)
+		.unwrap_or(StorageOperation::READ);
+	NodeContract::new(
+		[
+			PortContract::new(PortKind::EXECUTION, None, true),
+			PortContract::new(
+				PortKind::DATA,
+				Some(TypeId::new(RESPONSE_BODY_TYPE).expect("static type is valid")),
+				operation == StorageOperation::WRITE,
+			),
+		],
+		[
+			PortContract::new(PortKind::EXECUTION, None, true),
+			PortContract::new(
+				PortKind::DATA,
+				Some(TypeId::new(RESPONSE_BODY_TYPE).expect("static type is valid")),
+				false,
+			),
+		],
+		[],
+		[],
+		[],
+		AsyncKind::ASYNC,
+		[operation.effect()],
 	)
 }
 
@@ -2224,7 +2690,7 @@ mod tests {
 	#[test]
 	fn exposes_route_and_response_descriptors() {
 		let plugin = BackendDslPlugin::new();
-		assert_eq!(plugin.descriptors().len(), 15);
+		assert_eq!(plugin.descriptors().len(), 18);
 		assert_eq!(plugin.descriptors()[0].label(), "HTTP Route");
 		assert_eq!(plugin.descriptors()[0].properties().len(), 2);
 		let cron = plugin
@@ -2289,6 +2755,39 @@ mod tests {
 		assert_eq!(transform.label(), "Identity Transform");
 		assert_eq!(transform.inputs().len(), 2);
 		assert_eq!(transform.outputs().len(), 2);
+		let http_request = plugin
+			.descriptors()
+			.iter()
+			.find(|descriptor| descriptor.type_id().as_str() == HTTP_REQUEST_NODE_TYPE)
+			.expect("HTTP Request descriptor should be registered");
+		assert_eq!(http_request.label(), "HTTP Request");
+		assert_eq!(http_request.category(), "Effects");
+		assert_eq!(http_request.inputs().len(), 2);
+		assert!(!http_request.inputs()[1].contract().required());
+		assert_eq!(http_request.outputs().len(), 2);
+		assert_eq!(http_request.properties().len(), 2);
+		let logging = plugin
+			.descriptors()
+			.iter()
+			.find(|descriptor| descriptor.type_id().as_str() == LOGGING_NODE_TYPE)
+			.expect("Logging descriptor should be registered");
+		assert_eq!(logging.label(), "Logging");
+		assert_eq!(logging.category(), "Effects");
+		assert_eq!(logging.inputs().len(), 2);
+		assert_eq!(logging.outputs().len(), 1);
+		assert_eq!(logging.properties().len(), 1);
+		assert_eq!(logging.properties()[0].key(), LOGGING_LEVEL_PROPERTY);
+		let storage = plugin
+			.descriptors()
+			.iter()
+			.find(|descriptor| descriptor.type_id().as_str() == STORAGE_NODE_TYPE)
+			.expect("Storage descriptor should be registered");
+		assert_eq!(storage.label(), "Storage");
+		assert_eq!(storage.category(), "Effects");
+		assert_eq!(storage.inputs().len(), 2);
+		assert!(!storage.inputs()[1].contract().required());
+		assert_eq!(storage.outputs().len(), 2);
+		assert_eq!(storage.properties().len(), 2);
 		let response = plugin
 			.descriptors()
 			.iter()
@@ -3035,6 +3534,226 @@ mod tests {
 		}));
 		assert!(diagnostics.iter().any(|diagnostic| {
 			diagnostic.code().as_str() == "BACKEND_DSL.MUTATION_NAME_DUPLICATE"
+		}));
+	}
+
+	#[test]
+	fn exposes_and_lowers_effect_nodes_with_explicit_effects() {
+		let plugin = BackendDslPlugin::new();
+
+		let http_request = Node::new(
+			NodeId::new(6).unwrap(),
+			NodeTypeId::new(HTTP_REQUEST_NODE_TYPE).unwrap(),
+		)
+		.with_property(
+			HTTP_REQUEST_METHOD_PROPERTY,
+			Value::String("POST".to_string()),
+		)
+		.unwrap()
+		.with_property(
+			HTTP_REQUEST_URL_PROPERTY,
+			Value::String("https://example.test/users".to_string()),
+		)
+		.unwrap();
+		let lowered_http_request = plugin.lower_node(&http_request).unwrap();
+		assert_eq!(
+			lowered_http_request.operation().as_str(),
+			HTTP_REQUEST_NODE_TYPE
+		);
+		assert_eq!(lowered_http_request.input_types().len(), 1);
+		assert_eq!(lowered_http_request.output_types().len(), 1);
+		assert_eq!(lowered_http_request.async_kind(), AsyncKind::ASYNC);
+		assert_eq!(
+			lowered_http_request.effects(),
+			&[EffectId::new(HTTP_REQUEST_EFFECT).unwrap()]
+		);
+		assert_eq!(
+			lowered_http_request.attributes()["backend.http_request.method"],
+			"POST"
+		);
+		assert_eq!(
+			lowered_http_request.attributes()["backend.http_request.url"],
+			"https://example.test/users"
+		);
+
+		let logging = Node::new(
+			NodeId::new(7).unwrap(),
+			NodeTypeId::new(LOGGING_NODE_TYPE).unwrap(),
+		)
+		.with_property(LOGGING_LEVEL_PROPERTY, Value::String("WARN".to_string()))
+		.unwrap();
+		let lowered_logging = plugin.lower_node(&logging).unwrap();
+		assert_eq!(lowered_logging.operation().as_str(), LOGGING_NODE_TYPE);
+		assert_eq!(lowered_logging.input_types().len(), 1);
+		assert!(lowered_logging.output_types().is_empty());
+		assert_eq!(lowered_logging.async_kind(), AsyncKind::SYNC);
+		assert_eq!(
+			lowered_logging.effects(),
+			&[EffectId::new(LOGGING_EFFECT).unwrap()]
+		);
+		assert_eq!(
+			lowered_logging.attributes()["backend.logging.level"],
+			"WARN"
+		);
+
+		let storage_read = Node::new(
+			NodeId::new(8).unwrap(),
+			NodeTypeId::new(STORAGE_NODE_TYPE).unwrap(),
+		)
+		.with_property(
+			STORAGE_OPERATION_PROPERTY,
+			Value::String("READ".to_string()),
+		)
+		.unwrap()
+		.with_property(STORAGE_KEY_PROPERTY, Value::String("users:all".to_string()))
+		.unwrap();
+		let lowered_storage_read = plugin.lower_node(&storage_read).unwrap();
+		assert_eq!(lowered_storage_read.operation().as_str(), STORAGE_NODE_TYPE);
+		assert_eq!(lowered_storage_read.input_types().len(), 1);
+		assert_eq!(lowered_storage_read.output_types().len(), 1);
+		assert_eq!(lowered_storage_read.async_kind(), AsyncKind::ASYNC);
+		assert_eq!(
+			lowered_storage_read.effects(),
+			&[EffectId::new(STORAGE_READ_EFFECT).unwrap()]
+		);
+		assert_eq!(
+			lowered_storage_read.attributes()["backend.storage.operation"],
+			"READ"
+		);
+		assert!(!plugin.contract(&storage_read).inputs()[1].required());
+
+		let storage_write = storage_read
+			.clone()
+			.with_property(
+				STORAGE_OPERATION_PROPERTY,
+				Value::String("WRITE".to_string()),
+			)
+			.unwrap();
+		let lowered_storage_write = plugin.lower_node(&storage_write).unwrap();
+		assert_eq!(
+			lowered_storage_write.effects(),
+			&[EffectId::new(STORAGE_WRITE_EFFECT).unwrap()]
+		);
+		assert!(plugin.contract(&storage_write).inputs()[1].required());
+	}
+
+	#[test]
+	fn rejects_invalid_effect_properties_and_unconnected_outputs() {
+		let plugin = BackendDslPlugin::new();
+		let http_request = Node::new(
+			NodeId::new(6).unwrap(),
+			NodeTypeId::new(HTTP_REQUEST_NODE_TYPE).unwrap(),
+		);
+		let invalid_method = http_request
+			.clone()
+			.with_property(
+				HTTP_REQUEST_METHOD_PROPERTY,
+				Value::String("INVALID".to_string()),
+			)
+			.unwrap()
+			.with_property(
+				HTTP_REQUEST_URL_PROPERTY,
+				Value::String("https://example.test".to_string()),
+			)
+			.unwrap();
+		assert_eq!(
+			plugin.analyze_node(&http_request)[0].code().as_str(),
+			"BACKEND_DSL.HTTP_REQUEST_METHOD_MISSING"
+		);
+		assert_eq!(
+			plugin.analyze_node(&invalid_method)[0].code().as_str(),
+			"BACKEND_DSL.HTTP_REQUEST_METHOD_INVALID"
+		);
+
+		let invalid_logging = Node::new(
+			NodeId::new(7).unwrap(),
+			NodeTypeId::new(LOGGING_NODE_TYPE).unwrap(),
+		)
+		.with_property(LOGGING_LEVEL_PROPERTY, Value::String("TRACE".to_string()))
+		.unwrap();
+		assert_eq!(
+			plugin.analyze_node(&invalid_logging)[0].code().as_str(),
+			"BACKEND_DSL.LOGGING_LEVEL_INVALID"
+		);
+
+		let invalid_storage = Node::new(
+			NodeId::new(8).unwrap(),
+			NodeTypeId::new(STORAGE_NODE_TYPE).unwrap(),
+		)
+		.with_property(
+			STORAGE_OPERATION_PROPERTY,
+			Value::String("REMOVE".to_string()),
+		)
+		.unwrap()
+		.with_property(STORAGE_KEY_PROPERTY, Value::String("users".to_string()))
+		.unwrap();
+		assert_eq!(
+			plugin.analyze_node(&invalid_storage)[0].code().as_str(),
+			"BACKEND_DSL.STORAGE_OPERATION_INVALID"
+		);
+
+		let metadata = krunt_graph_model::GraphMetadata::new(
+			krunt_graph_model::GraphId::new(34).unwrap(),
+			"backend-v1",
+			"krunt-test",
+		)
+		.unwrap();
+		let mut http_request = invalid_method
+			.clone()
+			.with_property(
+				HTTP_REQUEST_METHOD_PROPERTY,
+				Value::String("GET".to_string()),
+			)
+			.unwrap();
+		http_request
+			.add_port(krunt_graph_model::Port::new(
+				PortId::new(61).unwrap(),
+				PortDirection::OUTPUT,
+				PortKind::EXECUTION,
+			))
+			.unwrap();
+		let mut logging = Node::new(
+			NodeId::new(7).unwrap(),
+			NodeTypeId::new(LOGGING_NODE_TYPE).unwrap(),
+		);
+		logging
+			.add_port(krunt_graph_model::Port::new(
+				PortId::new(71).unwrap(),
+				PortDirection::OUTPUT,
+				PortKind::EXECUTION,
+			))
+			.unwrap();
+		let mut storage = Node::new(
+			NodeId::new(8).unwrap(),
+			NodeTypeId::new(STORAGE_NODE_TYPE).unwrap(),
+		)
+		.with_property(
+			STORAGE_OPERATION_PROPERTY,
+			Value::String("READ".to_string()),
+		)
+		.unwrap()
+		.with_property(STORAGE_KEY_PROPERTY, Value::String("users".to_string()))
+		.unwrap();
+		storage
+			.add_port(krunt_graph_model::Port::new(
+				PortId::new(81).unwrap(),
+				PortDirection::OUTPUT,
+				PortKind::EXECUTION,
+			))
+			.unwrap();
+		let mut builder = krunt_graph_model::GraphBuilder::new(metadata);
+		for node in [http_request, logging, storage] {
+			builder.add_node(node).unwrap();
+		}
+		let diagnostics = plugin.analyze_graph(&builder.build().unwrap());
+		assert!(diagnostics.iter().any(|diagnostic| {
+			diagnostic.code().as_str() == "BACKEND_DSL.HTTP_REQUEST_OUTPUT_UNCONNECTED"
+		}));
+		assert!(diagnostics.iter().any(|diagnostic| {
+			diagnostic.code().as_str() == "BACKEND_DSL.LOGGING_OUTPUT_UNCONNECTED"
+		}));
+		assert!(diagnostics.iter().any(|diagnostic| {
+			diagnostic.code().as_str() == "BACKEND_DSL.STORAGE_OUTPUT_UNCONNECTED"
 		}));
 	}
 
