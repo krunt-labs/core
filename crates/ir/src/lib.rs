@@ -123,6 +123,7 @@ impl EffectId {
 #[allow(non_camel_case_types)]
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub enum IROp {
+	DECLARATION { name: OperationId },
 	ENTRY { name: OperationId },
 	OPERATION { name: OperationId },
 	BRANCH,
@@ -329,7 +330,8 @@ impl OptimizationReport {
 /// The pass preserves control-reachable operations and recursively preserves
 /// producers of data consumed by those operations. If the graph has no ENTRY
 /// operation, it is returned unchanged because the optimizer cannot establish
-/// a safe execution root.
+/// a safe execution root. Explicit module-level declarations are preserved
+/// because generators consume them independently of execution reachability.
 pub fn eliminate_unreachable_nodes(
 	graph: IRGraph,
 ) -> Result<(IRGraph, OptimizationReport), BuildError> {
@@ -369,7 +371,9 @@ pub fn eliminate_unreachable_nodes(
 	let removed_nodes: Vec<_> = graph
 		.nodes
 		.iter()
-		.filter(|node| !reachable.contains_key(&node.id))
+		.filter(|node| {
+			!reachable.contains_key(&node.id) && !matches!(&node.op, IROp::DECLARATION { .. })
+		})
 		.map(|node| node.id)
 		.collect();
 	if removed_nodes.is_empty() {
@@ -378,7 +382,7 @@ pub fn eliminate_unreachable_nodes(
 
 	let mut builder = IRBuilder::new();
 	for node in &graph.nodes {
-		if reachable.contains_key(&node.id) {
+		if reachable.contains_key(&node.id) || matches!(&node.op, IROp::DECLARATION { .. }) {
 			builder.add_node(node.clone())?;
 		}
 	}
@@ -721,6 +725,36 @@ mod tests {
 			optimized.node(IrNodeId(2)).unwrap().source.primary,
 			GraphElementId::NODE(GraphNodeId(20))
 		);
+	}
+
+	#[test]
+	fn preserves_declarations_when_eliminating_unreachable_operations() {
+		let mut builder = IRBuilder::new();
+		builder.add_node(entry_operation("route", 1, 10)).unwrap();
+		builder
+			.add_node(IRNode {
+				id: IrNodeId(2),
+				op: IROp::DECLARATION {
+					name: OperationId::new("backend.entity").unwrap(),
+				},
+				input_types: Vec::new(),
+				output_types: Vec::new(),
+				async_kind: AsyncKind::SYNC,
+				effects: Vec::new(),
+				attributes: BTreeMap::new(),
+				returns: false,
+				source: SourceMap::node(GraphNodeId(20)),
+			})
+			.unwrap();
+		builder
+			.add_node(operation("dead", 3, 30, &[], &[]))
+			.unwrap();
+
+		let (optimized, report) = eliminate_unreachable_nodes(builder.build().unwrap()).unwrap();
+
+		assert_eq!(report.removed_nodes(), &[IrNodeId(3)]);
+		assert!(optimized.node(IrNodeId(2)).is_some());
+		assert_eq!(optimized.nodes().len(), 2);
 	}
 
 	#[test]

@@ -6,12 +6,13 @@
 //! executable while persistence-specific infrastructure stays explicit.
 
 use krunt_codegen_typescript::{
-	TypeScriptFunction, TypeScriptOperationKind, TypeScriptProgram, TypeScriptRenderError,
-	TypeScriptSourceRenderer,
+	TypeScriptFunction, TypeScriptOperation, TypeScriptOperationKind, TypeScriptProgram,
+	TypeScriptRenderError, TypeScriptSourceRenderer,
 };
 use krunt_framework_backend::{FrameworkBackend, GeneratedProject, ProjectError};
 use krunt_ir::GraphElementId;
 use serde::Serialize;
+use std::collections::BTreeMap;
 use std::fmt;
 
 /// Version of the NestJS framework semantic IR.
@@ -23,6 +24,8 @@ pub struct NestJsProgram {
 	version: u32,
 	fallback_execution_name: String,
 	requires_runtime: bool,
+	entities: Vec<NestJsEntity>,
+	repositories: Vec<NestJsRepository>,
 	routes: Vec<NestJsRoute>,
 }
 
@@ -49,8 +52,105 @@ impl NestJsProgram {
 		self.requires_runtime
 	}
 
+	pub fn entities(&self) -> &[NestJsEntity] {
+		&self.entities
+	}
+
+	pub fn repositories(&self) -> &[NestJsRepository] {
+		&self.repositories
+	}
+
 	pub fn routes(&self) -> &[NestJsRoute] {
 		&self.routes
+	}
+}
+
+/// One Backend DSL entity declaration preserved by the language backend.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+pub struct NestJsEntity {
+	id: u32,
+	name: String,
+	source: String,
+}
+
+impl NestJsEntity {
+	pub fn id(&self) -> u32 {
+		self.id
+	}
+
+	pub fn name(&self) -> &str {
+		&self.name
+	}
+
+	pub fn source(&self) -> &str {
+		&self.source
+	}
+}
+
+/// The kind of persistence method generated for a NestJS repository.
+#[allow(non_camel_case_types)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+pub enum NestJsRepositoryMethodKind {
+	MUTATION,
+	QUERY,
+}
+
+/// One query or mutation method exposed by a generated repository provider.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+pub struct NestJsRepositoryMethod {
+	operation_id: u32,
+	name: String,
+	kind: NestJsRepositoryMethodKind,
+	source: String,
+}
+
+impl NestJsRepositoryMethod {
+	pub fn operation_id(&self) -> u32 {
+		self.operation_id
+	}
+
+	pub fn name(&self) -> &str {
+		&self.name
+	}
+
+	pub fn kind(&self) -> NestJsRepositoryMethodKind {
+		self.kind
+	}
+
+	pub fn source(&self) -> &str {
+		&self.source
+	}
+}
+
+/// One repository provider bound to a declared Backend DSL entity.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+pub struct NestJsRepository {
+	id: u32,
+	name: String,
+	entity: String,
+	source: String,
+	methods: Vec<NestJsRepositoryMethod>,
+}
+
+impl NestJsRepository {
+	pub fn id(&self) -> u32 {
+		self.id
+	}
+
+	pub fn name(&self) -> &str {
+		&self.name
+	}
+
+	pub fn entity(&self) -> &str {
+		&self.entity
+	}
+
+	pub fn source(&self) -> &str {
+		&self.source
+	}
+
+	pub fn methods(&self) -> &[NestJsRepositoryMethod] {
+		&self.methods
 	}
 }
 
@@ -64,6 +164,7 @@ pub struct NestJsRoute {
 	execution_name: String,
 	status_code: u16,
 	response_kind: NestJsResponseKind,
+	error_message: Option<String>,
 	requires_runtime: bool,
 }
 
@@ -94,6 +195,10 @@ impl NestJsRoute {
 
 	pub fn response_kind(&self) -> NestJsResponseKind {
 		self.response_kind
+	}
+
+	pub fn error_message(&self) -> Option<&str> {
+		self.error_message.as_deref()
 	}
 
 	pub fn requires_runtime(&self) -> bool {
@@ -206,8 +311,108 @@ fn lower_nestjs_program(
 					.iter()
 					.any(|operation| operation.requires_runtime())
 			}),
+		entities: lower_entities(program),
+		repositories: lower_repositories(program),
 		routes: lower_routes(program)?,
 	})
+}
+
+fn lower_entities(program: &TypeScriptProgram) -> Vec<NestJsEntity> {
+	let mut entities = program
+		.modules()
+		.iter()
+		.flat_map(|module| module.declarations())
+		.filter_map(|declaration| {
+			Some(NestJsEntity {
+				id: declaration.id().as_u32(),
+				name: declaration.attributes().get("backend.entity.name")?.clone(),
+				source: source_marker(declaration.source()),
+			})
+		})
+		.collect::<Vec<_>>();
+	entities.sort();
+	entities
+}
+
+fn lower_repositories(program: &TypeScriptProgram) -> Vec<NestJsRepository> {
+	let mut repositories = BTreeMap::<String, NestJsRepository>::new();
+	for declaration in program
+		.modules()
+		.iter()
+		.flat_map(|module| module.declarations())
+	{
+		let Some(name) = declaration.attributes().get("backend.repository.name") else {
+			continue;
+		};
+		let Some(entity) = declaration.attributes().get("backend.repository.entity") else {
+			continue;
+		};
+		repositories.insert(
+			name.clone(),
+			NestJsRepository {
+				id: declaration.id().as_u32(),
+				name: name.clone(),
+				entity: entity.clone(),
+				source: source_marker(declaration.source()),
+				methods: Vec::new(),
+			},
+		);
+	}
+
+	for operation in program
+		.modules()
+		.iter()
+		.flat_map(|module| module.functions())
+		.flat_map(TypeScriptFunction::operations)
+	{
+		let Some((kind, name_key, repository_key)) = persistence_operation(operation) else {
+			continue;
+		};
+		let Some(repository_name) = operation.attributes().get(repository_key) else {
+			continue;
+		};
+		let Some(name) = operation.attributes().get(name_key) else {
+			continue;
+		};
+		let Some(repository) = repositories.get_mut(repository_name) else {
+			continue;
+		};
+		repository.methods.push(NestJsRepositoryMethod {
+			operation_id: operation.id().as_u32(),
+			name: name.clone(),
+			kind,
+			source: source_marker(operation.source()),
+		});
+	}
+
+	let mut repositories = repositories.into_values().collect::<Vec<_>>();
+	for repository in &mut repositories {
+		repository.methods.sort();
+		repository.methods.dedup();
+	}
+	repositories
+}
+
+fn persistence_operation(
+	operation: &TypeScriptOperation,
+) -> Option<(NestJsRepositoryMethodKind, &'static str, &'static str)> {
+	match operation
+		.attributes()
+		.get("backend.persistence.kind")
+		.map(String::as_str)
+	{
+		Some("QUERY") => Some((
+			NestJsRepositoryMethodKind::QUERY,
+			"backend.query.name",
+			"backend.query.repository",
+		)),
+		Some("MUTATION") => Some((
+			NestJsRepositoryMethodKind::MUTATION,
+			"backend.mutation.name",
+			"backend.mutation.repository",
+		)),
+		_ => None,
+	}
 }
 
 fn lower_routes(program: &TypeScriptProgram) -> Result<Vec<NestJsRoute>, NestJsGenerationError> {
@@ -221,13 +426,15 @@ fn lower_routes(program: &TypeScriptProgram) -> Result<Vec<NestJsRoute>, NestJsG
 			}) else {
 				continue;
 			};
-			let status_code = function
+			let return_operation = function
 				.operations()
 				.iter()
-				.find(|operation| matches!(operation.kind(), TypeScriptOperationKind::RETURN))
+				.find(|operation| matches!(operation.kind(), TypeScriptOperationKind::RETURN));
+			let status_code = return_operation
 				.and_then(|operation| operation.attributes().get("response.status_code"))
 				.and_then(|value| value.parse().ok())
 				.unwrap_or(200);
+			let response_kind = response_kind(function)?;
 			routes.push(NestJsRoute {
 				operation_id: operation.id().as_u32(),
 				method: operation
@@ -243,7 +450,11 @@ fn lower_routes(program: &TypeScriptProgram) -> Result<Vec<NestJsRoute>, NestJsG
 				source: source_marker(operation.source()),
 				execution_name: function.name().to_string(),
 				status_code,
-				response_kind: response_kind(function)?,
+				error_message: (response_kind == NestJsResponseKind::ERROR)
+					.then(|| return_operation)
+					.flatten()
+					.and_then(|operation| operation.attributes().get("error.message").cloned()),
+				response_kind,
 				requires_runtime: function
 					.operations()
 					.iter()
@@ -255,13 +466,17 @@ fn lower_routes(program: &TypeScriptProgram) -> Result<Vec<NestJsRoute>, NestJsG
 	Ok(routes)
 }
 
-fn response_kind(
-	function: &TypeScriptFunction,
-) -> Result<NestJsResponseKind, NestJsGenerationError> {
-	let value = function
+fn return_operation(function: &TypeScriptFunction) -> Option<&TypeScriptOperation> {
+	function
 		.operations()
 		.iter()
 		.find(|operation| matches!(operation.kind(), TypeScriptOperationKind::RETURN))
+}
+
+fn response_kind(
+	function: &TypeScriptFunction,
+) -> Result<NestJsResponseKind, NestJsGenerationError> {
+	let value = return_operation(function)
 		.and_then(|operation| operation.attributes().get("response.kind"))
 		.map(String::as_str);
 	match value {
@@ -274,7 +489,7 @@ fn response_kind(
 }
 
 fn static_project_files(program: &NestJsProgram) -> Vec<(String, String)> {
-	vec![
+	let mut files = vec![
 		("src/app.controller.ts".to_string(), app_controller(program)),
 		("src/app.module.ts".to_string(), app_module(program)),
 		("src/main.ts".to_string(), main_module()),
@@ -282,18 +497,45 @@ fn static_project_files(program: &NestJsProgram) -> Vec<(String, String)> {
 		("README.md".to_string(), project_readme(program)),
 		("tsconfig.json".to_string(), tsconfig()),
 		("tsconfig.build.json".to_string(), tsconfig_build()),
-	]
-	.into_iter()
-	.chain(program.requires_runtime().then(|| {
-		(
-			"src/krunt-runtime.ts".to_string(),
-			krunt_runtime().to_string(),
-		)
-	}))
-	.collect()
+	];
+	for entity in program.entities() {
+		files.push((
+			format!(
+				"src/models/{}.model.ts",
+				type_identifier(entity.name(), "Entity")
+			),
+			entity_model(entity),
+		));
+	}
+	for repository in program.repositories() {
+		files.push((
+			format!(
+				"src/repositories/{}.repository.ts",
+				repository_class_name(repository)
+			),
+			repository_provider(repository),
+		));
+	}
+	if needs_runtime_file(program) {
+		files.push(("src/krunt-runtime.ts".to_string(), krunt_runtime(program)));
+	}
+	files
+}
+
+fn needs_runtime_file(program: &NestJsProgram) -> bool {
+	program.requires_runtime() || !program.repositories().is_empty()
 }
 
 fn app_controller(program: &NestJsProgram) -> String {
+	let exception_import = if program
+		.routes()
+		.iter()
+		.any(|route| route.response_kind() == NestJsResponseKind::ERROR)
+	{
+		", HttpException"
+	} else {
+		""
+	};
 	let execution_imports = if program.routes().is_empty() {
 		program.fallback_execution_name().to_string()
 	} else {
@@ -310,7 +552,7 @@ fn app_controller(program: &NestJsProgram) -> String {
 		""
 	};
 	let mut source = format!(
-		r#"import {{ Controller, Delete, Get, Head, HttpCode, Options, Patch, Post, Put, Req }} from '@nestjs/common';
+		r#"import {{ Controller, Delete, Get, Head, HttpCode, Options, Patch, Post, Put, Req{exception_import} }} from '@nestjs/common';
 import {{ {execution_imports} }} from './generated';
 {runtime_import}
 
@@ -346,12 +588,27 @@ export class AppController {{
 			source.push_str("')\n");
 			source.push_str("  async handle_");
 			source.push_str(&route.operation_id().to_string());
-			source.push_str("(@Req() request: unknown): Promise<unknown> {\n    return ");
-			source.push_str(route.execution_name());
+			source.push_str("(@Req() request: unknown): Promise<unknown> {\n");
+			let mut invocation = route.execution_name().to_string();
 			if route.requires_runtime() {
-				source.push_str("(request, this.runtime);\n  }\n");
+				invocation.push_str("(request, this.runtime)");
 			} else {
-				source.push_str("(request);\n  }\n");
+				invocation.push_str("(request)");
+			}
+			if route.response_kind() == NestJsResponseKind::ERROR {
+				source.push_str("    const result = await ");
+				source.push_str(&invocation);
+				source.push_str(";\n    throw new HttpException(result ?? '");
+				source.push_str(&escape_single_quoted(
+					route.error_message().unwrap_or("Request failed"),
+				));
+				source.push_str("', ");
+				source.push_str(&route.status_code().to_string());
+				source.push_str(");\n  }\n");
+			} else {
+				source.push_str("    return ");
+				source.push_str(&invocation);
+				source.push_str(";\n  }\n");
 			}
 		}
 	}
@@ -398,29 +655,217 @@ fn graph_element_marker(element: &GraphElementId) -> String {
 	}
 }
 
-fn app_module(program: &NestJsProgram) -> String {
-	if program.requires_runtime() {
-		return r#"import { Module } from '@nestjs/common';
-import { AppController } from './app.controller';
-import { KruntRuntimeService } from './krunt-runtime';
+fn entity_model(entity: &NestJsEntity) -> String {
+	let name = type_identifier(entity.name(), "Entity");
+	format!(
+		"// krunt:source={}\nexport interface {} {{\n  [key: string]: unknown;\n}}\n",
+		entity.source(),
+		name,
+	)
+}
 
-@Module({
-  controllers: [AppController],
-  providers: [KruntRuntimeService],
-})
-export class AppModule {}
-"#
-		.to_string();
+fn repository_provider(repository: &NestJsRepository) -> String {
+	let class_name = repository_class_name(repository);
+	let entity_name = type_identifier(repository.entity(), "Entity");
+	let mut source = String::new();
+	source.push_str("// krunt:source=");
+	source.push_str(repository.source());
+	source.push('\n');
+	source.push_str("import type { ");
+	source.push_str(&entity_name);
+	source.push_str(" } from '../models/");
+	source.push_str(&entity_name);
+	source.push_str(".model';\n");
+	source.push_str(
+		"import type { KruntRepository, KruntRepositoryOperation } from '../krunt-runtime';\n\n",
+	);
+	source.push_str("export class ");
+	source.push_str(&class_name);
+	source.push_str(" implements KruntRepository {\n");
+	source.push_str(
+		"  async execute(kind: KruntRepositoryOperation, name: string, value: unknown): Promise<unknown> {\n",
+	);
+	source.push_str("    switch (`${kind}:${name}`) {\n");
+	for method in repository.methods() {
+		source.push_str("      case '");
+		source.push_str(match method.kind() {
+			NestJsRepositoryMethodKind::QUERY => "QUERY",
+			NestJsRepositoryMethodKind::MUTATION => "MUTATION",
+		});
+		source.push(':');
+		source.push_str(&escape_single_quoted(method.name()));
+		source.push_str("': return this.");
+		source.push_str(&method_identifier(method.name(), "operation"));
+		if method.kind() == NestJsRepositoryMethodKind::MUTATION {
+			source.push_str("(value);");
+		} else {
+			source.push_str("();");
+		}
+		source.push('\n');
 	}
-	r#"import { Module } from '@nestjs/common';
-import { AppController } from './app.controller';
+	source.push_str("      default: throw new Error(`Unknown repository operation ${name}`);\n");
+	source.push_str("    }\n  }\n\n");
+	for method in repository.methods() {
+		source.push_str("  // krunt:source=");
+		source.push_str(method.source());
+		source.push('\n');
+		source.push_str("  async ");
+		source.push_str(&method_identifier(method.name(), "operation"));
+		if method.kind() == NestJsRepositoryMethodKind::MUTATION {
+			source.push_str("(value: unknown): Promise<unknown> {\n");
+		} else {
+			source.push_str("(): Promise<unknown> {\n");
+		}
+		source.push_str("    throw new Error('Repository method ");
+		source.push_str(&escape_single_quoted(repository.name()));
+		source.push('.');
+		source.push_str(&escape_single_quoted(method.name()));
+		source.push_str(" requires a persistence adapter.');\n  }\n\n");
+	}
+	source.push_str("}\n");
+	source
+}
 
-@Module({
-  controllers: [AppController],
-})
-export class AppModule {}
-"#
-	.to_string()
+fn repository_class_name(repository: &NestJsRepository) -> String {
+	format!(
+		"{}Repository",
+		type_identifier(repository.name(), "Repository")
+	)
+}
+
+fn type_identifier(value: &str, fallback: &str) -> String {
+	let identifier = sanitize_identifier(value, fallback);
+	let mut characters = identifier.chars();
+	let Some(first) = characters.next() else {
+		return fallback.to_string();
+	};
+	let mut result = first.to_ascii_uppercase().to_string();
+	result.extend(characters);
+	if is_typescript_keyword(&result) {
+		result.insert(0, '_');
+	}
+	result
+}
+
+fn method_identifier(value: &str, fallback: &str) -> String {
+	let identifier = sanitize_identifier(value, fallback);
+	let mut characters = identifier.chars();
+	let Some(first) = characters.next() else {
+		return fallback.to_string();
+	};
+	let mut identifier = first.to_ascii_lowercase().to_string();
+	identifier.extend(characters);
+	if is_typescript_keyword(&identifier) {
+		format!("_{identifier}")
+	} else {
+		identifier
+	}
+}
+
+fn sanitize_identifier(value: &str, fallback: &str) -> String {
+	let mut identifier = value
+		.chars()
+		.map(|character| {
+			if character.is_ascii_alphanumeric() || character == '_' || character == '$' {
+				character
+			} else {
+				'_'
+			}
+		})
+		.collect::<String>();
+	if identifier.is_empty() {
+		identifier = fallback.to_string();
+	}
+	if identifier
+		.chars()
+		.next()
+		.is_some_and(|character| character.is_ascii_digit())
+	{
+		identifier.insert(0, '_');
+	}
+	identifier
+}
+
+fn is_typescript_keyword(value: &str) -> bool {
+	matches!(
+		value,
+		"break"
+			| "case" | "catch"
+			| "class" | "const"
+			| "continue"
+			| "debugger"
+			| "default"
+			| "delete"
+			| "do" | "else"
+			| "enum" | "export"
+			| "extends"
+			| "false" | "finally"
+			| "for" | "function"
+			| "if" | "import"
+			| "in" | "instanceof"
+			| "new" | "null"
+			| "return"
+			| "super" | "switch"
+			| "this" | "throw"
+			| "true" | "try"
+			| "typeof"
+			| "var" | "void"
+			| "while" | "with"
+			| "yield" | "implements"
+			| "interface"
+			| "let" | "package"
+			| "private"
+			| "protected"
+			| "public"
+			| "static"
+			| "await" | "abstract"
+			| "as" | "asserts"
+			| "any" | "boolean"
+			| "constructor"
+			| "declare"
+			| "get" | "infer"
+			| "intrinsic"
+			| "is" | "keyof"
+			| "module"
+			| "namespace"
+			| "never" | "number"
+			| "object"
+			| "readonly"
+			| "require"
+			| "set" | "string"
+			| "symbol"
+			| "type" | "undefined"
+			| "unique"
+			| "unknown"
+			| "from" | "of"
+	)
+}
+
+fn app_module(program: &NestJsProgram) -> String {
+	let mut source = "import { Module } from '@nestjs/common';\nimport { AppController } from './app.controller';\n".to_string();
+	if program.requires_runtime() {
+		source.push_str("import { KruntRuntimeService } from './krunt-runtime';\n");
+	}
+	for repository in program.repositories() {
+		source.push_str("import { ");
+		source.push_str(&repository_class_name(repository));
+		source.push_str(" } from './repositories/");
+		source.push_str(&repository_class_name(repository));
+		source.push_str(".repository';\n");
+	}
+	source.push_str("\n@Module({\n  controllers: [AppController],\n");
+	let mut providers = Vec::new();
+	if program.requires_runtime() {
+		providers.push("KruntRuntimeService".to_string());
+	}
+	providers.extend(program.repositories().iter().map(repository_class_name));
+	if !providers.is_empty() {
+		source.push_str("  providers: [");
+		source.push_str(&providers.join(", "));
+		source.push_str("],\n");
+	}
+	source.push_str("})\nexport class AppModule {}\n");
+	source
 }
 
 fn main_module() -> String {
@@ -465,8 +910,8 @@ fn package_json() -> String {
 }
 
 fn project_readme(program: &NestJsProgram) -> String {
-	let runtime_note = if program.requires_runtime() {
-		"\n`src/krunt-runtime.ts` is the generated runtime adapter. Replace or extend its persistence methods with the application's repository and database integrations before production deployment.\n"
+	let runtime_note = if needs_runtime_file(program) {
+		"\n`src/krunt-runtime.ts` is the generated runtime adapter. Repository providers are generated as readable persistence seams; replace their stub methods with the application's database integrations before production deployment.\n"
 	} else {
 		""
 	};
@@ -494,12 +939,43 @@ comments. Route handlers preserve the declared success or error HTTP status.
 	readme
 }
 
-fn krunt_runtime() -> &'static str {
-	r#"import type { KruntRuntime } from './generated';
-
-export class KruntRuntimeService implements KruntRuntime {
-  private readonly storage = new Map<string, unknown>();
-
+fn krunt_runtime(program: &NestJsProgram) -> String {
+	let mut source = String::new();
+	source.push_str("import type { KruntRuntime } from './generated';\n");
+	for repository in program.repositories() {
+		source.push_str("import { ");
+		source.push_str(&repository_class_name(repository));
+		source.push_str(" } from './repositories/");
+		source.push_str(&repository_class_name(repository));
+		source.push_str(".repository';\n");
+	}
+	source.push_str(
+		"\nexport type KruntRepositoryOperation = 'QUERY' | 'MUTATION';\n\nexport interface KruntRepository {\n  execute(kind: KruntRepositoryOperation, name: string, value: unknown): Promise<unknown>;\n}\n\n",
+	);
+	source.push_str("export class KruntRuntimeService implements KruntRuntime {\n");
+	source.push_str("  private readonly storage = new Map<string, unknown>();\n");
+	if !program.repositories().is_empty() {
+		source.push_str("\n  constructor(\n");
+		for repository in program.repositories() {
+			source.push_str("    private readonly ");
+			source.push_str(&repository_variable_name(repository));
+			source.push_str(": ");
+			source.push_str(&repository_class_name(repository));
+			source.push_str(",\n");
+		}
+		source.push_str("  ) {}\n");
+		source.push_str("\n  private repository(name: string): KruntRepository | undefined {\n    switch (name) {\n");
+		for repository in program.repositories() {
+			source.push_str("      case '");
+			source.push_str(&escape_single_quoted(repository.name()));
+			source.push_str("': return this.");
+			source.push_str(&repository_variable_name(repository));
+			source.push_str(";\n");
+		}
+		source.push_str("      default: return undefined;\n    }\n  }\n");
+	}
+	source.push_str(
+		r#"
   async httpRequest(method: string, url: string, request: unknown): Promise<unknown> {
     const response = await fetch(url, {
       method,
@@ -518,11 +994,19 @@ export class KruntRuntimeService implements KruntRuntime {
   }
 
   async query(name: string, repository: string): Promise<unknown> {
-    throw new Error(`No persistence adapter configured for query ${repository}.${name}`);
+    const adapter = this.repository(repository);
+    if (adapter === undefined) {
+      throw new Error(`No repository provider configured for query ${repository}.${name}`);
+    }
+    return adapter.execute('QUERY', name, undefined);
   }
 
-  async mutation(name: string, repository: string, _value: unknown): Promise<unknown> {
-    throw new Error(`No persistence adapter configured for mutation ${repository}.${name}`);
+  async mutation(name: string, repository: string, value: unknown): Promise<unknown> {
+    const adapter = this.repository(repository);
+    if (adapter === undefined) {
+      throw new Error(`No repository provider configured for mutation ${repository}.${name}`);
+    }
+    return adapter.execute('MUTATION', name, value);
   }
 
   log(level: string, message: unknown): void {
@@ -550,7 +1034,20 @@ export class KruntRuntimeService implements KruntRuntime {
     return value;
   }
 }
-"#
+"#,
+	);
+	source
+}
+
+fn repository_variable_name(repository: &NestJsRepository) -> String {
+	let class_name = repository_class_name(repository);
+	let mut characters = class_name.chars();
+	let Some(first) = characters.next() else {
+		return "repository".to_string();
+	};
+	let mut result = first.to_ascii_lowercase().to_string();
+	result.extend(characters);
+	result
 }
 
 fn tsconfig() -> String {
@@ -717,6 +1214,132 @@ mod tests {
 				})
 				.unwrap();
 		}
+		TypeScriptBackend::lower_graph(&builder.build().unwrap()).unwrap()
+	}
+
+	fn persistence_program() -> TypeScriptProgram {
+		let mut builder = IRBuilder::new();
+		let mut route_attributes = std::collections::BTreeMap::new();
+		route_attributes.insert("backend.http.method".to_string(), "GET".to_string());
+		route_attributes.insert("backend.http.path".to_string(), "/users".to_string());
+		builder
+			.add_node(IRNode {
+				id: krunt_ir::IrNodeId(1),
+				op: IROp::ENTRY {
+					name: OperationId::new("backend.http_route").unwrap(),
+				},
+				input_types: Vec::new(),
+				output_types: vec![TypeId::new("Request").unwrap()],
+				async_kind: AsyncKind::ASYNC,
+				effects: Vec::new(),
+				attributes: route_attributes,
+				returns: false,
+				source: SourceMap::node(GraphNodeId(10)),
+			})
+			.unwrap();
+		builder
+			.add_node(IRNode {
+				id: krunt_ir::IrNodeId(2),
+				op: IROp::OPERATION {
+					name: OperationId::new("backend.query").unwrap(),
+				},
+				input_types: Vec::new(),
+				output_types: vec![TypeId::new("ResponseBody").unwrap()],
+				async_kind: AsyncKind::ASYNC,
+				effects: Vec::new(),
+				attributes: std::collections::BTreeMap::from([
+					("backend.persistence.kind".to_string(), "QUERY".to_string()),
+					("backend.query.name".to_string(), "ListUsers".to_string()),
+					(
+						"backend.query.repository".to_string(),
+						"UserRepository".to_string(),
+					),
+				]),
+				returns: false,
+				source: SourceMap::node(GraphNodeId(20)),
+			})
+			.unwrap();
+		builder
+			.add_node(IRNode {
+				id: krunt_ir::IrNodeId(3),
+				op: IROp::RETURN,
+				input_types: vec![TypeId::new("ResponseBody").unwrap()],
+				output_types: Vec::new(),
+				async_kind: AsyncKind::ASYNC,
+				effects: Vec::new(),
+				attributes: std::collections::BTreeMap::from([
+					("response.kind".to_string(), "SUCCESS".to_string()),
+					("response.status_code".to_string(), "200".to_string()),
+				]),
+				returns: true,
+				source: SourceMap::node(GraphNodeId(30)),
+			})
+			.unwrap();
+		builder
+			.add_node(IRNode {
+				id: krunt_ir::IrNodeId(4),
+				op: IROp::DECLARATION {
+					name: OperationId::new("backend.entity").unwrap(),
+				},
+				input_types: Vec::new(),
+				output_types: Vec::new(),
+				async_kind: AsyncKind::SYNC,
+				effects: Vec::new(),
+				attributes: std::collections::BTreeMap::from([(
+					"backend.entity.name".to_string(),
+					"User".to_string(),
+				)]),
+				returns: false,
+				source: SourceMap::node(GraphNodeId(40)),
+			})
+			.unwrap();
+		builder
+			.add_node(IRNode {
+				id: krunt_ir::IrNodeId(5),
+				op: IROp::DECLARATION {
+					name: OperationId::new("backend.repository").unwrap(),
+				},
+				input_types: Vec::new(),
+				output_types: Vec::new(),
+				async_kind: AsyncKind::SYNC,
+				effects: Vec::new(),
+				attributes: std::collections::BTreeMap::from([
+					(
+						"backend.repository.name".to_string(),
+						"UserRepository".to_string(),
+					),
+					("backend.repository.entity".to_string(), "User".to_string()),
+				]),
+				returns: false,
+				source: SourceMap::node(GraphNodeId(50)),
+			})
+			.unwrap();
+		for (from, to) in [(1, 2), (2, 3)] {
+			builder
+				.add_control_edge(ControlEdge {
+					from: PortRef {
+						node: krunt_ir::IrNodeId(from),
+						index: 0,
+					},
+					to: PortRef {
+						node: krunt_ir::IrNodeId(to),
+						index: 0,
+					},
+				})
+				.unwrap();
+		}
+		builder
+			.add_data_edge(DataEdge {
+				from: PortRef {
+					node: krunt_ir::IrNodeId(2),
+					index: 0,
+				},
+				to: PortRef {
+					node: krunt_ir::IrNodeId(3),
+					index: 0,
+				},
+			})
+			.unwrap();
 		TypeScriptBackend::lower_graph(&builder.build().unwrap()).unwrap()
 	}
 
@@ -1044,6 +1667,15 @@ mod tests {
 			framework_program.routes()[0].response_kind(),
 			NestJsResponseKind::ERROR
 		);
+		assert_eq!(
+			framework_program.routes()[0].error_message(),
+			Some("Validation failed")
+		);
+		assert!(NestJsBackend::generate_project(&program)
+			.unwrap()
+			.file("src/app.controller.ts")
+			.unwrap()
+			.contains("throw new HttpException(result ?? 'Validation failed', 400);"));
 	}
 
 	#[test]
@@ -1079,7 +1711,41 @@ mod tests {
 		assert!(first
 			.file("src/krunt-runtime.ts")
 			.unwrap()
-			.contains("No persistence adapter configured"));
+			.contains("No repository provider configured"));
+	}
+
+	#[test]
+	fn generates_entity_and_repository_providers_for_persistence_operations() {
+		let program = persistence_program();
+		let framework_program = NestJsBackend::lower_program(&program).unwrap();
+		assert_eq!(framework_program.entities().len(), 1);
+		assert_eq!(framework_program.entities()[0].name(), "User");
+		assert_eq!(framework_program.repositories().len(), 1);
+		assert_eq!(framework_program.repositories()[0].name(), "UserRepository");
+		assert_eq!(framework_program.repositories()[0].methods().len(), 1);
+		assert_eq!(
+			framework_program.repositories()[0].methods()[0].kind(),
+			NestJsRepositoryMethodKind::QUERY
+		);
+
+		let project = NestJsBackend::generate_project(&program).unwrap();
+		assert!(project.file("src/models/User.model.ts").is_some());
+		assert!(project
+			.file("src/repositories/UserRepositoryRepository.repository.ts")
+			.unwrap()
+			.contains("async listUsers(): Promise<unknown>"));
+		assert!(project
+			.file("src/app.module.ts")
+			.unwrap()
+			.contains("providers: [KruntRuntimeService, UserRepositoryRepository]"));
+		assert!(project
+			.file("src/krunt-runtime.ts")
+			.unwrap()
+			.contains("case 'UserRepository': return this.userRepositoryRepository;"));
+		assert!(project
+			.file("src/generated.ts")
+			.unwrap()
+			.contains("runtime.query(\"ListUsers\", \"UserRepository\")"));
 	}
 
 	#[test]

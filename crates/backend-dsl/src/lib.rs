@@ -1062,6 +1062,7 @@ impl krunt_plugin_api::SemanticPlugin for BackendDslPlugin {
 					AsyncKind::SYNC,
 					[],
 				)
+				.with_kind(LoweredOperationKind::DECLARATION)
 				.with_attribute("backend.entity.name", name))
 			}
 			REPOSITORY_NODE_TYPE => {
@@ -1073,6 +1074,7 @@ impl krunt_plugin_api::SemanticPlugin for BackendDslPlugin {
 					AsyncKind::SYNC,
 					[],
 				)
+				.with_kind(LoweredOperationKind::DECLARATION)
 				.with_attribute("backend.repository.name", properties.name)
 				.with_attribute("backend.repository.entity", properties.entity))
 			}
@@ -3021,6 +3023,7 @@ mod tests {
 		.unwrap();
 		let lowered = plugin.lower_node(&node).unwrap();
 		assert_eq!(lowered.operation().as_str(), ENTITY_NODE_TYPE);
+		assert_eq!(lowered.kind(), LoweredOperationKind::DECLARATION);
 		assert_eq!(lowered.attributes()["backend.entity.name"], "User");
 		assert!(lowered.input_types().is_empty());
 		assert!(lowered.output_types().is_empty());
@@ -3120,6 +3123,7 @@ mod tests {
 		.unwrap();
 		let lowered = plugin.lower_node(&node).unwrap();
 		assert_eq!(lowered.operation().as_str(), REPOSITORY_NODE_TYPE);
+		assert_eq!(lowered.kind(), LoweredOperationKind::DECLARATION);
 		assert_eq!(
 			lowered.attributes()["backend.repository.name"],
 			"UserRepository"

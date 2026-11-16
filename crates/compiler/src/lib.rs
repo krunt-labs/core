@@ -813,6 +813,9 @@ fn ir_node(
 			}
 		} else {
 			match lowered.kind() {
+				LoweredOperationKind::DECLARATION => IROp::DECLARATION {
+					name: lowered.operation().clone(),
+				},
 				LoweredOperationKind::OPERATION => IROp::OPERATION {
 					name: lowered.operation().clone(),
 				},
@@ -1649,6 +1652,12 @@ mod tests {
 			vec![EffectId::new(DATABASE_READ_EFFECT).unwrap()]
 		);
 		assert_eq!(query.attributes["backend.persistence.kind"], "QUERY");
+		assert!(result.ir().unwrap().nodes().iter().any(|node| {
+			matches!(&node.op, IROp::DECLARATION { name } if name.as_str() == ENTITY_NODE_TYPE)
+		}));
+		assert!(result.ir().unwrap().nodes().iter().any(|node| {
+			matches!(&node.op, IROp::DECLARATION { name } if name.as_str() == REPOSITORY_NODE_TYPE)
+		}));
 	}
 
 	#[test]

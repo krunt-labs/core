@@ -52,6 +52,7 @@ impl PluginManifest {
 #[allow(non_camel_case_types)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 pub enum LoweredOperationKind {
+	DECLARATION,
 	OPERATION,
 	BRANCH,
 	MERGE,

@@ -38,6 +38,7 @@ impl TypeScriptProgram {
 pub struct TypeScriptModule {
 	path: String,
 	imports: Vec<TypeScriptImport>,
+	declarations: Vec<TypeScriptDeclaration>,
 	functions: Vec<TypeScriptFunction>,
 }
 
@@ -50,8 +51,39 @@ impl TypeScriptModule {
 		&self.imports
 	}
 
+	pub fn declarations(&self) -> &[TypeScriptDeclaration] {
+		&self.declarations
+	}
+
 	pub fn functions(&self) -> &[TypeScriptFunction] {
 		&self.functions
+	}
+}
+
+/// A module-level semantic declaration preserved from universal IR.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct TypeScriptDeclaration {
+	id: TypeScriptOperationId,
+	name: String,
+	attributes: BTreeMap<String, String>,
+	source: SourceMap,
+}
+
+impl TypeScriptDeclaration {
+	pub fn id(&self) -> TypeScriptOperationId {
+		self.id
+	}
+
+	pub fn name(&self) -> &str {
+		&self.name
+	}
+
+	pub fn attributes(&self) -> &BTreeMap<String, String> {
+		&self.attributes
+	}
+
+	pub fn source(&self) -> &SourceMap {
+		&self.source
 	}
 }
 
@@ -174,6 +206,7 @@ impl TypeScriptOperationId {
 #[allow(non_camel_case_types)]
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub enum TypeScriptOperationKind {
+	DECLARATION { name: String },
 	ENTRY { name: String },
 	OPERATION { name: String },
 	BRANCH,
@@ -302,6 +335,18 @@ impl LanguageBackend for TypeScriptBackend {
 			.iter()
 			.map(lower_operation)
 			.collect::<Result<Vec<_>, _>>()?;
+		let declarations = all_operations
+			.iter()
+			.filter_map(|operation| match operation.kind() {
+				TypeScriptOperationKind::DECLARATION { name } => Some(TypeScriptDeclaration {
+					id: operation.id,
+					name: name.clone(),
+					attributes: operation.attributes.clone(),
+					source: operation.source.clone(),
+				}),
+				_ => None,
+			})
+			.collect();
 		let http_entries = all_operations
 			.iter()
 			.filter_map(|operation| {
@@ -337,6 +382,7 @@ impl LanguageBackend for TypeScriptBackend {
 			modules: vec![TypeScriptModule {
 				path: "generated.ts".to_string(),
 				imports: Vec::new(),
+				declarations,
 				functions,
 			}],
 		})
@@ -580,6 +626,7 @@ fn render_function(function: &TypeScriptFunction) -> String {
 		}
 
 		match operation.kind() {
+			TypeScriptOperationKind::DECLARATION { .. } => {}
 			TypeScriptOperationKind::ENTRY { name }
 			| TypeScriptOperationKind::OPERATION { name } => {
 				if is_http_entry(operation) {
@@ -882,6 +929,7 @@ fn operation_callee(id: TypeScriptOperationId, name: &str) -> String {
 
 fn render_operation_kind(kind: &TypeScriptOperationKind) -> String {
 	match kind {
+		TypeScriptOperationKind::DECLARATION { name } => format!("DECLARATION {name}"),
 		TypeScriptOperationKind::ENTRY { name } => format!("ENTRY {name}"),
 		TypeScriptOperationKind::OPERATION { name } => format!("OPERATION {name}"),
 		TypeScriptOperationKind::BRANCH => "BRANCH".to_string(),
@@ -976,6 +1024,9 @@ fn lower_operation(
 ) -> Result<TypeScriptOperation, TypeScriptLoweringError> {
 	let id = TypeScriptOperationId::new(node.id.0);
 	let kind = match &node.op {
+		IROp::DECLARATION { name } => TypeScriptOperationKind::DECLARATION {
+			name: name.as_str().to_string(),
+		},
 		IROp::ENTRY { name } => {
 			if name.as_str().trim().is_empty() {
 				return Err(TypeScriptLoweringError::EmptyOperationName { node_id: id });
@@ -1127,6 +1178,55 @@ mod tests {
 		assert!(first.contains("generated.ts"));
 		assert!(first.contains("Request"));
 		assert!(first.contains("Response"));
+	}
+
+	#[test]
+	fn preserves_module_declarations_for_framework_backends() {
+		let mut builder = IRBuilder::new();
+		builder
+			.add_node(IRNode {
+				id: krunt_ir::IrNodeId(1),
+				op: IROp::DECLARATION {
+					name: OperationId::new("backend.entity").unwrap(),
+				},
+				input_types: Vec::new(),
+				output_types: Vec::new(),
+				async_kind: AsyncKind::SYNC,
+				effects: Vec::new(),
+				attributes: BTreeMap::from([(
+					"backend.entity.name".to_string(),
+					"User".to_string(),
+				)]),
+				returns: false,
+				source: SourceMap::node(GraphNodeId(10)),
+			})
+			.unwrap();
+		builder
+			.add_node(IRNode {
+				id: krunt_ir::IrNodeId(2),
+				op: IROp::ENTRY {
+					name: OperationId::new("route").unwrap(),
+				},
+				input_types: Vec::new(),
+				output_types: Vec::new(),
+				async_kind: AsyncKind::SYNC,
+				effects: Vec::new(),
+				attributes: BTreeMap::new(),
+				returns: false,
+				source: SourceMap::node(GraphNodeId(20)),
+			})
+			.unwrap();
+
+		let program = TypeScriptBackend::lower_graph(&builder.build().unwrap()).unwrap();
+		let declaration = &program.modules()[0].declarations()[0];
+
+		assert_eq!(declaration.id().as_u32(), 1);
+		assert_eq!(declaration.name(), "backend.entity");
+		assert_eq!(declaration.attributes()["backend.entity.name"], "User");
+		assert_eq!(
+			declaration.source().primary,
+			GraphElementId::NODE(GraphNodeId(10))
+		);
 	}
 
 	#[test]
