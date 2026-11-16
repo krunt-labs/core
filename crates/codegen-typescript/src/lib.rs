@@ -1193,10 +1193,13 @@ mod tests {
 				output_types: Vec::new(),
 				async_kind: AsyncKind::SYNC,
 				effects: Vec::new(),
-				attributes: BTreeMap::from([(
-					"backend.entity.name".to_string(),
-					"User".to_string(),
-				)]),
+				attributes: BTreeMap::from([
+					("backend.entity.name".to_string(), "User".to_string()),
+					(
+						"backend.entity.fields".to_string(),
+						"{\"id\":\"Integer\"}".to_string(),
+					),
+				]),
 				returns: false,
 				source: SourceMap::node(GraphNodeId(10)),
 			})
@@ -1223,6 +1226,10 @@ mod tests {
 		assert_eq!(declaration.id().as_u32(), 1);
 		assert_eq!(declaration.name(), "backend.entity");
 		assert_eq!(declaration.attributes()["backend.entity.name"], "User");
+		assert_eq!(
+			declaration.attributes()["backend.entity.fields"],
+			"{\"id\":\"Integer\"}"
+		);
 		assert_eq!(
 			declaration.source().primary,
 			GraphElementId::NODE(GraphNodeId(10))

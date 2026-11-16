@@ -16,6 +16,7 @@ dependencies = [
  "krunt-graph-model",
  "krunt-ir",
  "krunt-plugin-api",
+ "krunt-type-system",
  "serde",
  "serde_json",
 ]

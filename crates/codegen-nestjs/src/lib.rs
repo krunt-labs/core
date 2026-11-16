@@ -16,7 +16,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 
 /// Version of the NestJS framework semantic IR.
-pub const NESTJS_PROGRAM_VERSION: u32 = 1;
+pub const NESTJS_PROGRAM_VERSION: u32 = 2;
 
 /// Framework-level semantic model consumed by NestJS project rendering.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -71,6 +71,7 @@ pub struct NestJsEntity {
 	id: u32,
 	name: String,
 	source: String,
+	fields: Vec<NestJsEntityField>,
 }
 
 impl NestJsEntity {
@@ -84,6 +85,27 @@ impl NestJsEntity {
 
 	pub fn source(&self) -> &str {
 		&self.source
+	}
+
+	pub fn fields(&self) -> &[NestJsEntityField] {
+		&self.fields
+	}
+}
+
+/// One scalar field in a generated NestJS entity model.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+pub struct NestJsEntityField {
+	name: String,
+	type_name: String,
+}
+
+impl NestJsEntityField {
+	pub fn name(&self) -> &str {
+		&self.name
+	}
+
+	pub fn type_name(&self) -> &str {
+		&self.type_name
 	}
 }
 
@@ -165,6 +187,7 @@ pub struct NestJsRoute {
 	status_code: u16,
 	response_kind: NestJsResponseKind,
 	error_message: Option<String>,
+	request_entity: Option<String>,
 	requires_runtime: bool,
 }
 
@@ -199,6 +222,10 @@ impl NestJsRoute {
 
 	pub fn error_message(&self) -> Option<&str> {
 		self.error_message.as_deref()
+	}
+
+	pub fn request_entity(&self) -> Option<&str> {
+		self.request_entity.as_deref()
 	}
 
 	pub fn requires_runtime(&self) -> bool {
@@ -255,7 +282,24 @@ impl FrameworkBackend for NestJsBackend {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum NestJsGenerationError {
 	MISSING_EXECUTE_FUNCTION,
-	UNSUPPORTED_RESPONSE_KIND { kind: String },
+	INVALID_ENTITY_FIELDS {
+		entity: String,
+	},
+	INVALID_ENTITY_FIELD_NAME {
+		entity: String,
+		field: String,
+	},
+	UNSUPPORTED_ENTITY_FIELD_TYPE {
+		entity: String,
+		field: String,
+		type_name: String,
+	},
+	REQUEST_ENTITY_NOT_FOUND {
+		entity: String,
+	},
+	UNSUPPORTED_RESPONSE_KIND {
+		kind: String,
+	},
 	TYPESCRIPT_RENDER(TypeScriptRenderError),
 	PROJECT(ProjectError),
 }
@@ -265,6 +309,23 @@ impl fmt::Display for NestJsGenerationError {
 		match self {
 			Self::MISSING_EXECUTE_FUNCTION => {
 				write!(f, "TypeScript program does not expose an execute function")
+			}
+			Self::INVALID_ENTITY_FIELDS { entity } => {
+				write!(f, "entity '{entity}' has invalid field metadata")
+			}
+			Self::INVALID_ENTITY_FIELD_NAME { entity, field } => {
+				write!(f, "entity '{entity}' has invalid field name '{field}'")
+			}
+			Self::UNSUPPORTED_ENTITY_FIELD_TYPE {
+				entity,
+				field,
+				type_name,
+			} => write!(
+				f,
+				"entity '{entity}' field '{field}' has unsupported type '{type_name}'"
+			),
+			Self::REQUEST_ENTITY_NOT_FOUND { entity } => {
+				write!(f, "request entity '{entity}' is not declared")
 			}
 			Self::UNSUPPORTED_RESPONSE_KIND { kind } => {
 				write!(
@@ -298,6 +359,9 @@ fn lower_nestjs_program(
 	let Some(fallback_execution_name) = execution_function_name(program) else {
 		return Err(NestJsGenerationError::MISSING_EXECUTE_FUNCTION);
 	};
+	let entities = lower_entities(program)?;
+	let repositories = lower_repositories(program);
+	let routes = lower_routes(program, &entities)?;
 	Ok(NestJsProgram {
 		version: NestJsProgram::CURRENT_VERSION,
 		fallback_execution_name,
@@ -311,27 +375,69 @@ fn lower_nestjs_program(
 					.iter()
 					.any(|operation| operation.requires_runtime())
 			}),
-		entities: lower_entities(program),
-		repositories: lower_repositories(program),
-		routes: lower_routes(program)?,
+		entities,
+		repositories,
+		routes,
 	})
 }
 
-fn lower_entities(program: &TypeScriptProgram) -> Vec<NestJsEntity> {
+fn lower_entities(program: &TypeScriptProgram) -> Result<Vec<NestJsEntity>, NestJsGenerationError> {
 	let mut entities = program
 		.modules()
 		.iter()
 		.flat_map(|module| module.declarations())
-		.filter_map(|declaration| {
-			Some(NestJsEntity {
+		.map(|declaration| {
+			let name = declaration.attributes().get("backend.entity.name").cloned();
+			let Some(name) = name else {
+				return Ok(None);
+			};
+			let fields =
+				entity_fields(&name, declaration.attributes().get("backend.entity.fields"))?;
+			Ok(Some(NestJsEntity {
 				id: declaration.id().as_u32(),
-				name: declaration.attributes().get("backend.entity.name")?.clone(),
+				name,
 				source: source_marker(declaration.source()),
-			})
+				fields,
+			}))
 		})
+		.collect::<Result<Vec<_>, NestJsGenerationError>>()?
+		.into_iter()
+		.flatten()
 		.collect::<Vec<_>>();
 	entities.sort();
-	entities
+	Ok(entities)
+}
+
+fn entity_fields(
+	entity: &str,
+	serialized: Option<&String>,
+) -> Result<Vec<NestJsEntityField>, NestJsGenerationError> {
+	let Some(serialized) = serialized else {
+		return Ok(Vec::new());
+	};
+	let fields = serde_json::from_str::<BTreeMap<String, String>>(serialized).map_err(|_| {
+		NestJsGenerationError::INVALID_ENTITY_FIELDS {
+			entity: entity.to_string(),
+		}
+	})?;
+	let mut result = Vec::with_capacity(fields.len());
+	for (name, type_name) in fields {
+		if !is_typescript_property_identifier(&name) {
+			return Err(NestJsGenerationError::INVALID_ENTITY_FIELD_NAME {
+				entity: entity.to_string(),
+				field: name,
+			});
+		}
+		if typescript_entity_type(&type_name).is_none() {
+			return Err(NestJsGenerationError::UNSUPPORTED_ENTITY_FIELD_TYPE {
+				entity: entity.to_string(),
+				field: name,
+				type_name,
+			});
+		}
+		result.push(NestJsEntityField { name, type_name });
+	}
+	Ok(result)
 }
 
 fn lower_repositories(program: &TypeScriptProgram) -> Vec<NestJsRepository> {
@@ -415,7 +521,10 @@ fn persistence_operation(
 	}
 }
 
-fn lower_routes(program: &TypeScriptProgram) -> Result<Vec<NestJsRoute>, NestJsGenerationError> {
+fn lower_routes(
+	program: &TypeScriptProgram,
+	entities: &[NestJsEntity],
+) -> Result<Vec<NestJsRoute>, NestJsGenerationError> {
 	let mut routes = Vec::new();
 	for module in program.modules() {
 		for function in module.functions() {
@@ -435,6 +544,17 @@ fn lower_routes(program: &TypeScriptProgram) -> Result<Vec<NestJsRoute>, NestJsG
 				.and_then(|value| value.parse().ok())
 				.unwrap_or(200);
 			let response_kind = response_kind(function)?;
+			let request_entity = operation
+				.attributes()
+				.get("backend.http.request_entity")
+				.cloned();
+			if let Some(entity) = request_entity.as_deref() {
+				if !entities.iter().any(|candidate| candidate.name() == entity) {
+					return Err(NestJsGenerationError::REQUEST_ENTITY_NOT_FOUND {
+						entity: entity.to_string(),
+					});
+				}
+			}
 			routes.push(NestJsRoute {
 				operation_id: operation.id().as_u32(),
 				method: operation
@@ -455,6 +575,7 @@ fn lower_routes(program: &TypeScriptProgram) -> Result<Vec<NestJsRoute>, NestJsG
 					.flatten()
 					.and_then(|operation| operation.attributes().get("error.message").cloned()),
 				response_kind,
+				request_entity,
 				requires_runtime: function
 					.operations()
 					.iter()
@@ -527,15 +648,33 @@ fn needs_runtime_file(program: &NestJsProgram) -> bool {
 }
 
 fn app_controller(program: &NestJsProgram) -> String {
-	let exception_import = if program
+	let has_error_routes = program
 		.routes()
 		.iter()
-		.any(|route| route.response_kind() == NestJsResponseKind::ERROR)
-	{
-		", HttpException"
-	} else {
-		""
-	};
+		.any(|route| route.response_kind() == NestJsResponseKind::ERROR);
+	let has_request_validation = program
+		.routes()
+		.iter()
+		.any(|route| route.request_entity().is_some());
+	let mut decorators = vec![
+		"Controller",
+		"Delete",
+		"Get",
+		"Head",
+		"HttpCode",
+		"Options",
+		"Patch",
+		"Post",
+		"Put",
+	];
+	if has_request_validation {
+		decorators.push("BadRequestException");
+		decorators.push("Body");
+	}
+	decorators.push("Req");
+	if has_error_routes {
+		decorators.push("HttpException");
+	}
 	let execution_imports = if program.routes().is_empty() {
 		program.fallback_execution_name().to_string()
 	} else {
@@ -551,14 +690,31 @@ fn app_controller(program: &NestJsProgram) -> String {
 	} else {
 		""
 	};
+	let mut request_validator_imports = program
+		.routes()
+		.iter()
+		.filter_map(|route| route.request_entity())
+		.map(|entity| format!("validate{}", type_identifier(entity, "Entity")))
+		.collect::<Vec<_>>();
+	request_validator_imports.sort();
+	request_validator_imports.dedup();
+	let request_validator_imports = request_validator_imports
+		.iter()
+		.map(|function| {
+			let entity = function.strip_prefix("validate").unwrap_or("Entity");
+			format!("import {{ {function} }} from './models/{entity}.model';\n")
+		})
+		.collect::<String>();
 	let mut source = format!(
-		r#"import {{ Controller, Delete, Get, Head, HttpCode, Options, Patch, Post, Put, Req{exception_import} }} from '@nestjs/common';
+		r#"import {{ {} }} from '@nestjs/common';
 import {{ {execution_imports} }} from './generated';
 {runtime_import}
+{request_validator_imports}
 
 @Controller()
 export class AppController {{
-"#
+"#,
+		decorators.join(", "),
 	);
 	if program.requires_runtime() {
 		source.push_str("  constructor(private readonly runtime: KruntRuntimeService) {}\n\n");
@@ -588,12 +744,29 @@ export class AppController {{
 			source.push_str("')\n");
 			source.push_str("  async handle_");
 			source.push_str(&route.operation_id().to_string());
-			source.push_str("(@Req() request: unknown): Promise<unknown> {\n");
+			if route.request_entity().is_some() {
+				source.push_str("(@Body() request: unknown): Promise<unknown> {\n");
+			} else {
+				source.push_str("(@Req() request: unknown): Promise<unknown> {\n");
+			}
+			let request_expression = if let Some(entity) = route.request_entity() {
+				source.push_str("    let validatedRequest: unknown;\n");
+				source.push_str("    try {\n      validatedRequest = validate");
+				source.push_str(&type_identifier(entity, "Entity"));
+				source.push_str("(request);\n    } catch (error) {\n      throw new BadRequestException(error instanceof Error ? error.message : 'Invalid request body');\n    }\n");
+				"validatedRequest"
+			} else {
+				"request"
+			};
 			let mut invocation = route.execution_name().to_string();
 			if route.requires_runtime() {
-				invocation.push_str("(request, this.runtime)");
+				invocation.push('(');
+				invocation.push_str(request_expression);
+				invocation.push_str(", this.runtime)");
 			} else {
-				invocation.push_str("(request)");
+				invocation.push('(');
+				invocation.push_str(request_expression);
+				invocation.push(')');
 			}
 			if route.response_kind() == NestJsResponseKind::ERROR {
 				source.push_str("    const result = await ");
@@ -657,11 +830,124 @@ fn graph_element_marker(element: &GraphElementId) -> String {
 
 fn entity_model(entity: &NestJsEntity) -> String {
 	let name = type_identifier(entity.name(), "Entity");
-	format!(
-		"// krunt:source={}\nexport interface {} {{\n  [key: string]: unknown;\n}}\n",
+	let mut source = format!(
+		"// krunt:source={}\nexport interface {} {{\n",
 		entity.source(),
 		name,
-	)
+	);
+	if entity.fields().is_empty() {
+		source.push_str("  [key: string]: unknown;\n");
+	} else {
+		for field in entity.fields() {
+			source.push_str("  ");
+			source.push_str(field.name());
+			source.push_str(": ");
+			source.push_str(typescript_entity_type(field.type_name()).unwrap_or("unknown"));
+			source.push_str(";\n");
+		}
+	}
+	source.push_str("}\n\n");
+	if !entity.fields().is_empty() {
+		source.push_str("export function validate");
+		source.push_str(&name);
+		source.push_str("(value: unknown): ");
+		source.push_str(&name);
+		source.push_str(" {\n");
+		source.push_str(
+		"  if (typeof value !== 'object' || value === null || Array.isArray(value)) {\n    throw new Error('",
+	);
+		source.push_str(&name);
+		source.push_str(" must be an object.');\n  }\n");
+		source.push_str("  const record = value as Record<string, unknown>;\n");
+		for field in entity.fields() {
+			source.push_str("  if (");
+			source.push_str(&entity_field_validation(field));
+			source.push_str(") {\n    throw new Error('");
+			source.push_str(&name);
+			source.push('.');
+			source.push_str(field.name());
+			source.push_str(" must be a ");
+			source.push_str(entity_field_error_type(field.type_name()));
+			source.push_str(".');\n  }\n");
+		}
+		source.push_str("  return {\n");
+		for field in entity.fields() {
+			source.push_str("    ");
+			source.push_str(field.name());
+			source.push_str(": record.");
+			source.push_str(field.name());
+			source.push_str(" as ");
+			source.push_str(typescript_entity_type(field.type_name()).unwrap_or("unknown"));
+			source.push_str(",\n");
+		}
+		source.push_str("  };\n}\n");
+	}
+	source
+}
+
+fn typescript_entity_type(type_name: &str) -> Option<&'static str> {
+	match type_name.to_ascii_lowercase().as_str() {
+		"string" => Some("string"),
+		"boolean" => Some("boolean"),
+		"integer" | "float" | "number" => Some("number"),
+		"null" => Some("null"),
+		"any" => Some("unknown"),
+		_ => None,
+	}
+}
+
+fn entity_field_error_type(type_name: &str) -> &'static str {
+	match type_name.to_ascii_lowercase().as_str() {
+		"string" => "string",
+		"boolean" => "boolean",
+		"integer" => "integer",
+		"float" | "number" => "number",
+		"null" => "null",
+		"any" => "value",
+		_ => "supported value",
+	}
+}
+
+fn entity_field_validation(field: &NestJsEntityField) -> String {
+	let access = format!("record.{}", field.name());
+	match field.type_name().to_ascii_lowercase().as_str() {
+		"string" => format!(
+			"typeof {access} !== 'string' || !Object.prototype.hasOwnProperty.call(record, '{}')",
+			field.name()
+		),
+		"boolean" => format!(
+			"typeof {access} !== 'boolean' || !Object.prototype.hasOwnProperty.call(record, '{}')",
+			field.name()
+		),
+		"integer" => format!(
+			"typeof {access} !== 'number' || !Number.isInteger({access}) || !Object.prototype.hasOwnProperty.call(record, '{}')",
+			field.name()
+		),
+		"float" | "number" => format!(
+			"typeof {access} !== 'number' || !Number.isFinite({access}) || !Object.prototype.hasOwnProperty.call(record, '{}')",
+			field.name()
+		),
+		"null" => format!(
+			"{access} !== null || !Object.prototype.hasOwnProperty.call(record, '{}')",
+			field.name()
+		),
+		"any" => format!(
+			"!Object.prototype.hasOwnProperty.call(record, '{}')",
+			field.name()
+		),
+		_ => "true".to_string(),
+	}
+}
+
+fn is_typescript_property_identifier(value: &str) -> bool {
+	let mut characters = value.chars();
+	let Some(first) = characters.next() else {
+		return false;
+	};
+	(first.is_ascii_alphabetic() || first == '_' || first == '$')
+		&& characters.all(|character| {
+			character.is_ascii_alphanumeric() || character == '_' || character == '$'
+		})
 }
 
 fn repository_provider(repository: &NestJsRepository) -> String {
@@ -1226,8 +1512,12 @@ mod tests {
 	fn persistence_program() -> TypeScriptProgram {
 		let mut builder = IRBuilder::new();
 		let mut route_attributes = std::collections::BTreeMap::new();
-		route_attributes.insert("backend.http.method".to_string(), "GET".to_string());
+		route_attributes.insert("backend.http.method".to_string(), "POST".to_string());
 		route_attributes.insert("backend.http.path".to_string(), "/users".to_string());
+		route_attributes.insert(
+			"backend.http.request_entity".to_string(),
+			"User".to_string(),
+		);
 		builder
 			.add_node(IRNode {
 				id: krunt_ir::IrNodeId(1),
@@ -1291,10 +1581,13 @@ mod tests {
 				output_types: Vec::new(),
 				async_kind: AsyncKind::SYNC,
 				effects: Vec::new(),
-				attributes: std::collections::BTreeMap::from([(
-					"backend.entity.name".to_string(),
-					"User".to_string(),
-				)]),
+				attributes: std::collections::BTreeMap::from([
+					("backend.entity.name".to_string(), "User".to_string()),
+					(
+						"backend.entity.fields".to_string(),
+						"{\"email\":\"String\",\"id\":\"Integer\"}".to_string(),
+					),
+				]),
 				returns: false,
 				source: SourceMap::node(GraphNodeId(40)),
 			})
@@ -1609,6 +1902,7 @@ mod tests {
 
 	const TYPECHECK_STUBS: &str = r#"declare module '@nestjs/common' {
   export function Controller(prefix?: string): ClassDecorator;
+  export function Body(): ParameterDecorator;
   export function Delete(path?: string): MethodDecorator;
   export function Get(path?: string): MethodDecorator;
   export function Head(path?: string): MethodDecorator;
@@ -1619,6 +1913,9 @@ mod tests {
   export function Put(path?: string): MethodDecorator;
   export function Req(): ParameterDecorator;
   export function Module(metadata: unknown): ClassDecorator;
+  export class BadRequestException extends Error {
+    constructor(response: unknown);
+  }
   export class HttpException extends Error {
     constructor(response: unknown, status: number);
   }
@@ -1812,6 +2109,13 @@ declare const process: {
 		let framework_program = NestJsBackend::lower_program(&program).unwrap();
 		assert_eq!(framework_program.entities().len(), 1);
 		assert_eq!(framework_program.entities()[0].name(), "User");
+		assert_eq!(framework_program.entities()[0].fields().len(), 2);
+		assert_eq!(framework_program.entities()[0].fields()[0].name(), "email");
+		assert_eq!(
+			framework_program.entities()[0].fields()[0].type_name(),
+			"String"
+		);
+		assert_eq!(framework_program.routes()[0].request_entity(), Some("User"));
 		assert_eq!(framework_program.repositories().len(), 1);
 		assert_eq!(framework_program.repositories()[0].name(), "UserRepository");
 		assert_eq!(framework_program.repositories()[0].methods().len(), 1);
@@ -1822,6 +2126,10 @@ declare const process: {
 
 		let project = NestJsBackend::generate_project(&program).unwrap();
 		assert!(project.file("src/models/User.model.ts").is_some());
+		let model = project.file("src/models/User.model.ts").unwrap();
+		assert!(model.contains("email: string;"));
+		assert!(model.contains("id: number;"));
+		assert!(model.contains("export function validateUser(value: unknown): User"));
 		assert!(project
 			.file("src/repositories/UserRepositoryRepository.repository.ts")
 			.unwrap()
@@ -1838,6 +2146,10 @@ declare const process: {
 			.file("src/generated.ts")
 			.unwrap()
 			.contains("runtime.query(\"ListUsers\", \"UserRepository\")"));
+		let controller = project.file("src/app.controller.ts").unwrap();
+		assert!(controller.contains("@Body() request: unknown"));
+		assert!(controller.contains("validateUser(request)"));
+		assert!(controller.contains("BadRequestException"));
 	}
 
 	#[test]
@@ -1888,6 +2200,9 @@ declare const process: {
 			assert!(controller.contains(status_decorator));
 			assert_generated_project_typechecks(&project, label);
 		}
+
+		let persistence = NestJsBackend::generate_project(&persistence_program()).unwrap();
+		assert_generated_project_typechecks(&persistence, "typed-request");
 	}
 
 	#[test]

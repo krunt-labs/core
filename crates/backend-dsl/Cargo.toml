@@ -10,5 +10,6 @@ krunt-diagnostics = { path = "../diagnostics" }
 krunt-graph-model = { path = "../graph-model" }
 krunt-plugin-api = { path = "../plugin-api" }
 krunt-ir = { path = "../ir" }
+krunt-type-system = { path = "../type-system" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

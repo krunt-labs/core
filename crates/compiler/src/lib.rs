@@ -932,13 +932,14 @@ fn optimization_diagnostic(primary: GraphElementId, error: BuildError) -> Diagno
 mod tests {
 	use super::*;
 	use krunt_backend_dsl::{
-		BackendDslPlugin, DATABASE_READ_EFFECT, ENTITY_NAME_PROPERTY, ENTITY_NODE_TYPE,
-		HTTP_REQUEST_EFFECT, HTTP_REQUEST_METHOD_PROPERTY, HTTP_REQUEST_NODE_TYPE,
-		HTTP_REQUEST_TYPE, HTTP_REQUEST_URL_PROPERTY, HTTP_ROUTE_NODE_TYPE, LOGGING_EFFECT,
-		LOGGING_LEVEL_PROPERTY, LOGGING_NODE_TYPE, QUERY_NAME_PROPERTY, QUERY_NODE_TYPE,
-		QUERY_REPOSITORY_PROPERTY, REPOSITORY_ENTITY_PROPERTY, REPOSITORY_NAME_PROPERTY,
-		REPOSITORY_NODE_TYPE, STORAGE_KEY_PROPERTY, STORAGE_NODE_TYPE, STORAGE_OPERATION_PROPERTY,
-		STORAGE_READ_EFFECT, SUCCESS_RESPONSE_NODE_TYPE,
+		BackendDslPlugin, DATABASE_READ_EFFECT, ENTITY_FIELDS_PROPERTY, ENTITY_NAME_PROPERTY,
+		ENTITY_NODE_TYPE, HTTP_REQUEST_EFFECT, HTTP_REQUEST_METHOD_PROPERTY,
+		HTTP_REQUEST_NODE_TYPE, HTTP_REQUEST_TYPE, HTTP_REQUEST_URL_PROPERTY, HTTP_ROUTE_NODE_TYPE,
+		HTTP_ROUTE_REQUEST_ENTITY_PROPERTY, LOGGING_EFFECT, LOGGING_LEVEL_PROPERTY,
+		LOGGING_NODE_TYPE, QUERY_NAME_PROPERTY, QUERY_NODE_TYPE, QUERY_REPOSITORY_PROPERTY,
+		REPOSITORY_ENTITY_PROPERTY, REPOSITORY_NAME_PROPERTY, REPOSITORY_NODE_TYPE,
+		STORAGE_KEY_PROPERTY, STORAGE_NODE_TYPE, STORAGE_OPERATION_PROPERTY, STORAGE_READ_EFFECT,
+		SUCCESS_RESPONSE_NODE_TYPE,
 	};
 	use krunt_graph_model::{
 		Edge, EdgeId, EdgeKind, GraphBuilder, GraphId, GraphMetadata, NodeId, NodeTypeId,
@@ -1056,6 +1057,11 @@ mod tests {
 		.with_property("method", serde_json::Value::String("GET".into()))
 		.unwrap()
 		.with_property("path", serde_json::Value::String("/users".into()))
+		.unwrap()
+		.with_property(
+			HTTP_ROUTE_REQUEST_ENTITY_PROPERTY,
+			serde_json::Value::String("User".into()),
+		)
 		.unwrap();
 		route
 			.add_port(Port::new(
@@ -1143,6 +1149,11 @@ mod tests {
 		.with_property(
 			ENTITY_NAME_PROPERTY,
 			serde_json::Value::String("User".into()),
+		)
+		.unwrap()
+		.with_property(
+			ENTITY_FIELDS_PROPERTY,
+			serde_json::json!({"email": "String", "id": "Integer"}),
 		)
 		.unwrap();
 		let repository = Node::new(
@@ -1655,6 +1666,27 @@ mod tests {
 		assert!(result.ir().unwrap().nodes().iter().any(|node| {
 			matches!(&node.op, IROp::DECLARATION { name } if name.as_str() == ENTITY_NODE_TYPE)
 		}));
+		let entity = result
+			.ir()
+			.unwrap()
+			.nodes()
+			.iter()
+			.find(
+				|node| matches!(&node.op, IROp::DECLARATION { name } if name.as_str() == ENTITY_NODE_TYPE),
+			)
+			.expect("entity should be lowered into IR");
+		assert_eq!(
+			entity.attributes["backend.entity.fields"],
+			"{\"email\":\"String\",\"id\":\"Integer\"}"
+		);
+		let route = result
+			.ir()
+			.unwrap()
+			.nodes()
+			.iter()
+			.find(|node| matches!(&node.op, IROp::ENTRY { .. }))
+			.expect("route should be lowered into IR");
+		assert_eq!(route.attributes["backend.http.request_entity"], "User");
 		assert!(result.ir().unwrap().nodes().iter().any(|node| {
 			matches!(&node.op, IROp::DECLARATION { name } if name.as_str() == REPOSITORY_NODE_TYPE)
 		}));

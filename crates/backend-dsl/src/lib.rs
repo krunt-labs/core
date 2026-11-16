@@ -17,6 +17,7 @@ use krunt_plugin_api::{
 	LoweredOperation, LoweredOperationKind, NodeContract, PluginApiError, PluginManifest,
 	PluginRegistry, PortContract,
 };
+use krunt_type_system::Type;
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -58,6 +59,8 @@ pub const VALIDATION_ERROR_DEFAULT_MESSAGE: &str = "Validation failed";
 pub const CRON_SCHEDULE_PROPERTY: &str = "schedule";
 pub const SUBGRAPH_ID_PROPERTY: &str = "subgraph_id";
 pub const ENTITY_NAME_PROPERTY: &str = "name";
+pub const ENTITY_FIELDS_PROPERTY: &str = "fields";
+pub const HTTP_ROUTE_REQUEST_ENTITY_PROPERTY: &str = "request_entity";
 pub const REPOSITORY_NAME_PROPERTY: &str = "name";
 pub const REPOSITORY_ENTITY_PROPERTY: &str = "entity";
 pub const QUERY_NAME_PROPERTY: &str = "name";
@@ -104,6 +107,7 @@ impl StorageOperation {
 pub enum BackendPropertyKind {
 	STRING,
 	INTEGER,
+	OBJECT,
 	ENUM { values: Vec<String> },
 }
 
@@ -303,6 +307,12 @@ impl BackendDslPlugin {
 						BackendPropertyKind::STRING,
 						true,
 						Some(Value::String("/".to_string())),
+					),
+					BackendPropertyDescriptor::new(
+						HTTP_ROUTE_REQUEST_ENTITY_PROPERTY,
+						BackendPropertyKind::STRING,
+						false,
+						None,
 					),
 				],
 			},
@@ -541,12 +551,20 @@ impl BackendDslPlugin {
 				category: "Persistence".to_string(),
 				inputs: Vec::new(),
 				outputs: Vec::new(),
-				properties: vec![BackendPropertyDescriptor::new(
-					ENTITY_NAME_PROPERTY,
-					BackendPropertyKind::STRING,
-					true,
-					None,
-				)],
+				properties: vec![
+					BackendPropertyDescriptor::new(
+						ENTITY_NAME_PROPERTY,
+						BackendPropertyKind::STRING,
+						true,
+						None,
+					),
+					BackendPropertyDescriptor::new(
+						ENTITY_FIELDS_PROPERTY,
+						BackendPropertyKind::OBJECT,
+						false,
+						Some(Value::Object(serde_json::Map::new())),
+					),
+				],
 			},
 			BackendNodeDescriptor {
 				type_id: repository_type,
@@ -890,6 +908,7 @@ impl krunt_plugin_api::SemanticPlugin for BackendDslPlugin {
 		));
 		diagnostics.extend(validate_subgraph_references(document));
 		diagnostics.extend(validate_entity_names(document));
+		diagnostics.extend(validate_route_request_entities(document));
 		diagnostics.extend(validate_repository_references(document));
 		diagnostics.extend(validate_query_references(document));
 		diagnostics.extend(validate_mutation_references(document));
@@ -920,7 +939,7 @@ impl krunt_plugin_api::SemanticPlugin for BackendDslPlugin {
 				.map(|diagnostic| *diagnostic)
 				.into_iter()
 				.collect(),
-			ENTITY_NODE_TYPE => entity_name(node)
+			ENTITY_NODE_TYPE => entity_properties(node)
 				.err()
 				.map(|diagnostic| *diagnostic)
 				.into_iter()
@@ -979,7 +998,7 @@ impl krunt_plugin_api::SemanticPlugin for BackendDslPlugin {
 		match node.type_id().as_str() {
 			HTTP_ROUTE_NODE_TYPE => {
 				let properties = route_properties(node).map_err(|error| vec![*error])?;
-				Ok(LoweredOperation::new(
+				let mut lowered = LoweredOperation::new(
 					OperationId::new(HTTP_ROUTE_NODE_TYPE).expect("static operation is valid"),
 					[],
 					[TypeId::new(HTTP_REQUEST_TYPE).expect("static type is valid")],
@@ -987,7 +1006,11 @@ impl krunt_plugin_api::SemanticPlugin for BackendDslPlugin {
 					[],
 				)
 				.with_attribute("backend.http.method", properties.method)
-				.with_attribute("backend.http.path", properties.path))
+				.with_attribute("backend.http.path", properties.path);
+				if let Some(request_entity) = properties.request_entity {
+					lowered = lowered.with_attribute("backend.http.request_entity", request_entity);
+				}
+				Ok(lowered)
 			}
 			HTTP_REQUEST_NODE_TYPE => {
 				let properties = http_request_properties(node).map_err(|error| vec![*error])?;
@@ -1054,8 +1077,8 @@ impl krunt_plugin_api::SemanticPlugin for BackendDslPlugin {
 				.with_attribute("backend.subgraph.id", subgraph_id.as_u64().to_string()))
 			}
 			ENTITY_NODE_TYPE => {
-				let name = entity_name(node).map_err(|error| vec![*error])?;
-				Ok(LoweredOperation::new(
+				let properties = entity_properties(node).map_err(|error| vec![*error])?;
+				let mut lowered = LoweredOperation::new(
 					OperationId::new(ENTITY_NODE_TYPE).expect("static operation is valid"),
 					[],
 					[],
@@ -1063,7 +1086,13 @@ impl krunt_plugin_api::SemanticPlugin for BackendDslPlugin {
 					[],
 				)
 				.with_kind(LoweredOperationKind::DECLARATION)
-				.with_attribute("backend.entity.name", name))
+				.with_attribute("backend.entity.name", properties.name);
+				if !properties.fields.is_empty() {
+					let fields = serde_json::to_string(&properties.fields)
+						.expect("validated entity fields should serialize");
+					lowered = lowered.with_attribute("backend.entity.fields", fields);
+				}
+				Ok(lowered)
 			}
 			REPOSITORY_NODE_TYPE => {
 				let properties = repository_properties(node).map_err(|error| vec![*error])?;
@@ -1206,6 +1235,13 @@ impl krunt_plugin_api::SemanticPlugin for BackendDslPlugin {
 struct RouteProperties {
 	method: String,
 	path: String,
+	request_entity: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct EntityProperties {
+	name: String,
+	fields: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1980,6 +2016,34 @@ fn validate_entity_names(document: &GraphDocument) -> Vec<Diagnostic> {
 	diagnostics
 }
 
+fn validate_route_request_entities(document: &GraphDocument) -> Vec<Diagnostic> {
+	let entity_names: BTreeSet<_> = document
+		.nodes()
+		.iter()
+		.filter(|node| node.type_id().as_str() == ENTITY_NODE_TYPE)
+		.filter_map(|node| entity_name(node).ok())
+		.collect();
+
+	document
+		.nodes()
+		.iter()
+		.filter(|node| node.type_id().as_str() == HTTP_ROUTE_NODE_TYPE)
+		.filter_map(|route| {
+			let request_entity = route_properties(route).ok()?.request_entity?;
+			if entity_names.contains(&request_entity) {
+				return None;
+			}
+			Some(*node_diagnostic(
+				route,
+				"BACKEND_DSL.HTTP_ROUTE_REQUEST_ENTITY_NOT_FOUND",
+				format!(
+					"HTTP Route references request entity '{request_entity}', but that entity is not declared."
+				),
+			))
+		})
+		.collect()
+}
+
 fn validate_repository_references(document: &GraphDocument) -> Vec<Diagnostic> {
 	let entity_names: BTreeSet<_> = document
 		.nodes()
@@ -2321,6 +2385,69 @@ fn entity_name(node: &Node) -> Result<String, Box<Diagnostic>> {
 	Ok(name.to_string())
 }
 
+fn entity_properties(node: &Node) -> Result<EntityProperties, Box<Diagnostic>> {
+	let name = entity_name(node)?;
+	let fields = match node.properties().get(ENTITY_FIELDS_PROPERTY) {
+		None => BTreeMap::new(),
+		Some(Value::Object(fields)) => {
+			let mut validated = BTreeMap::new();
+			for (field_name, field_type) in fields {
+				if !is_identifier(field_name) {
+					return Err(node_diagnostic(
+						node,
+						"BACKEND_DSL.ENTITY_FIELD_NAME_INVALID",
+						format!("Entity field name '{field_name}' must be a valid identifier."),
+					));
+				}
+				let Some(field_type) = field_type.as_str() else {
+					return Err(node_diagnostic(
+						node,
+						"BACKEND_DSL.ENTITY_FIELD_TYPE",
+						format!("Entity field '{field_name}' type must be a string."),
+					));
+				};
+				let parsed_type = Type::from_reference(field_type).map_err(|_| {
+					node_diagnostic(
+						node,
+						"BACKEND_DSL.ENTITY_FIELD_TYPE_INVALID",
+						format!("Entity field '{field_name}' has an invalid type reference."),
+					)
+				})?;
+				if !parsed_type.is_scalar() && parsed_type != Type::ANY {
+					return Err(node_diagnostic(
+						node,
+						"BACKEND_DSL.ENTITY_FIELD_TYPE_UNSUPPORTED",
+						format!(
+							"Entity field '{field_name}' must use String, Boolean, Integer, Float, Number, Null, or Any."
+						),
+					));
+				}
+				validated.insert(field_name.clone(), field_type.to_string());
+			}
+			validated
+		}
+		Some(_) => {
+			return Err(node_diagnostic(
+				node,
+				"BACKEND_DSL.ENTITY_FIELDS_TYPE",
+				"Entity property 'fields' must be an object mapping field names to type references.",
+			));
+		}
+	};
+	Ok(EntityProperties { name, fields })
+}
+
+fn is_identifier(value: &str) -> bool {
+	let mut characters = value.chars();
+	let Some(first) = characters.next() else {
+		return false;
+	};
+	(first.is_ascii_alphabetic() || first == '_' || first == '$')
+		&& characters.all(|character| {
+			character.is_ascii_alphanumeric() || character == '_' || character == '$'
+		})
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct RepositoryProperties {
 	name: String,
@@ -2489,7 +2616,46 @@ fn route_properties(node: &Node) -> Result<RouteProperties, Box<Diagnostic>> {
 		));
 	}
 
-	Ok(RouteProperties { method, path })
+	let request_entity = optional_identifier_property(
+		node,
+		"HTTP Route",
+		HTTP_ROUTE_REQUEST_ENTITY_PROPERTY,
+		"BACKEND_DSL.HTTP_ROUTE_REQUEST_ENTITY_TYPE",
+		"BACKEND_DSL.HTTP_ROUTE_REQUEST_ENTITY_INVALID",
+	)?;
+
+	Ok(RouteProperties {
+		method,
+		path,
+		request_entity,
+	})
+}
+
+fn optional_identifier_property(
+	node: &Node,
+	owner: &str,
+	key: &str,
+	type_code: &str,
+	invalid_code: &str,
+) -> Result<Option<String>, Box<Diagnostic>> {
+	let Some(value) = node.properties().get(key) else {
+		return Ok(None);
+	};
+	let Some(value) = value.as_str() else {
+		return Err(node_diagnostic(
+			node,
+			type_code,
+			format!("{owner} property '{key}' must be a non-empty string."),
+		));
+	};
+	if value.trim().is_empty() || value.chars().any(char::is_whitespace) {
+		return Err(node_diagnostic(
+			node,
+			invalid_code,
+			format!("{owner} property '{key}' must be a non-empty string without whitespace."),
+		));
+	}
+	Ok(Some(value.to_string()))
 }
 
 fn node_diagnostic(node: &Node, code: &str, message: impl Into<String>) -> Box<Diagnostic> {
@@ -2694,7 +2860,7 @@ mod tests {
 		let plugin = BackendDslPlugin::new();
 		assert_eq!(plugin.descriptors().len(), 18);
 		assert_eq!(plugin.descriptors()[0].label(), "HTTP Route");
-		assert_eq!(plugin.descriptors()[0].properties().len(), 2);
+		assert_eq!(plugin.descriptors()[0].properties().len(), 3);
 		let cron = plugin
 			.descriptors()
 			.iter()
@@ -3007,13 +3173,19 @@ mod tests {
 		assert_eq!(descriptor.category(), "Persistence");
 		assert!(descriptor.inputs().is_empty());
 		assert!(descriptor.outputs().is_empty());
-		assert_eq!(descriptor.properties().len(), 1);
+		assert_eq!(descriptor.properties().len(), 2);
 		assert_eq!(descriptor.properties()[0].key(), ENTITY_NAME_PROPERTY);
 		assert_eq!(
 			descriptor.properties()[0].kind(),
 			&BackendPropertyKind::STRING
 		);
 		assert!(descriptor.properties()[0].required());
+		assert_eq!(descriptor.properties()[1].key(), ENTITY_FIELDS_PROPERTY);
+		assert_eq!(
+			descriptor.properties()[1].kind(),
+			&BackendPropertyKind::OBJECT
+		);
+		assert!(!descriptor.properties()[1].required());
 
 		let node = Node::new(
 			NodeId::new(2).unwrap(),
@@ -3025,8 +3197,69 @@ mod tests {
 		assert_eq!(lowered.operation().as_str(), ENTITY_NODE_TYPE);
 		assert_eq!(lowered.kind(), LoweredOperationKind::DECLARATION);
 		assert_eq!(lowered.attributes()["backend.entity.name"], "User");
+		assert!(!lowered.attributes().contains_key("backend.entity.fields"));
 		assert!(lowered.input_types().is_empty());
 		assert!(lowered.output_types().is_empty());
+	}
+
+	#[test]
+	fn lowers_entity_fields_as_deterministic_scalar_metadata() {
+		let plugin = BackendDslPlugin::new();
+		let node = Node::new(
+			NodeId::new(2).unwrap(),
+			NodeTypeId::new(ENTITY_NODE_TYPE).unwrap(),
+		)
+		.with_property(ENTITY_NAME_PROPERTY, Value::String("User".to_string()))
+		.unwrap()
+		.with_property(
+			ENTITY_FIELDS_PROPERTY,
+			serde_json::json!({"email": "String", "id": "Integer"}),
+		)
+		.unwrap();
+		let lowered = plugin.lower_node(&node).unwrap();
+
+		assert_eq!(
+			lowered.attributes()["backend.entity.fields"],
+			"{\"email\":\"String\",\"id\":\"Integer\"}"
+		);
+	}
+
+	#[test]
+	fn rejects_invalid_entity_field_schemas() {
+		let plugin = BackendDslPlugin::new();
+		let base = Node::new(
+			NodeId::new(2).unwrap(),
+			NodeTypeId::new(ENTITY_NODE_TYPE).unwrap(),
+		)
+		.with_property(ENTITY_NAME_PROPERTY, Value::String("User".to_string()))
+		.unwrap();
+		let wrong_shape = base
+			.clone()
+			.with_property(ENTITY_FIELDS_PROPERTY, Value::String("id".to_string()))
+			.unwrap();
+		let wrong_type = base
+			.clone()
+			.with_property(ENTITY_FIELDS_PROPERTY, serde_json::json!({"id": 1}))
+			.unwrap();
+		let unsupported = base
+			.with_property(
+				ENTITY_FIELDS_PROPERTY,
+				serde_json::json!({"profile": "UserProfile"}),
+			)
+			.unwrap();
+
+		assert_eq!(
+			plugin.analyze_node(&wrong_shape)[0].code().as_str(),
+			"BACKEND_DSL.ENTITY_FIELDS_TYPE"
+		);
+		assert_eq!(
+			plugin.analyze_node(&wrong_type)[0].code().as_str(),
+			"BACKEND_DSL.ENTITY_FIELD_TYPE"
+		);
+		assert_eq!(
+			plugin.analyze_node(&unsupported)[0].code().as_str(),
+			"BACKEND_DSL.ENTITY_FIELD_TYPE_UNSUPPORTED"
+		);
 	}
 
 	#[test]
@@ -4052,6 +4285,48 @@ mod tests {
 		assert_eq!(lowered.operation().as_str(), HTTP_ROUTE_NODE_TYPE);
 		assert_eq!(lowered.attributes()["backend.http.method"], "GET");
 		assert_eq!(lowered.attributes()["backend.http.path"], "/users");
+	}
+
+	#[test]
+	fn lowers_a_route_request_entity_binding() {
+		let plugin = BackendDslPlugin::new();
+		let node = route(&[
+			("method", Value::String("POST".to_string())),
+			("path", Value::String("/users".to_string())),
+			(
+				HTTP_ROUTE_REQUEST_ENTITY_PROPERTY,
+				Value::String("User".to_string()),
+			),
+		]);
+		let lowered = plugin.lower_node(&node).unwrap();
+
+		assert_eq!(lowered.attributes()["backend.http.request_entity"], "User");
+	}
+
+	#[test]
+	fn rejects_a_route_with_an_undeclared_request_entity() {
+		let metadata = krunt_graph_model::GraphMetadata::new(
+			krunt_graph_model::GraphId::new(2).unwrap(),
+			"backend-v1",
+			"krunt-test",
+		)
+		.unwrap();
+		let mut builder = krunt_graph_model::GraphBuilder::new(metadata);
+		builder
+			.add_node(route(&[
+				("method", Value::String("POST".to_string())),
+				("path", Value::String("/users".to_string())),
+				(
+					HTTP_ROUTE_REQUEST_ENTITY_PROPERTY,
+					Value::String("Missing".to_string()),
+				),
+			]))
+			.unwrap();
+		let diagnostics = BackendDslPlugin::new().analyze_graph(&builder.build().unwrap());
+
+		assert!(diagnostics.iter().any(|diagnostic| {
+			diagnostic.code().as_str() == "BACKEND_DSL.HTTP_ROUTE_REQUEST_ENTITY_NOT_FOUND"
+		}));
 	}
 
 	#[test]
