@@ -1092,6 +1092,7 @@ mod tests {
 		SUCCESS_RESPONSE_NODE_TYPE, TRANSFORM_NODE_TYPE, VALIDATION_ERROR_NODE_TYPE,
 	};
 	use krunt_codegen_typescript::TypeScriptBackend;
+	use krunt_framework_backend::GeneratedProject;
 	use krunt_graph_model::{
 		Edge, EdgeId, EdgeKind, GraphBuilder, GraphId, GraphMetadata, Node, NodeId, NodeTypeId,
 		Port, PortDirection, PortId, PortKind, TypeReference,
@@ -1102,6 +1103,11 @@ mod tests {
 	};
 	use krunt_plugin_api::PluginRegistry;
 	use serde_json::Value;
+	use std::fs;
+	use std::process::Command;
+	use std::sync::atomic::{AtomicUsize, Ordering};
+
+	static TYPECHECK_DIRECTORY_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 	fn program() -> TypeScriptProgram {
 		let mut builder = IRBuilder::new();
@@ -1543,6 +1549,92 @@ mod tests {
 		builder.build().unwrap()
 	}
 
+	fn assert_generated_project_typechecks(project: &GeneratedProject, label: &str) {
+		let directory = std::env::temp_dir().join(format!(
+			"krunt-generated-{label}-{}-{}",
+			std::process::id(),
+			TYPECHECK_DIRECTORY_COUNTER.fetch_add(1, Ordering::Relaxed)
+		));
+		fs::create_dir_all(&directory).expect("create generated project typecheck directory");
+
+		for (path, content) in project.files() {
+			let file_path = directory.join(path);
+			if let Some(parent) = file_path.parent() {
+				fs::create_dir_all(parent).expect("create generated project file directory");
+			}
+			fs::write(file_path, content).expect("write generated project file");
+		}
+		fs::write(directory.join("typecheck-stubs.d.ts"), TYPECHECK_STUBS)
+			.expect("write generated project typecheck stubs");
+		fs::write(
+			directory.join("tsconfig.typecheck.json"),
+			TYPECHECK_TSCONFIG,
+		)
+		.expect("write generated project typecheck configuration");
+
+		let tsc = std::env::var("KRUNT_TSC").unwrap_or_else(|_| "tsc".to_string());
+		let output = Command::new(&tsc)
+			.args(["-p", "tsconfig.typecheck.json", "--pretty", "false"])
+			.current_dir(&directory)
+			.output()
+			.unwrap_or_else(|error| {
+				panic!(
+					"generated project typecheck could not start for {label} using {tsc}: {error}. Set KRUNT_TSC to a TypeScript compiler path."
+				)
+			});
+
+		if !output.status.success() {
+			let stdout = String::from_utf8_lossy(&output.stdout);
+			let stderr = String::from_utf8_lossy(&output.stderr);
+			panic!(
+				"generated project typecheck failed for {label} in {}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+				directory.display()
+			);
+		}
+
+		fs::remove_dir_all(&directory).expect("remove generated project typecheck directory");
+	}
+
+	const TYPECHECK_TSCONFIG: &str = r#"{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "incremental": false,
+    "types": [],
+    "lib": ["ES2021", "DOM"]
+  },
+  "include": ["src/**/*.ts", "typecheck-stubs.d.ts"]
+}
+"#;
+
+	const TYPECHECK_STUBS: &str = r#"declare module '@nestjs/common' {
+  export function Controller(prefix?: string): ClassDecorator;
+  export function Delete(path?: string): MethodDecorator;
+  export function Get(path?: string): MethodDecorator;
+  export function Head(path?: string): MethodDecorator;
+  export function HttpCode(status: number): MethodDecorator;
+  export function Options(path?: string): MethodDecorator;
+  export function Patch(path?: string): MethodDecorator;
+  export function Post(path?: string): MethodDecorator;
+  export function Put(path?: string): MethodDecorator;
+  export function Req(): ParameterDecorator;
+  export function Module(metadata: unknown): ClassDecorator;
+  export class HttpException extends Error {
+    constructor(response: unknown, status: number);
+  }
+}
+
+declare module '@nestjs/core' {
+  export const NestFactory: {
+    create(module: unknown): Promise<{ listen(port: number): Promise<void> }>;
+  };
+}
+
+declare const process: {
+  env: Record<string, string | undefined>;
+};
+"#;
+
 	#[test]
 	fn generates_a_deterministic_nestjs_project() {
 		let first = NestJsBackend::generate_project(&program()).unwrap();
@@ -1746,6 +1838,56 @@ mod tests {
 			.file("src/generated.ts")
 			.unwrap()
 			.contains("runtime.query(\"ListUsers\", \"UserRepository\")"));
+	}
+
+	#[test]
+	fn generated_success_and_error_projects_pass_the_quality_gate() {
+		let cases = [
+			(
+				"success",
+				backend_dsl_program(),
+				"return execute_1(request);",
+				"@HttpCode(201)",
+			),
+			(
+				"error",
+				backend_dsl_error_program(),
+				"throw new HttpException(result ?? 'Request failed', 422);",
+				"@HttpCode(422)",
+			),
+		];
+
+		for (label, program, route_semantics, status_decorator) in cases {
+			let project = NestJsBackend::generate_project(&program).unwrap();
+			let regenerated = NestJsBackend::generate_project(&program).unwrap();
+			assert_eq!(
+				project, regenerated,
+				"generation must be deterministic: {label}"
+			);
+			assert_eq!(
+				project
+					.files()
+					.keys()
+					.map(String::as_str)
+					.collect::<Vec<_>>(),
+				vec![
+					"README.md",
+					"package.json",
+					"src/app.controller.ts",
+					"src/app.module.ts",
+					"src/generated.ts",
+					"src/main.ts",
+					"tsconfig.build.json",
+					"tsconfig.json",
+				],
+				"golden file tree changed: {label}"
+			);
+			let controller = project.file("src/app.controller.ts").unwrap();
+			assert!(controller.contains("// krunt:source=node:1"));
+			assert!(controller.contains(route_semantics));
+			assert!(controller.contains(status_decorator));
+			assert_generated_project_typechecks(&project, label);
+		}
 	}
 
 	#[test]
