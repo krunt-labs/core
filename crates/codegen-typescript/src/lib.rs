@@ -480,10 +480,22 @@ fn lower_function(
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TypeScriptRenderError {
 	EMPTY_MODULE_PATH,
-	ABSOLUTE_MODULE_PATH { path: String },
-	PATH_TRAVERSAL { path: String },
-	BACKSLASH_MODULE_PATH { path: String },
-	DUPLICATE_MODULE_PATH { path: String },
+	ABSOLUTE_MODULE_PATH {
+		path: String,
+	},
+	PATH_TRAVERSAL {
+		path: String,
+	},
+	BACKSLASH_MODULE_PATH {
+		path: String,
+	},
+	DUPLICATE_MODULE_PATH {
+		path: String,
+	},
+	UNSUPPORTED_SUBGRAPH {
+		operation_id: u32,
+		subgraph_id: String,
+	},
 }
 
 impl fmt::Display for TypeScriptRenderError {
@@ -505,6 +517,13 @@ impl fmt::Display for TypeScriptRenderError {
 					"TypeScript program contains duplicate module path: {path}"
 				)
 			}
+			Self::UNSUPPORTED_SUBGRAPH {
+				operation_id,
+				subgraph_id,
+			} => write!(
+				f,
+				"TypeScript operation {operation_id} references unsupported subgraph {subgraph_id}; subgraph bodies are not present in the language IR."
+			),
 		}
 	}
 }
@@ -520,6 +539,9 @@ impl TypeScriptSourceRenderer {
 	pub fn render_program(
 		program: &TypeScriptProgram,
 	) -> Result<BTreeMap<String, String>, TypeScriptRenderError> {
+		if let Some(error) = unsupported_subgraph(program) {
+			return Err(error);
+		}
 		let mut files = BTreeMap::new();
 		for module in program.modules() {
 			validate_module_path(module.path())?;
@@ -534,6 +556,27 @@ impl TypeScriptSourceRenderer {
 		}
 		Ok(files)
 	}
+}
+
+fn unsupported_subgraph(program: &TypeScriptProgram) -> Option<TypeScriptRenderError> {
+	program
+		.modules()
+		.iter()
+		.flat_map(|module| module.functions())
+		.flat_map(|function| function.operations())
+		.find_map(|operation| {
+			if !matches!(operation.kind(), TypeScriptOperationKind::SUBGRAPH) {
+				return None;
+			}
+			Some(TypeScriptRenderError::UNSUPPORTED_SUBGRAPH {
+				operation_id: operation.id().as_u32(),
+				subgraph_id: operation
+					.attributes()
+					.get("backend.subgraph.id")
+					.cloned()
+					.unwrap_or_else(|| "<unknown>".to_string()),
+			})
+		})
 }
 
 fn render_module(module: &TypeScriptModule) -> String {
@@ -2196,12 +2239,14 @@ mod tests {
 			},
 			IRNode {
 				id: krunt_ir::IrNodeId(7),
-				op: IROp::SUBGRAPH,
+				op: IROp::OPERATION {
+					name: OperationId::new("after_merge").unwrap(),
+				},
 				input_types: Vec::new(),
 				output_types: Vec::new(),
 				async_kind: AsyncKind::SYNC,
 				effects: Vec::new(),
-				attributes: BTreeMap::from([("backend.subgraph.id".to_string(), "9".to_string())]),
+				attributes: BTreeMap::new(),
 				returns: false,
 				source: SourceMap::node(GraphNodeId(70)),
 			},
@@ -2296,9 +2341,61 @@ mod tests {
 
 		assert!(source.contains("let operation_2: Boolean = undefined as Boolean;"));
 		assert!(source.contains("control = operation_2 ? 4 : 5;"));
-		assert!(source.contains("// krunt:subgraph=9"));
 		assert!(source.contains("control = operation_2 ? 9 : 10;"));
 		assert!(source.contains("control = 8;"));
 		assert!(!source.contains(": unknown = undefined"));
+	}
+
+	#[test]
+	fn rejects_subgraph_operations_until_the_ir_defines_subgraph_bodies() {
+		let mut builder = IRBuilder::new();
+		for (id, operation) in [
+			(
+				1,
+				IROp::ENTRY {
+					name: OperationId::new("start").unwrap(),
+				},
+			),
+			(2, IROp::SUBGRAPH),
+		] {
+			builder
+				.add_node(IRNode {
+					id: krunt_ir::IrNodeId(id),
+					op: operation,
+					input_types: Vec::new(),
+					output_types: Vec::new(),
+					async_kind: AsyncKind::SYNC,
+					effects: Vec::new(),
+					attributes: if id == 2 {
+						BTreeMap::from([("backend.subgraph.id".to_string(), "9".to_string())])
+					} else {
+						BTreeMap::new()
+					},
+					returns: false,
+					source: SourceMap::node(GraphNodeId(id as u64 * 10)),
+				})
+				.unwrap();
+		}
+		builder
+			.add_control_edge(ControlEdge {
+				from: PortRef {
+					node: krunt_ir::IrNodeId(1),
+					index: 0,
+				},
+				to: PortRef {
+					node: krunt_ir::IrNodeId(2),
+					index: 0,
+				},
+			})
+			.unwrap();
+
+		let program = TypeScriptBackend::lower_graph(&builder.build().unwrap()).unwrap();
+		assert_eq!(
+			TypeScriptSourceRenderer::render_program(&program),
+			Err(TypeScriptRenderError::UNSUPPORTED_SUBGRAPH {
+				operation_id: 2,
+				subgraph_id: "9".to_string(),
+			})
+		);
 	}
 }
