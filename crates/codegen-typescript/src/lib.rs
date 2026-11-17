@@ -611,23 +611,35 @@ fn render_function(function: &TypeScriptFunction) -> String {
 
 	let data_inputs = data_inputs(function);
 	let output_arities = output_arities(function);
-	for operation in &function.operations {
-		source.push_str("  // krunt:source=");
-		source.push_str(&source_marker(operation.source()));
-		source.push('\n');
-		source.push_str("  // krunt:operation=");
-		source.push_str(&operation.id.as_u32().to_string());
-		source.push(' ');
-		source.push_str(&render_operation_kind(operation.kind()));
-		source.push('\n');
-		if !operation.input_types.is_empty() || !operation.output_types.is_empty() {
-			source.push_str("  // krunt:types=");
-			source.push_str(&render_types(&operation.input_types));
-			source.push_str(" -> ");
-			source.push_str(&render_types(&operation.output_types));
-			source.push('\n');
-		}
+	if has_structured_control_flow(function) {
+		render_structured_function_body(&mut source, function, &data_inputs, &output_arities);
+	} else {
+		render_linear_function_body(&mut source, function, &data_inputs, &output_arities);
+	}
+	source.push_str("}\n");
+	source
+}
 
+fn has_structured_control_flow(function: &TypeScriptFunction) -> bool {
+	function.operations.iter().any(|operation| {
+		matches!(
+			operation.kind(),
+			TypeScriptOperationKind::BRANCH
+				| TypeScriptOperationKind::MERGE
+				| TypeScriptOperationKind::LOOP
+				| TypeScriptOperationKind::SUBGRAPH
+		)
+	})
+}
+
+fn render_linear_function_body(
+	source: &mut String,
+	function: &TypeScriptFunction,
+	data_inputs: &BTreeMap<TypeScriptOperationId, Vec<Option<TypeScriptPortRef>>>,
+	output_arities: &BTreeMap<TypeScriptOperationId, usize>,
+) {
+	for operation in &function.operations {
+		render_operation_comments(source, operation, "  ");
 		match operation.kind() {
 			TypeScriptOperationKind::DECLARATION { .. } => {}
 			TypeScriptOperationKind::ENTRY { name }
@@ -637,36 +649,213 @@ fn render_function(function: &TypeScriptFunction) -> String {
 					source.push_str(&operation_variable(operation.id));
 					source.push_str(" = request;\n");
 				} else {
-					render_named_operation(
-						&mut source,
-						operation,
-						name,
-						&data_inputs,
-						&output_arities,
-					);
+					render_named_operation(source, operation, name, data_inputs, output_arities);
 				}
 			}
 			TypeScriptOperationKind::BRANCH
 			| TypeScriptOperationKind::MERGE
 			| TypeScriptOperationKind::LOOP
 			| TypeScriptOperationKind::SUBGRAPH => {
-				source.push_str("  const ");
-				source.push_str(&operation_variable(operation.id));
-				source.push_str(": unknown = undefined;\n");
+				unreachable!("structured control flow is rendered by the structured body renderer")
 			}
 			TypeScriptOperationKind::RETURN => {
-				if let Some(value) = first_data_input(operation.id, &data_inputs) {
-					source.push_str("  return ");
-					source.push_str(&render_data_reference(value, &output_arities));
-					source.push_str(";\n");
-				} else {
-					source.push_str("  return;\n");
-				}
+				render_return(source, operation, data_inputs, output_arities, "  ");
 			}
 		}
 	}
-	source.push_str("}\n");
-	source
+}
+
+fn render_structured_function_body(
+	source: &mut String,
+	function: &TypeScriptFunction,
+	data_inputs: &BTreeMap<TypeScriptOperationId, Vec<Option<TypeScriptPortRef>>>,
+	output_arities: &BTreeMap<TypeScriptOperationId, usize>,
+) {
+	for operation in &function.operations {
+		if operation.output_types.is_empty() {
+			continue;
+		}
+		source.push_str("  let ");
+		source.push_str(&operation_variable(operation.id));
+		source.push_str(": ");
+		source.push_str(&render_operation_output_type(operation));
+		source.push_str(" = undefined as ");
+		source.push_str(&render_operation_output_type(operation));
+		source.push_str(";\n");
+	}
+
+	let start = function
+		.operations
+		.iter()
+		.find(|operation| matches!(operation.kind(), TypeScriptOperationKind::ENTRY { .. }))
+		.map(|operation| operation.id.as_u32());
+	source.push_str("  let control: number | null = ");
+	source.push_str(
+		&start
+			.map(|id| id.to_string())
+			.unwrap_or_else(|| "null".to_string()),
+	);
+	source.push_str(";\n");
+	source.push_str("  while (control !== null) {\n");
+	source.push_str("    switch (control) {\n");
+
+	for operation in &function.operations {
+		if matches!(
+			operation.kind(),
+			TypeScriptOperationKind::DECLARATION { .. }
+		) {
+			continue;
+		}
+		source.push_str("      case ");
+		source.push_str(&operation.id.as_u32().to_string());
+		source.push_str(": {\n");
+		render_operation_comments(source, operation, "        ");
+
+		match operation.kind() {
+			TypeScriptOperationKind::ENTRY { name }
+			| TypeScriptOperationKind::OPERATION { name } => {
+				if is_http_entry(operation) {
+					source.push_str("        ");
+					source.push_str(&operation_variable(operation.id));
+					source.push_str(" = request;\n");
+				} else if matches!(operation.kind(), TypeScriptOperationKind::OPERATION { .. }) {
+					render_named_operation_with_assignment(
+						source,
+						operation,
+						name,
+						data_inputs,
+						output_arities,
+						true,
+					);
+				}
+				render_next_control(source, function, operation, 0, "        ");
+				source.push_str("        break;\n");
+			}
+			TypeScriptOperationKind::BRANCH => {
+				let condition = data_input_expression(operation.id, 0, data_inputs, output_arities);
+				let when_true = control_successor(function, operation.id, 0);
+				let when_false = control_successor(function, operation.id, 1);
+				source.push_str("        control = ");
+				source.push_str(&condition);
+				source.push_str(" ? ");
+				source.push_str(&render_control_target(when_true));
+				source.push_str(" : ");
+				source.push_str(&render_control_target(when_false));
+				source.push_str(";\n");
+				source.push_str("        break;\n");
+			}
+			TypeScriptOperationKind::LOOP => {
+				let condition = data_input_expression(operation.id, 0, data_inputs, output_arities);
+				let body = control_successor(function, operation.id, 0);
+				let done = control_successor(function, operation.id, 1);
+				source.push_str("        control = ");
+				source.push_str(&condition);
+				source.push_str(" ? ");
+				source.push_str(&render_control_target(body));
+				source.push_str(" : ");
+				source.push_str(&render_control_target(done));
+				source.push_str(";\n");
+				source.push_str("        break;\n");
+			}
+			TypeScriptOperationKind::MERGE | TypeScriptOperationKind::SUBGRAPH => {
+				if matches!(operation.kind(), TypeScriptOperationKind::SUBGRAPH) {
+					if let Some(subgraph_id) = operation.attributes().get("backend.subgraph.id") {
+						source.push_str("        // krunt:subgraph=");
+						source.push_str(subgraph_id);
+						source.push('\n');
+					}
+				}
+				render_next_control(source, function, operation, 0, "        ");
+				source.push_str("        break;\n");
+			}
+			TypeScriptOperationKind::RETURN => {
+				render_return(source, operation, data_inputs, output_arities, "        ");
+			}
+			TypeScriptOperationKind::DECLARATION { .. } => unreachable!(),
+		}
+		source.push_str("      }\n");
+	}
+
+	source.push_str("      default: {\n");
+	source.push_str("        control = null;\n");
+	source.push_str("        break;\n");
+	source.push_str("      }\n");
+	source.push_str("    }\n");
+	source.push_str("  }\n");
+	source.push_str("  return undefined as never;\n");
+}
+
+fn render_operation_comments(source: &mut String, operation: &TypeScriptOperation, indent: &str) {
+	source.push_str(indent);
+	source.push_str("// krunt:source=");
+	source.push_str(&source_marker(operation.source()));
+	source.push('\n');
+	source.push_str(indent);
+	source.push_str("// krunt:operation=");
+	source.push_str(&operation.id.as_u32().to_string());
+	source.push(' ');
+	source.push_str(&render_operation_kind(operation.kind()));
+	source.push('\n');
+	if !operation.input_types.is_empty() || !operation.output_types.is_empty() {
+		source.push_str(indent);
+		source.push_str("// krunt:types=");
+		source.push_str(&render_types(&operation.input_types));
+		source.push_str(" -> ");
+		source.push_str(&render_types(&operation.output_types));
+		source.push('\n');
+	}
+}
+
+fn render_return(
+	source: &mut String,
+	operation: &TypeScriptOperation,
+	data_inputs: &BTreeMap<TypeScriptOperationId, Vec<Option<TypeScriptPortRef>>>,
+	output_arities: &BTreeMap<TypeScriptOperationId, usize>,
+	indent: &str,
+) {
+	source.push_str(indent);
+	source.push_str("return ");
+	if let Some(value) = first_data_input(operation.id, data_inputs) {
+		source.push_str(&render_data_reference(value, output_arities));
+	} else {
+		source.push_str("undefined as never");
+	}
+	source.push_str(";\n");
+}
+
+fn control_successor(
+	function: &TypeScriptFunction,
+	operation: TypeScriptOperationId,
+	output_index: u16,
+) -> Option<TypeScriptOperationId> {
+	function
+		.control_edges
+		.iter()
+		.find(|edge| edge.from.node == operation && edge.from.index == output_index)
+		.map(|edge| edge.to.node)
+}
+
+fn render_control_target(target: Option<TypeScriptOperationId>) -> String {
+	target
+		.map(|id| id.as_u32().to_string())
+		.unwrap_or_else(|| "null".to_string())
+}
+
+fn render_next_control(
+	source: &mut String,
+	function: &TypeScriptFunction,
+	operation: &TypeScriptOperation,
+	output_index: u16,
+	indent: &str,
+) {
+	source.push_str(indent);
+	source.push_str("control = ");
+	source.push_str(&render_control_target(control_successor(
+		function,
+		operation.id,
+		output_index,
+	)));
+	source.push_str(";\n");
 }
 
 fn http_request_parameter(function: &TypeScriptFunction) -> String {
@@ -795,8 +984,30 @@ fn render_named_operation(
 	data_inputs: &BTreeMap<TypeScriptOperationId, Vec<Option<TypeScriptPortRef>>>,
 	output_arities: &BTreeMap<TypeScriptOperationId, usize>,
 ) {
+	render_named_operation_with_assignment(
+		source,
+		operation,
+		name,
+		data_inputs,
+		output_arities,
+		false,
+	);
+}
+
+fn render_named_operation_with_assignment(
+	source: &mut String,
+	operation: &TypeScriptOperation,
+	name: &str,
+	data_inputs: &BTreeMap<TypeScriptOperationId, Vec<Option<TypeScriptPortRef>>>,
+	output_arities: &BTreeMap<TypeScriptOperationId, usize>,
+	mutable_assignment: bool,
+) {
 	if is_identity_transform(operation) {
-		source.push_str("  const ");
+		if mutable_assignment {
+			source.push_str("        ");
+		} else {
+			source.push_str("  const ");
+		}
 		source.push_str(&operation_variable(operation.id));
 		source.push_str(" = ");
 		if let Some(value) = first_data_input(operation.id, data_inputs) {
@@ -808,7 +1019,7 @@ fn render_named_operation(
 		return;
 	}
 	if let Some(invocation) = runtime_invocation(operation, data_inputs, output_arities) {
-		render_invocation(source, operation, &invocation);
+		render_invocation(source, operation, &invocation, mutable_assignment);
 		return;
 	}
 
@@ -827,10 +1038,20 @@ fn render_named_operation(
 				.join(", ")
 		})
 		.unwrap_or_default();
-	render_invocation(source, operation, &format!("{}({})", callee, arguments));
+	render_invocation(
+		source,
+		operation,
+		&format!("{}({})", callee, arguments),
+		mutable_assignment,
+	);
 }
 
-fn render_invocation(source: &mut String, operation: &TypeScriptOperation, invocation: &str) {
+fn render_invocation(
+	source: &mut String,
+	operation: &TypeScriptOperation,
+	invocation: &str,
+	mutable_assignment: bool,
+) {
 	let await_prefix = if operation.async_kind == AsyncKind::ASYNC {
 		"await "
 	} else {
@@ -838,12 +1059,21 @@ fn render_invocation(source: &mut String, operation: &TypeScriptOperation, invoc
 	};
 	let invocation = format!("{await_prefix}{invocation}");
 	if operation.output_types.is_empty() {
-		source.push_str("  ");
+		if mutable_assignment {
+			source.push_str("        ");
+		} else {
+			source.push_str("  ");
+		}
 		source.push_str(&invocation);
 		source.push_str(";\n");
 	} else {
-		source.push_str("  const ");
-		source.push_str(&operation_variable(operation.id));
+		if mutable_assignment {
+			source.push_str("        ");
+			source.push_str(&operation_variable(operation.id));
+		} else {
+			source.push_str("  const ");
+			source.push_str(&operation_variable(operation.id));
+		}
 		source.push_str(" = ");
 		source.push_str(&invocation);
 		source.push_str(";\n");
@@ -1884,5 +2114,191 @@ mod tests {
 		assert!(source.contains("runtime.storageRead(\"last-response\")"));
 		assert!(!source.contains("declare function krunt_backend_http_request"));
 		assert!(source.contains("// krunt:source=node:20"));
+	}
+
+	#[test]
+	fn renders_typed_structured_control_flow_from_execution_ports() {
+		let mut builder = IRBuilder::new();
+		let nodes = vec![
+			IRNode {
+				id: krunt_ir::IrNodeId(1),
+				op: IROp::ENTRY {
+					name: OperationId::new("start").unwrap(),
+				},
+				input_types: Vec::new(),
+				output_types: Vec::new(),
+				async_kind: AsyncKind::SYNC,
+				effects: Vec::new(),
+				attributes: BTreeMap::new(),
+				returns: false,
+				source: SourceMap::node(GraphNodeId(10)),
+			},
+			IRNode {
+				id: krunt_ir::IrNodeId(2),
+				op: IROp::OPERATION {
+					name: OperationId::new("predicate").unwrap(),
+				},
+				input_types: Vec::new(),
+				output_types: vec![TypeId::new("Boolean").unwrap()],
+				async_kind: AsyncKind::SYNC,
+				effects: Vec::new(),
+				attributes: BTreeMap::new(),
+				returns: false,
+				source: SourceMap::node(GraphNodeId(20)),
+			},
+			IRNode {
+				id: krunt_ir::IrNodeId(3),
+				op: IROp::BRANCH,
+				input_types: vec![TypeId::new("Boolean").unwrap()],
+				output_types: Vec::new(),
+				async_kind: AsyncKind::SYNC,
+				effects: Vec::new(),
+				attributes: BTreeMap::new(),
+				returns: false,
+				source: SourceMap::node(GraphNodeId(30)),
+			},
+			IRNode {
+				id: krunt_ir::IrNodeId(4),
+				op: IROp::OPERATION {
+					name: OperationId::new("when_true").unwrap(),
+				},
+				input_types: Vec::new(),
+				output_types: vec![TypeId::new("String").unwrap()],
+				async_kind: AsyncKind::SYNC,
+				effects: Vec::new(),
+				attributes: BTreeMap::new(),
+				returns: false,
+				source: SourceMap::node(GraphNodeId(40)),
+			},
+			IRNode {
+				id: krunt_ir::IrNodeId(5),
+				op: IROp::OPERATION {
+					name: OperationId::new("when_false").unwrap(),
+				},
+				input_types: Vec::new(),
+				output_types: vec![TypeId::new("String").unwrap()],
+				async_kind: AsyncKind::SYNC,
+				effects: Vec::new(),
+				attributes: BTreeMap::new(),
+				returns: false,
+				source: SourceMap::node(GraphNodeId(50)),
+			},
+			IRNode {
+				id: krunt_ir::IrNodeId(6),
+				op: IROp::MERGE,
+				input_types: Vec::new(),
+				output_types: Vec::new(),
+				async_kind: AsyncKind::SYNC,
+				effects: Vec::new(),
+				attributes: BTreeMap::new(),
+				returns: false,
+				source: SourceMap::node(GraphNodeId(60)),
+			},
+			IRNode {
+				id: krunt_ir::IrNodeId(7),
+				op: IROp::SUBGRAPH,
+				input_types: Vec::new(),
+				output_types: Vec::new(),
+				async_kind: AsyncKind::SYNC,
+				effects: Vec::new(),
+				attributes: BTreeMap::from([("backend.subgraph.id".to_string(), "9".to_string())]),
+				returns: false,
+				source: SourceMap::node(GraphNodeId(70)),
+			},
+			IRNode {
+				id: krunt_ir::IrNodeId(8),
+				op: IROp::LOOP,
+				input_types: vec![TypeId::new("Boolean").unwrap()],
+				output_types: Vec::new(),
+				async_kind: AsyncKind::SYNC,
+				effects: Vec::new(),
+				attributes: BTreeMap::new(),
+				returns: false,
+				source: SourceMap::node(GraphNodeId(80)),
+			},
+			IRNode {
+				id: krunt_ir::IrNodeId(9),
+				op: IROp::OPERATION {
+					name: OperationId::new("body").unwrap(),
+				},
+				input_types: Vec::new(),
+				output_types: Vec::new(),
+				async_kind: AsyncKind::SYNC,
+				effects: Vec::new(),
+				attributes: BTreeMap::new(),
+				returns: false,
+				source: SourceMap::node(GraphNodeId(90)),
+			},
+			IRNode {
+				id: krunt_ir::IrNodeId(10),
+				op: IROp::OPERATION {
+					name: OperationId::new("done").unwrap(),
+				},
+				input_types: Vec::new(),
+				output_types: Vec::new(),
+				async_kind: AsyncKind::SYNC,
+				effects: Vec::new(),
+				attributes: BTreeMap::new(),
+				returns: false,
+				source: SourceMap::node(GraphNodeId(100)),
+			},
+		];
+		for node in nodes {
+			builder.add_node(node).unwrap();
+		}
+		for (from, from_index, to, to_index) in [
+			(1, 0, 2, 0),
+			(2, 0, 3, 0),
+			(3, 0, 4, 0),
+			(3, 1, 5, 0),
+			(4, 0, 6, 0),
+			(5, 0, 6, 1),
+			(6, 0, 7, 0),
+			(7, 0, 8, 0),
+			(8, 0, 9, 0),
+			(9, 0, 8, 1),
+			(8, 1, 10, 0),
+		] {
+			builder
+				.add_control_edge(ControlEdge {
+					from: PortRef {
+						node: krunt_ir::IrNodeId(from),
+						index: from_index,
+					},
+					to: PortRef {
+						node: krunt_ir::IrNodeId(to),
+						index: to_index,
+					},
+				})
+				.unwrap();
+		}
+		for (from, to) in [(2, 3), (2, 8)] {
+			builder
+				.add_data_edge(DataEdge {
+					from: PortRef {
+						node: krunt_ir::IrNodeId(from),
+						index: 0,
+					},
+					to: PortRef {
+						node: krunt_ir::IrNodeId(to),
+						index: 0,
+					},
+				})
+				.unwrap();
+		}
+
+		let source = TypeScriptSourceRenderer::render_program(
+			&TypeScriptBackend::lower_graph(&builder.build().unwrap()).unwrap(),
+		)
+		.unwrap()
+		.remove("generated.ts")
+		.unwrap();
+
+		assert!(source.contains("let operation_2: Boolean = undefined as Boolean;"));
+		assert!(source.contains("control = operation_2 ? 4 : 5;"));
+		assert!(source.contains("// krunt:subgraph=9"));
+		assert!(source.contains("control = operation_2 ? 9 : 10;"));
+		assert!(source.contains("control = 8;"));
+		assert!(!source.contains(": unknown = undefined"));
 	}
 }
