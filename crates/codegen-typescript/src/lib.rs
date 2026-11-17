@@ -610,6 +610,7 @@ fn render_function(function: &TypeScriptFunction) -> String {
 	));
 
 	let data_inputs = data_inputs(function);
+	let output_arities = output_arities(function);
 	for operation in &function.operations {
 		source.push_str("  // krunt:source=");
 		source.push_str(&source_marker(operation.source()));
@@ -636,7 +637,13 @@ fn render_function(function: &TypeScriptFunction) -> String {
 					source.push_str(&operation_variable(operation.id));
 					source.push_str(" = request;\n");
 				} else {
-					render_named_operation(&mut source, operation, name, &data_inputs);
+					render_named_operation(
+						&mut source,
+						operation,
+						name,
+						&data_inputs,
+						&output_arities,
+					);
 				}
 			}
 			TypeScriptOperationKind::BRANCH
@@ -650,7 +657,7 @@ fn render_function(function: &TypeScriptFunction) -> String {
 			TypeScriptOperationKind::RETURN => {
 				if let Some(value) = first_data_input(operation.id, &data_inputs) {
 					source.push_str("  return ");
-					source.push_str(&operation_variable(value));
+					source.push_str(&render_data_reference(value, &output_arities));
 					source.push_str(";\n");
 				} else {
 					source.push_str("  return;\n");
@@ -723,11 +730,11 @@ fn render_operation_declaration(operation: &TypeScriptOperation, name: &str) -> 
 		})
 		.collect::<Vec<_>>()
 		.join(", ");
-	let output_type = operation
-		.output_types()
-		.first()
-		.map(|type_value| render_type_annotation(Some(type_value)))
-		.unwrap_or_else(|| "void".to_string());
+	let output_type = if operation.output_types().is_empty() {
+		"void".to_string()
+	} else {
+		render_operation_output_type(operation)
+	};
 	let return_type = if operation.async_kind() == AsyncKind::ASYNC {
 		format!("Promise<{output_type}>")
 	} else {
@@ -785,21 +792,22 @@ fn render_named_operation(
 	source: &mut String,
 	operation: &TypeScriptOperation,
 	name: &str,
-	data_inputs: &BTreeMap<TypeScriptOperationId, Vec<Option<TypeScriptOperationId>>>,
+	data_inputs: &BTreeMap<TypeScriptOperationId, Vec<Option<TypeScriptPortRef>>>,
+	output_arities: &BTreeMap<TypeScriptOperationId, usize>,
 ) {
 	if is_identity_transform(operation) {
 		source.push_str("  const ");
 		source.push_str(&operation_variable(operation.id));
 		source.push_str(" = ");
 		if let Some(value) = first_data_input(operation.id, data_inputs) {
-			source.push_str(&operation_variable(value));
+			source.push_str(&render_data_reference(value, output_arities));
 		} else {
 			source.push_str("undefined");
 		}
 		source.push_str(";\n");
 		return;
 	}
-	if let Some(invocation) = runtime_invocation(operation, data_inputs) {
+	if let Some(invocation) = runtime_invocation(operation, data_inputs, output_arities) {
 		render_invocation(source, operation, &invocation);
 		return;
 	}
@@ -812,7 +820,7 @@ fn render_named_operation(
 				.iter()
 				.map(|input| {
 					input
-						.map(operation_variable)
+						.map(|input| render_data_reference(input, output_arities))
 						.unwrap_or_else(|| "undefined".to_string())
 				})
 				.collect::<Vec<_>>()
@@ -844,9 +852,10 @@ fn render_invocation(source: &mut String, operation: &TypeScriptOperation, invoc
 
 fn runtime_invocation(
 	operation: &TypeScriptOperation,
-	data_inputs: &BTreeMap<TypeScriptOperationId, Vec<Option<TypeScriptOperationId>>>,
+	data_inputs: &BTreeMap<TypeScriptOperationId, Vec<Option<TypeScriptPortRef>>>,
+	output_arities: &BTreeMap<TypeScriptOperationId, usize>,
 ) -> Option<String> {
-	let input = |index| data_input_expression(operation.id, index, data_inputs);
+	let input = |index| data_input_expression(operation.id, index, data_inputs, output_arities);
 	let attributes = operation.attributes();
 	if attributes
 		.get("backend.persistence.kind")
@@ -855,7 +864,7 @@ fn runtime_invocation(
 	{
 		return Some(format!(
 			"runtime.query<{}>({}, {})",
-			render_type_annotation(operation.output_types().first()),
+			render_operation_output_type(operation),
 			string_literal(attributes.get("backend.query.name")?),
 			string_literal(attributes.get("backend.query.repository")?),
 		));
@@ -868,7 +877,7 @@ fn runtime_invocation(
 		return Some(format!(
 			"runtime.mutation<{}, {}>({}, {}, {})",
 			render_type_annotation(operation.input_types().first()),
-			render_type_annotation(operation.output_types().first()),
+			render_operation_output_type(operation),
 			string_literal(attributes.get("backend.mutation.name")?),
 			string_literal(attributes.get("backend.mutation.repository")?),
 			input(0),
@@ -913,15 +922,32 @@ fn render_type_annotation(type_value: Option<&TypeScriptType>) -> String {
 	}
 }
 
+fn render_operation_output_type(operation: &TypeScriptOperation) -> String {
+	match operation.output_types().len() {
+		0 => "unknown".to_string(),
+		1 => render_type_annotation(operation.output_types().first()),
+		_ => format!(
+			"[{}]",
+			operation
+				.output_types()
+				.iter()
+				.map(|type_value| render_type_annotation(Some(type_value)))
+				.collect::<Vec<_>>()
+				.join(", ")
+		),
+	}
+}
+
 fn data_input_expression(
 	operation: TypeScriptOperationId,
 	index: usize,
-	data_inputs: &BTreeMap<TypeScriptOperationId, Vec<Option<TypeScriptOperationId>>>,
+	data_inputs: &BTreeMap<TypeScriptOperationId, Vec<Option<TypeScriptPortRef>>>,
+	output_arities: &BTreeMap<TypeScriptOperationId, usize>,
 ) -> String {
 	data_inputs
 		.get(&operation)
 		.and_then(|inputs| inputs.get(index))
-		.and_then(|input| input.map(operation_variable))
+		.and_then(|input| input.map(|input| render_data_reference(input, output_arities)))
 		.unwrap_or_else(|| "undefined".to_string())
 }
 
@@ -948,13 +974,13 @@ fn escape_double_quoted(value: &str) -> String {
 
 fn data_inputs(
 	function: &TypeScriptFunction,
-) -> BTreeMap<TypeScriptOperationId, Vec<Option<TypeScriptOperationId>>> {
+) -> BTreeMap<TypeScriptOperationId, Vec<Option<TypeScriptPortRef>>> {
 	let mut inputs: BTreeMap<_, BTreeMap<_, _>> = BTreeMap::new();
 	for edge in &function.data_edges {
 		inputs
 			.entry(edge.to.node)
 			.or_default()
-			.insert(edge.to.index, edge.from.node);
+			.insert(edge.to.index, edge.from);
 	}
 	inputs
 		.into_iter()
@@ -973,11 +999,31 @@ fn data_inputs(
 
 fn first_data_input(
 	operation: TypeScriptOperationId,
-	inputs: &BTreeMap<TypeScriptOperationId, Vec<Option<TypeScriptOperationId>>>,
-) -> Option<TypeScriptOperationId> {
+	inputs: &BTreeMap<TypeScriptOperationId, Vec<Option<TypeScriptPortRef>>>,
+) -> Option<TypeScriptPortRef> {
 	inputs
 		.get(&operation)
 		.and_then(|values| values.iter().flatten().next().copied())
+}
+
+fn output_arities(function: &TypeScriptFunction) -> BTreeMap<TypeScriptOperationId, usize> {
+	function
+		.operations
+		.iter()
+		.map(|operation| (operation.id(), operation.output_types().len()))
+		.collect()
+}
+
+fn render_data_reference(
+	port: TypeScriptPortRef,
+	output_arities: &BTreeMap<TypeScriptOperationId, usize>,
+) -> String {
+	let variable = operation_variable(port.node());
+	if output_arities.get(&port.node()).copied().unwrap_or(1) > 1 {
+		format!("{variable}[{}]", port.index())
+	} else {
+		variable
+	}
 }
 
 fn operation_variable(id: TypeScriptOperationId) -> String {
@@ -1402,6 +1448,116 @@ mod tests {
 			.contains("declare function krunt_transform_2(input_0: Request): Promise<Response>;"));
 		assert!(source.contains("const operation_2 = await krunt_transform_2(operation_1);"));
 		assert!(!source.contains("...args: unknown[]"));
+	}
+
+	#[test]
+	fn preserves_source_port_indexes_when_rendering_data_flow() {
+		let mut builder = IRBuilder::new();
+		builder
+			.add_node(IRNode {
+				id: krunt_ir::IrNodeId(1),
+				op: IROp::ENTRY {
+					name: OperationId::new("backend.http_route").unwrap(),
+				},
+				input_types: Vec::new(),
+				output_types: vec![TypeId::new("Request").unwrap()],
+				async_kind: AsyncKind::SYNC,
+				effects: Vec::new(),
+				attributes: BTreeMap::from([
+					("backend.http.method".to_string(), "GET".to_string()),
+					("backend.http.path".to_string(), "/split".to_string()),
+				]),
+				returns: false,
+				source: SourceMap::node(GraphNodeId(10)),
+			})
+			.unwrap();
+		builder
+			.add_node(IRNode {
+				id: krunt_ir::IrNodeId(2),
+				op: IROp::OPERATION {
+					name: OperationId::new("split").unwrap(),
+				},
+				input_types: vec![TypeId::new("Request").unwrap()],
+				output_types: vec![TypeId::new("Left").unwrap(), TypeId::new("Right").unwrap()],
+				async_kind: AsyncKind::SYNC,
+				effects: Vec::new(),
+				attributes: BTreeMap::new(),
+				returns: false,
+				source: SourceMap::node(GraphNodeId(20)),
+			})
+			.unwrap();
+		builder
+			.add_node(IRNode {
+				id: krunt_ir::IrNodeId(3),
+				op: IROp::OPERATION {
+					name: OperationId::new("consume").unwrap(),
+				},
+				input_types: vec![TypeId::new("Right").unwrap()],
+				output_types: vec![TypeId::new("Result").unwrap()],
+				async_kind: AsyncKind::SYNC,
+				effects: Vec::new(),
+				attributes: BTreeMap::new(),
+				returns: false,
+				source: SourceMap::node(GraphNodeId(30)),
+			})
+			.unwrap();
+		builder
+			.add_node(IRNode {
+				id: krunt_ir::IrNodeId(4),
+				op: IROp::RETURN,
+				input_types: vec![TypeId::new("Result").unwrap()],
+				output_types: Vec::new(),
+				async_kind: AsyncKind::SYNC,
+				effects: Vec::new(),
+				attributes: BTreeMap::from([(
+					"response.body_type".to_string(),
+					"Result".to_string(),
+				)]),
+				returns: true,
+				source: SourceMap::node(GraphNodeId(40)),
+			})
+			.unwrap();
+
+		for (from, to) in [(1, 2), (2, 3), (3, 4)] {
+			builder
+				.add_control_edge(ControlEdge {
+					from: PortRef {
+						node: krunt_ir::IrNodeId(from),
+						index: 0,
+					},
+					to: PortRef {
+						node: krunt_ir::IrNodeId(to),
+						index: 0,
+					},
+				})
+				.unwrap();
+		}
+		for (from, from_index, to) in [(1, 0, 2), (2, 1, 3), (3, 0, 4)] {
+			builder
+				.add_data_edge(DataEdge {
+					from: PortRef {
+						node: krunt_ir::IrNodeId(from),
+						index: from_index,
+					},
+					to: PortRef {
+						node: krunt_ir::IrNodeId(to),
+						index: 0,
+					},
+				})
+				.unwrap();
+		}
+
+		let source = TypeScriptSourceRenderer::render_program(
+			&TypeScriptBackend::lower_graph(&builder.build().unwrap()).unwrap(),
+		)
+		.unwrap()
+		.remove("generated.ts")
+		.unwrap();
+
+		assert!(source.contains("declare function krunt_split_2(input_0: Request): [Left, Right];"));
+		assert!(source.contains("declare function krunt_consume_3(input_0: Right): Result;"));
+		assert!(source.contains("const operation_3 = krunt_consume_3(operation_2[1]);"));
+		assert!(source.contains("return operation_3;"));
 	}
 
 	#[test]
