@@ -577,7 +577,7 @@ fn render_function(function: &TypeScriptFunction) -> String {
 	for declaration in declarations.values() {
 		source.push_str("declare function ");
 		source.push_str(declaration);
-		source.push_str("(...args: unknown[]): unknown;\n");
+		source.push('\n');
 	}
 	if !declarations.is_empty() {
 		source.push('\n');
@@ -701,13 +701,42 @@ fn operation_declarations(function: &TypeScriptFunction) -> BTreeMap<String, Str
 				{
 					Some((
 						operation.id.as_u32().to_string(),
-						operation_callee(operation.id, name),
+						render_operation_declaration(operation, name),
 					))
 				}
 				_ => None,
 			}
 		})
 		.collect()
+}
+
+fn render_operation_declaration(operation: &TypeScriptOperation, name: &str) -> String {
+	let parameters = operation
+		.input_types()
+		.iter()
+		.enumerate()
+		.map(|(index, type_value)| {
+			format!(
+				"input_{index}: {}",
+				render_type_annotation(Some(type_value))
+			)
+		})
+		.collect::<Vec<_>>()
+		.join(", ");
+	let output_type = operation
+		.output_types()
+		.first()
+		.map(|type_value| render_type_annotation(Some(type_value)))
+		.unwrap_or_else(|| "void".to_string());
+	let return_type = if operation.async_kind() == AsyncKind::ASYNC {
+		format!("Promise<{output_type}>")
+	} else {
+		output_type
+	};
+	format!(
+		"{}({parameters}): {return_type};",
+		operation_callee(operation.id, name)
+	)
 }
 
 fn is_identity_transform(operation: &TypeScriptOperation) -> bool {
@@ -1358,6 +1387,21 @@ mod tests {
 		assert!(source.contains("const operation_2 = operation_1;"));
 		assert!(source.contains("return operation_2;"));
 		assert!(!source.contains("declare function krunt_backend_transform"));
+	}
+
+	#[test]
+	fn renders_typed_declarations_for_non_runtime_operations() {
+		let source = TypeScriptSourceRenderer::render_program(
+			&TypeScriptBackend::lower_graph(&graph()).unwrap(),
+		)
+		.unwrap()
+		.remove("generated.ts")
+		.unwrap();
+
+		assert!(source
+			.contains("declare function krunt_transform_2(input_0: Request): Promise<Response>;"));
+		assert!(source.contains("const operation_2 = await krunt_transform_2(operation_1);"));
+		assert!(!source.contains("...args: unknown[]"));
 	}
 
 	#[test]
