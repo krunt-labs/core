@@ -930,15 +930,19 @@ export class AppController {{
 			source.push_str("  async handle_");
 			source.push_str(&route.operation_id().to_string());
 			let route_response_type = route.response_body_type().unwrap_or("unknown");
-			if route.request_entity().is_some() {
-				source.push_str("(@Body() request: unknown): Promise<");
+			if let Some(request_entity) = route.request_entity() {
+				source.push_str("(@Body() request: ");
+				source.push_str(request_entity);
+				source.push_str("): Promise<");
 			} else {
 				source.push_str("(@Req() request: unknown): Promise<");
 			}
 			source.push_str(route_response_type);
 			source.push_str("> {\n");
 			let request_expression = if let Some(entity) = route.request_entity() {
-				source.push_str("    let validatedRequest: unknown;\n");
+				source.push_str("    let validatedRequest: ");
+				source.push_str(entity);
+				source.push_str(";\n");
 				source.push_str("    try {\n      validatedRequest = validate");
 				source.push_str(&type_identifier(entity, "Entity"));
 				source.push_str("(request);\n    } catch (error) {\n      throw new BadRequestException(error instanceof Error ? error.message : 'Invalid request body');\n    }\n");
@@ -2486,8 +2490,13 @@ declare const process: {
 			.file("src/generated.ts")
 			.unwrap()
 			.contains("runtime.query<Array<User>>(\"ListUsers\", \"UserRepository\")"));
+		assert!(project
+			.file("src/generated.ts")
+			.unwrap()
+			.contains("export async function execute_1(request: User, runtime: KruntRuntime): Promise<unknown>"));
 		let controller = project.file("src/app.controller.ts").unwrap();
-		assert!(controller.contains("@Body() request: unknown"));
+		assert!(controller.contains("@Body() request: User"));
+		assert!(controller.contains("let validatedRequest: User;"));
 		assert!(controller.contains("validateUser(request)"));
 		assert!(controller.contains("import type { User } from './models/User.model';"));
 		assert!(controller.contains("Promise<Array<User>>"));

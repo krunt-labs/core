@@ -596,9 +596,10 @@ fn render_function(function: &TypeScriptFunction) -> String {
 	} else {
 		"unknown"
 	};
+	let request_parameter = http_request_parameter(function);
 	let parameters = match (accepts_request, requires_runtime) {
-		(true, true) => "request: unknown, runtime: KruntRuntime".to_string(),
-		(true, false) => "request: unknown = undefined".to_string(),
+		(true, true) => format!("{request_parameter}, runtime: KruntRuntime"),
+		(true, false) => request_parameter,
 		(false, true) => "runtime: KruntRuntime".to_string(),
 		(false, false) => String::new(),
 	};
@@ -658,6 +659,19 @@ fn render_function(function: &TypeScriptFunction) -> String {
 	}
 	source.push_str("}\n");
 	source
+}
+
+fn http_request_parameter(function: &TypeScriptFunction) -> String {
+	let request_type = function
+		.operations
+		.iter()
+		.find(|operation| is_http_entry(operation))
+		.and_then(|operation| operation.attributes().get("backend.http.request_entity"));
+
+	match request_type {
+		Some(request_type) => format!("request: {request_type}"),
+		None => "request: unknown = undefined".to_string(),
+	}
 }
 
 fn operation_declarations(function: &TypeScriptFunction) -> BTreeMap<String, String> {
@@ -1411,6 +1425,42 @@ mod tests {
 		assert!(source.contains("return operation_1;"));
 		assert!(source.contains("return operation_3;"));
 		assert!(!source.contains("declare function krunt_backend_http_route"));
+	}
+
+	#[test]
+	fn renders_a_typed_http_request_parameter_from_route_metadata() {
+		let mut builder = IRBuilder::new();
+		let attributes = BTreeMap::from([
+			("backend.http.method".to_string(), "POST".to_string()),
+			("backend.http.path".to_string(), "/users".to_string()),
+			(
+				"backend.http.request_entity".to_string(),
+				"User".to_string(),
+			),
+		]);
+		builder
+			.add_node(IRNode {
+				id: krunt_ir::IrNodeId(1),
+				op: IROp::ENTRY {
+					name: OperationId::new("backend.http_route").unwrap(),
+				},
+				input_types: Vec::new(),
+				output_types: vec![TypeId::new("HttpRequest").unwrap()],
+				async_kind: AsyncKind::ASYNC,
+				effects: Vec::new(),
+				attributes,
+				returns: false,
+				source: SourceMap::node(GraphNodeId(10)),
+			})
+			.unwrap();
+
+		let program = TypeScriptBackend::lower_graph(&builder.build().unwrap()).unwrap();
+		let source = TypeScriptSourceRenderer::render_program(&program)
+			.unwrap()
+			.remove("generated.ts")
+			.unwrap();
+
+		assert!(source.contains("export async function execute_1(request: User): Promise<unknown>"));
 	}
 
 	#[test]
