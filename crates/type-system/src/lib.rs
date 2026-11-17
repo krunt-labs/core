@@ -4,6 +4,7 @@
 //! plugins can compose these types into domain schemas without making the
 //! graph model or compiler orchestration depend on a particular DSL.
 
+use std::collections::BTreeMap;
 use std::fmt;
 
 /// A validated type name used by the compiler's initial type relation.
@@ -35,8 +36,34 @@ pub enum Type {
 	NUMBER,
 	NULL,
 	VOID,
+	ARRAY(Box<Type>),
+	RECORD(BTreeMap<String, RecordField>),
 	NAMED(TypeName),
 	ANY,
+}
+
+/// One field in a structural record type.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct RecordField {
+	type_value: Type,
+	required: bool,
+}
+
+impl RecordField {
+	pub fn new(type_value: Type, required: bool) -> Self {
+		Self {
+			type_value,
+			required,
+		}
+	}
+
+	pub fn type_value(&self) -> &Type {
+		&self.type_value
+	}
+
+	pub fn required(&self) -> bool {
+		self.required
+	}
 }
 
 impl Type {
@@ -48,6 +75,19 @@ impl Type {
 	/// type used by nodes whose payload is supplied by the graph.
 	pub fn from_reference(value: impl Into<String>) -> Result<Self, TypeError> {
 		let value = value.into();
+		if let Some(open) = value.find('<') {
+			if !value[..open].eq_ignore_ascii_case("Array") {
+				return Self::named(value);
+			}
+			let inner = &value[open + 1..];
+			let Some(inner) = inner.strip_suffix('>') else {
+				return Err(TypeError::INVALID_REFERENCE);
+			};
+			if inner.trim().is_empty() {
+				return Err(TypeError::INVALID_REFERENCE);
+			}
+			return Ok(Self::ARRAY(Box::new(Self::from_reference(inner.trim())?)));
+		}
 		match value.to_ascii_lowercase().as_str() {
 			"string" => Ok(Self::STRING),
 			"boolean" => Ok(Self::BOOLEAN),
@@ -59,6 +99,14 @@ impl Type {
 			"any" => Ok(Self::ANY),
 			_ => Self::named(value),
 		}
+	}
+
+	pub fn array(element: Type) -> Self {
+		Self::ARRAY(Box::new(element))
+	}
+
+	pub fn record(fields: BTreeMap<String, RecordField>) -> Self {
+		Self::RECORD(fields)
 	}
 
 	/// Whether this type is a concrete scalar value suitable for a flat schema.
@@ -79,6 +127,8 @@ impl Type {
 			| Self::NUMBER
 			| Self::NULL
 			| Self::VOID
+			| Self::ARRAY(_)
+			| Self::RECORD(_)
 			| Self::ANY => None,
 		}
 	}
@@ -89,6 +139,14 @@ pub fn is_assignable(from: &Type, to: &Type) -> bool {
 	match (from, to) {
 		(_, Type::ANY) => true,
 		(Type::INTEGER, Type::NUMBER) | (Type::FLOAT, Type::NUMBER) => true,
+		(Type::ARRAY(left), Type::ARRAY(right)) => is_assignable(left, right),
+		(Type::RECORD(left), Type::RECORD(right)) => right.iter().all(|(name, target)| {
+			let Some(source) = left.get(name) else {
+				return !target.required();
+			};
+			(!target.required() || source.required())
+				&& is_assignable(source.type_value(), target.type_value())
+		}),
 		(left, right) if left == right => true,
 		(Type::NAMED(left), Type::NAMED(right)) => left == right,
 		(Type::ANY, Type::NAMED(_)) => false,
@@ -130,6 +188,7 @@ pub fn check_assignable(from: &Type, to: &Type) -> Result<(), AssignabilityError
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TypeError {
 	EMPTY_NAME,
+	INVALID_REFERENCE,
 }
 
 impl fmt::Display for TypeError {
@@ -194,5 +253,48 @@ mod tests {
 		assert!(is_assignable(&Type::FLOAT, &Type::NUMBER));
 		assert!(!is_assignable(&Type::NUMBER, &Type::INTEGER));
 		assert!(!is_assignable(&Type::ANY, &Type::NUMBER));
+	}
+
+	#[test]
+	fn array_references_and_assignability_are_structural() {
+		let strings = Type::from_reference("Array<String>").unwrap();
+		let values = Type::array(Type::ANY);
+
+		assert_eq!(strings, Type::array(Type::STRING));
+		assert_eq!(
+			Type::from_reference("ARRAY<Boolean>").unwrap(),
+			Type::array(Type::BOOLEAN)
+		);
+		assert!(is_assignable(&strings, &values));
+		assert!(!is_assignable(&values, &strings));
+		assert_eq!(
+			Type::from_reference("Array<>"),
+			Err(TypeError::INVALID_REFERENCE)
+		);
+	}
+
+	#[test]
+	fn records_respect_required_fields_and_nested_assignability() {
+		let mut source_fields = BTreeMap::new();
+		source_fields.insert("id".to_string(), RecordField::new(Type::INTEGER, true));
+		source_fields.insert(
+			"nickname".to_string(),
+			RecordField::new(Type::STRING, false),
+		);
+		let source = Type::record(source_fields);
+
+		let mut target_fields = BTreeMap::new();
+		target_fields.insert("id".to_string(), RecordField::new(Type::NUMBER, true));
+		target_fields.insert("avatar".to_string(), RecordField::new(Type::STRING, false));
+		let target = Type::record(target_fields);
+
+		assert!(is_assignable(&source, &target));
+
+		let mut required_target_fields = BTreeMap::new();
+		required_target_fields.insert("nickname".to_string(), RecordField::new(Type::STRING, true));
+		assert!(!is_assignable(
+			&source,
+			&Type::record(required_target_fields)
+		));
 	}
 }

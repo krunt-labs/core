@@ -24,7 +24,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 
 pub const BACKEND_DSL_ID: &str = "krunt.backend-dsl";
-pub const BACKEND_DSL_VERSION: &str = "0.2.0";
+pub const BACKEND_DSL_VERSION: &str = "0.3.0";
 pub const HTTP_ROUTE_NODE_TYPE: &str = "backend.http_route";
 pub const HTTP_REQUEST_NODE_TYPE: &str = "backend.http_request";
 pub const CRON_NODE_TYPE: &str = "backend.cron";
@@ -1244,10 +1244,25 @@ struct EntityProperties {
 	fields: BTreeMap<String, EntityFieldProperties>,
 }
 
+#[allow(non_camel_case_types)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(untagged)]
+enum EntityTypeSchema {
+	SCALAR(String),
+	ARRAY {
+		kind: String,
+		items: Box<EntityTypeSchema>,
+	},
+	RECORD {
+		kind: String,
+		fields: BTreeMap<String, EntityFieldProperties>,
+	},
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 struct EntityFieldProperties {
 	#[serde(rename = "type")]
-	type_name: String,
+	type_schema: EntityTypeSchema,
 	required: bool,
 }
 
@@ -2406,65 +2421,9 @@ fn entity_properties(node: &Node) -> Result<EntityProperties, Box<Diagnostic>> {
 						format!("Entity field name '{field_name}' must be a valid identifier."),
 					));
 				}
-				let (field_type, required) = match field_schema {
-					Value::String(field_type) => (field_type.clone(), true),
-					Value::Object(schema) => {
-						let Some(field_type) = schema.get("type").and_then(Value::as_str) else {
-							return Err(node_diagnostic(
-								node,
-								"BACKEND_DSL.ENTITY_FIELD_TYPE",
-								format!(
-									"Entity field '{field_name}' schema must contain a string 'type'."
-								),
-							));
-						};
-						let required = match schema.get("required") {
-							None => true,
-							Some(Value::Bool(required)) => *required,
-							Some(_) => {
-								return Err(node_diagnostic(
-									node,
-									"BACKEND_DSL.ENTITY_FIELD_REQUIRED_TYPE",
-									format!(
-										"Entity field '{field_name}' property 'required' must be a boolean."
-									),
-								));
-							}
-						};
-						(field_type.to_string(), required)
-					}
-					_ => {
-						return Err(node_diagnostic(
-							node,
-							"BACKEND_DSL.ENTITY_FIELD_TYPE",
-							format!(
-								"Entity field '{field_name}' must be a type string or a schema object."
-							),
-						));
-					}
-				};
-				let parsed_type = Type::from_reference(field_type.as_str()).map_err(|_| {
-					node_diagnostic(
-						node,
-						"BACKEND_DSL.ENTITY_FIELD_TYPE_INVALID",
-						format!("Entity field '{field_name}' has an invalid type reference."),
-					)
-				})?;
-				if !parsed_type.is_scalar() && parsed_type != Type::ANY {
-					return Err(node_diagnostic(
-						node,
-						"BACKEND_DSL.ENTITY_FIELD_TYPE_UNSUPPORTED",
-						format!(
-							"Entity field '{field_name}' must use String, Boolean, Integer, Float, Number, Null, or Any."
-						),
-					));
-				}
 				validated.insert(
 					field_name.clone(),
-					EntityFieldProperties {
-						type_name: field_type,
-						required,
-					},
+					entity_field_properties(node, field_name, field_schema)?,
 				);
 			}
 			validated
@@ -2478,6 +2437,154 @@ fn entity_properties(node: &Node) -> Result<EntityProperties, Box<Diagnostic>> {
 		}
 	};
 	Ok(EntityProperties { name, fields })
+}
+
+fn entity_field_properties(
+	node: &Node,
+	field_name: &str,
+	value: &Value,
+) -> Result<EntityFieldProperties, Box<Diagnostic>> {
+	let (type_value, required) = match value {
+		Value::String(type_name) => (Value::String(type_name.clone()), true),
+		Value::Object(schema) => {
+			let Some(type_value) = schema.get("type") else {
+				return Err(node_diagnostic(
+					node,
+					"BACKEND_DSL.ENTITY_FIELD_TYPE",
+					format!("Entity field '{field_name}' schema must contain a 'type' value."),
+				));
+			};
+			let required = match schema.get("required") {
+				None => true,
+				Some(Value::Bool(required)) => *required,
+				Some(_) => {
+					return Err(node_diagnostic(
+						node,
+						"BACKEND_DSL.ENTITY_FIELD_REQUIRED_TYPE",
+						format!(
+							"Entity field '{field_name}' property 'required' must be a boolean."
+						),
+					));
+				}
+			};
+			(type_value.clone(), required)
+		}
+		_ => {
+			return Err(node_diagnostic(
+				node,
+				"BACKEND_DSL.ENTITY_FIELD_TYPE",
+				format!("Entity field '{field_name}' must be a type string or a schema object."),
+			));
+		}
+	};
+
+	Ok(EntityFieldProperties {
+		type_schema: entity_type_schema(node, field_name, &type_value)?,
+		required,
+	})
+}
+
+fn entity_type_schema(
+	node: &Node,
+	field_name: &str,
+	value: &Value,
+) -> Result<EntityTypeSchema, Box<Diagnostic>> {
+	match value {
+		Value::String(type_name) => {
+			let parsed_type = Type::from_reference(type_name.as_str()).map_err(|_| {
+				node_diagnostic(
+					node,
+					"BACKEND_DSL.ENTITY_FIELD_TYPE_INVALID",
+					format!("Entity field '{field_name}' has an invalid type reference."),
+				)
+			})?;
+			if !parsed_type.is_scalar() && parsed_type != Type::ANY {
+				return Err(node_diagnostic(
+					node,
+					"BACKEND_DSL.ENTITY_FIELD_TYPE_UNSUPPORTED",
+					format!(
+						"Entity field '{field_name}' must use a scalar, array, or record type."
+					),
+				));
+			}
+			Ok(EntityTypeSchema::SCALAR(type_name.clone()))
+		}
+		Value::Object(schema) => {
+			let Some(kind) = schema.get("kind").and_then(Value::as_str) else {
+				return Err(node_diagnostic(
+					node,
+					"BACKEND_DSL.ENTITY_FIELD_TYPE_INVALID",
+					format!(
+						"Entity field '{field_name}' composite type must declare kind 'array' or 'record'."
+					),
+				));
+			};
+			match kind {
+				"array" => {
+					let Some(items) = schema.get("items") else {
+						return Err(node_diagnostic(
+							node,
+							"BACKEND_DSL.ENTITY_FIELD_TYPE",
+							format!("Entity field '{field_name}' array type must contain 'items'."),
+						));
+					};
+					Ok(EntityTypeSchema::ARRAY {
+						kind: "array".to_string(),
+						items: Box::new(entity_type_schema(node, field_name, items)?),
+					})
+				}
+				"record" => {
+					let Some(Value::Object(fields)) = schema.get("fields") else {
+						return Err(node_diagnostic(
+							node,
+							"BACKEND_DSL.ENTITY_FIELD_TYPE",
+							format!(
+								"Entity field '{field_name}' record type must contain a 'fields' object."
+							),
+						));
+					};
+					let mut validated = BTreeMap::new();
+					for (nested_name, nested_value) in fields {
+						if !is_identifier(nested_name) {
+							return Err(node_diagnostic(
+								node,
+								"BACKEND_DSL.ENTITY_FIELD_NAME_INVALID",
+								format!(
+									"Entity field name '{field_name}.{nested_name}' must be a valid identifier."
+								),
+							));
+						}
+						validated.insert(
+							nested_name.clone(),
+							entity_field_properties(
+								node,
+								&format!("{field_name}.{nested_name}"),
+								nested_value,
+							)?,
+						);
+					}
+					Ok(EntityTypeSchema::RECORD {
+						kind: "record".to_string(),
+						fields: validated,
+					})
+				}
+				_ => Err(node_diagnostic(
+					node,
+					"BACKEND_DSL.ENTITY_FIELD_TYPE_UNSUPPORTED",
+					format!(
+						"Entity field '{field_name}' uses unsupported composite kind '{kind}'."
+					),
+				)),
+			}
+		}
+		_ => Err(node_diagnostic(
+			node,
+			"BACKEND_DSL.ENTITY_FIELD_TYPE",
+			format!(
+				"Entity field '{field_name}' type must be a scalar reference or composite schema."
+			),
+		)),
+	}
 }
 
 fn is_identifier(value: &str) -> bool {
@@ -3246,7 +3353,7 @@ mod tests {
 	}
 
 	#[test]
-	fn lowers_entity_fields_as_deterministic_scalar_metadata() {
+	fn lowers_entity_fields_as_deterministic_composite_metadata() {
 		let plugin = BackendDslPlugin::new();
 		let node = Node::new(
 			NodeId::new(2).unwrap(),
@@ -3258,7 +3365,21 @@ mod tests {
 			ENTITY_FIELDS_PROPERTY,
 			serde_json::json!({
 				"email": {"type": "String", "required": false},
-				"id": {"type": "Integer", "required": true}
+				"id": {"type": "Integer", "required": true},
+				"profile": {
+					"type": {
+						"kind": "record",
+						"fields": {
+							"displayName": {"type": "String", "required": true},
+							"bio": {"type": "String", "required": false}
+						}
+					},
+					"required": false
+				},
+				"tags": {
+					"type": {"kind": "array", "items": "String"},
+					"required": true
+				}
 			}),
 		)
 		.unwrap();
@@ -3266,7 +3387,7 @@ mod tests {
 
 		assert_eq!(
 			lowered.attributes()["backend.entity.fields"],
-			"{\"email\":{\"type\":\"String\",\"required\":false},\"id\":{\"type\":\"Integer\",\"required\":true}}"
+			"{\"email\":{\"type\":\"String\",\"required\":false},\"id\":{\"type\":\"Integer\",\"required\":true},\"profile\":{\"type\":{\"kind\":\"record\",\"fields\":{\"bio\":{\"type\":\"String\",\"required\":false},\"displayName\":{\"type\":\"String\",\"required\":true}}},\"required\":false},\"tags\":{\"type\":{\"kind\":\"array\",\"items\":\"String\"},\"required\":true}}"
 		);
 	}
 
@@ -3295,9 +3416,17 @@ mod tests {
 			)
 			.unwrap();
 		let unsupported = base
+			.clone()
 			.with_property(
 				ENTITY_FIELDS_PROPERTY,
 				serde_json::json!({"profile": "UserProfile"}),
+			)
+			.unwrap();
+		let missing_array_items = base
+			.clone()
+			.with_property(
+				ENTITY_FIELDS_PROPERTY,
+				serde_json::json!({"tags": {"type": {"kind": "array"}}}),
 			)
 			.unwrap();
 
@@ -3316,6 +3445,10 @@ mod tests {
 		assert_eq!(
 			plugin.analyze_node(&unsupported)[0].code().as_str(),
 			"BACKEND_DSL.ENTITY_FIELD_TYPE_UNSUPPORTED"
+		);
+		assert_eq!(
+			plugin.analyze_node(&missing_array_items)[0].code().as_str(),
+			"BACKEND_DSL.ENTITY_FIELD_TYPE"
 		);
 	}
 

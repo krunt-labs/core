@@ -16,7 +16,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 
 /// Version of the NestJS framework semantic IR.
-pub const NESTJS_PROGRAM_VERSION: u32 = 3;
+pub const NESTJS_PROGRAM_VERSION: u32 = 4;
 
 /// Framework-level semantic model consumed by NestJS project rendering.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -93,10 +93,19 @@ impl NestJsEntity {
 }
 
 /// One scalar field in a generated NestJS entity model.
+#[allow(non_camel_case_types)]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+pub enum NestJsEntityType {
+	SCALAR { type_name: String },
+	ARRAY { items: Box<NestJsEntityType> },
+	RECORD { fields: Vec<NestJsEntityField> },
+}
+
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct NestJsEntityField {
 	name: String,
 	type_name: String,
+	type_schema: NestJsEntityType,
 	required: bool,
 }
 
@@ -107,6 +116,10 @@ impl NestJsEntityField {
 
 	pub fn type_name(&self) -> &str {
 		&self.type_name
+	}
+
+	pub fn type_schema(&self) -> &NestJsEntityType {
+		&self.type_schema
 	}
 
 	pub fn required(&self) -> bool {
@@ -432,17 +445,13 @@ fn entity_fields(
 				field: name,
 			});
 		}
-		let (type_name, required) = field.into_parts();
-		if typescript_entity_type(&type_name).is_none() {
-			return Err(NestJsGenerationError::UNSUPPORTED_ENTITY_FIELD_TYPE {
-				entity: entity.to_string(),
-				field: name,
-				type_name,
-			});
-		}
+		let (serialized_type, required) = field.into_parts();
+		let type_schema = lower_entity_type(entity, &name, serialized_type)?;
+		let type_name = entity_type_name(&type_schema);
 		result.push(NestJsEntityField {
 			name,
 			type_name,
+			type_schema,
 			required,
 		});
 	}
@@ -455,21 +464,100 @@ enum SerializedEntityField {
 	Legacy(String),
 	Schema {
 		#[serde(rename = "type")]
-		type_name: String,
+		type_schema: SerializedEntityType,
 		#[serde(default = "default_required")]
 		required: bool,
 	},
 }
 
 impl SerializedEntityField {
-	fn into_parts(self) -> (String, bool) {
+	fn into_parts(self) -> (SerializedEntityType, bool) {
 		match self {
-			Self::Legacy(type_name) => (type_name, true),
+			Self::Legacy(type_name) => (SerializedEntityType::SCALAR(type_name), true),
 			Self::Schema {
-				type_name,
+				type_schema,
 				required,
-			} => (type_name, required),
+			} => (type_schema, required),
 		}
+	}
+}
+
+#[allow(non_camel_case_types)]
+#[derive(Clone, Debug, Deserialize)]
+#[serde(untagged)]
+enum SerializedEntityType {
+	SCALAR(String),
+	ARRAY {
+		kind: String,
+		items: Box<SerializedEntityType>,
+	},
+	RECORD {
+		kind: String,
+		fields: BTreeMap<String, SerializedEntityField>,
+	},
+}
+
+fn lower_entity_type(
+	entity: &str,
+	field: &str,
+	type_schema: SerializedEntityType,
+) -> Result<NestJsEntityType, NestJsGenerationError> {
+	match type_schema {
+		SerializedEntityType::SCALAR(type_name) => {
+			if typescript_scalar_type(&type_name).is_none() {
+				return Err(NestJsGenerationError::UNSUPPORTED_ENTITY_FIELD_TYPE {
+					entity: entity.to_string(),
+					field: field.to_string(),
+					type_name,
+				});
+			}
+			Ok(NestJsEntityType::SCALAR { type_name })
+		}
+		SerializedEntityType::ARRAY { kind, items } => {
+			if kind != "array" {
+				return Err(NestJsGenerationError::INVALID_ENTITY_FIELDS {
+					entity: entity.to_string(),
+				});
+			}
+			Ok(NestJsEntityType::ARRAY {
+				items: Box::new(lower_entity_type(entity, field, *items)?),
+			})
+		}
+		SerializedEntityType::RECORD { kind, fields } => {
+			if kind != "record" {
+				return Err(NestJsGenerationError::INVALID_ENTITY_FIELDS {
+					entity: entity.to_string(),
+				});
+			}
+			let mut lowered = Vec::with_capacity(fields.len());
+			for (name, field_schema) in fields {
+				if !is_typescript_property_identifier(&name) {
+					return Err(NestJsGenerationError::INVALID_ENTITY_FIELD_NAME {
+						entity: entity.to_string(),
+						field: format!("{field}.{name}"),
+					});
+				}
+				let (serialized_type, required) = field_schema.into_parts();
+				let type_schema =
+					lower_entity_type(entity, &format!("{field}.{name}"), serialized_type)?;
+				let type_name = entity_type_name(&type_schema);
+				lowered.push(NestJsEntityField {
+					name,
+					type_name,
+					type_schema,
+					required,
+				});
+			}
+			Ok(NestJsEntityType::RECORD { fields: lowered })
+		}
+	}
+}
+
+fn entity_type_name(type_schema: &NestJsEntityType) -> String {
+	match type_schema {
+		NestJsEntityType::SCALAR { type_name } => type_name.clone(),
+		NestJsEntityType::ARRAY { .. } => "Array".to_string(),
+		NestJsEntityType::RECORD { .. } => "Record".to_string(),
 	}
 }
 
@@ -882,7 +970,7 @@ fn entity_model(entity: &NestJsEntity) -> String {
 				source.push('?');
 			}
 			source.push_str(": ");
-			source.push_str(typescript_entity_type(field.type_name()).unwrap_or("unknown"));
+			source.push_str(&typescript_entity_type(field.type_schema(), 2));
 			source.push_str(";\n");
 		}
 	}
@@ -907,7 +995,7 @@ fn entity_model(entity: &NestJsEntity) -> String {
 			source.push('.');
 			source.push_str(field.name());
 			source.push_str(" must be a ");
-			source.push_str(entity_field_error_type(field.type_name()));
+			source.push_str(entity_field_error_type(field.type_schema()));
 			source.push_str(".');\n  }\n");
 		}
 		source.push_str("  return {\n");
@@ -917,7 +1005,7 @@ fn entity_model(entity: &NestJsEntity) -> String {
 			source.push_str(": record.");
 			source.push_str(field.name());
 			source.push_str(" as ");
-			source.push_str(typescript_entity_type(field.type_name()).unwrap_or("unknown"));
+			source.push_str(&typescript_entity_type(field.type_schema(), 2));
 			if !field.required() {
 				source.push_str(" | undefined");
 			}
@@ -928,7 +1016,7 @@ fn entity_model(entity: &NestJsEntity) -> String {
 	source
 }
 
-fn typescript_entity_type(type_name: &str) -> Option<&'static str> {
+fn typescript_scalar_type(type_name: &str) -> Option<&'static str> {
 	match type_name.to_ascii_lowercase().as_str() {
 		"string" => Some("string"),
 		"boolean" => Some("boolean"),
@@ -939,15 +1027,48 @@ fn typescript_entity_type(type_name: &str) -> Option<&'static str> {
 	}
 }
 
-fn entity_field_error_type(type_name: &str) -> &'static str {
-	match type_name.to_ascii_lowercase().as_str() {
-		"string" => "string",
-		"boolean" => "boolean",
-		"integer" => "integer",
-		"float" | "number" => "number",
-		"null" => "null",
-		"any" => "value",
-		_ => "supported value",
+fn typescript_entity_type(type_schema: &NestJsEntityType, indent: usize) -> String {
+	match type_schema {
+		NestJsEntityType::SCALAR { type_name } => typescript_scalar_type(type_name)
+			.unwrap_or("unknown")
+			.to_string(),
+		NestJsEntityType::ARRAY { items } => {
+			format!("Array<{}>", typescript_entity_type(items, indent))
+		}
+		NestJsEntityType::RECORD { fields } => {
+			let padding = "  ".repeat(indent);
+			let field_padding = "  ".repeat(indent + 1);
+			let mut source = String::from("{\n");
+			for field in fields {
+				source.push_str(&field_padding);
+				source.push_str(field.name());
+				if !field.required() {
+					source.push('?');
+				}
+				source.push_str(": ");
+				source.push_str(&typescript_entity_type(field.type_schema(), indent + 1));
+				source.push_str(";\n");
+			}
+			source.push_str(&padding);
+			source.push('}');
+			source
+		}
+	}
+}
+
+fn entity_field_error_type(type_schema: &NestJsEntityType) -> &'static str {
+	match type_schema {
+		NestJsEntityType::SCALAR { type_name } => match type_name.to_ascii_lowercase().as_str() {
+			"string" => "string",
+			"boolean" => "boolean",
+			"integer" => "integer",
+			"float" | "number" => "number",
+			"null" => "null",
+			"any" => "value",
+			_ => "supported value",
+		},
+		NestJsEntityType::ARRAY { .. } => "array",
+		NestJsEntityType::RECORD { .. } => "object",
 	}
 }
 
@@ -957,26 +1078,55 @@ fn entity_field_validation(field: &NestJsEntityField) -> String {
 		"Object.prototype.hasOwnProperty.call(record, '{}')",
 		field.name()
 	);
-	let type_check = match field.type_name().to_ascii_lowercase().as_str() {
-		"string" => Some(format!("typeof {access} !== 'string'")),
-		"boolean" => Some(format!("typeof {access} !== 'boolean'")),
-		"integer" => Some(format!(
-			"typeof {access} !== 'number' || !Number.isInteger({access})"
-		)),
-		"float" | "number" => Some(format!(
-			"typeof {access} !== 'number' || !Number.isFinite({access})"
-		)),
-		"null" => Some(format!("{access} !== null")),
-		"any" => None,
-		_ => Some("true".to_string()),
-	};
+	let type_check = entity_type_validation(&access, field.type_schema());
 
-	match (field.required(), type_check) {
-		(true, Some(type_check)) => format!("!{presence} || {type_check}"),
-		(true, None) => format!("!{presence}"),
-		(false, Some(type_check)) => format!("{presence} && ({type_check})"),
-		(false, None) => "false".to_string(),
+	match field.required() {
+		true => format!("!{presence} || {type_check}"),
+		false => format!("{presence} && ({type_check})"),
 	}
+}
+
+fn entity_type_validation(access: &str, type_schema: &NestJsEntityType) -> String {
+	match type_schema {
+		NestJsEntityType::SCALAR { type_name } => match type_name.to_ascii_lowercase().as_str() {
+			"string" => format!("typeof {access} !== 'string'"),
+			"boolean" => format!("typeof {access} !== 'boolean'"),
+			"integer" => format!("typeof {access} !== 'number' || !Number.isInteger({access})"),
+			"float" | "number" => {
+				format!("typeof {access} !== 'number' || !Number.isFinite({access})")
+			}
+			"null" => format!("{access} !== null"),
+			"any" => "false".to_string(),
+			_ => "true".to_string(),
+		},
+		NestJsEntityType::ARRAY { items } => format!(
+			"!Array.isArray({access}) || !{access}.every((item) => !({}))",
+			entity_type_validation("item", items)
+		),
+		NestJsEntityType::RECORD { fields } => {
+			let mut checks = vec![format!(
+				"typeof {access} !== 'object' || {access} === null || Array.isArray({access})"
+			)];
+			for field in fields {
+				let field_access = entity_property_access(access, field.name());
+				let field_presence = format!(
+					"Object.prototype.hasOwnProperty.call({access}, '{}')",
+					field.name()
+				);
+				let field_validation = entity_type_validation(&field_access, field.type_schema());
+				if field.required() {
+					checks.push(format!("!{field_presence} || {field_validation}"));
+				} else {
+					checks.push(format!("{field_presence} && ({field_validation})"));
+				}
+			}
+			checks.join(" || ")
+		}
+	}
+}
+
+fn entity_property_access(value: &str, property: &str) -> String {
+	format!("({value} as Record<string, unknown>).{property}")
 }
 
 fn is_typescript_property_identifier(value: &str) -> bool {
@@ -1625,7 +1775,7 @@ mod tests {
 					("backend.entity.name".to_string(), "User".to_string()),
 					(
 						"backend.entity.fields".to_string(),
-						"{\"email\":{\"type\":\"String\",\"required\":false},\"id\":{\"type\":\"Integer\",\"required\":true}}".to_string(),
+						"{\"email\":{\"type\":\"String\",\"required\":false},\"id\":{\"type\":\"Integer\",\"required\":true},\"profile\":{\"type\":{\"kind\":\"record\",\"fields\":{\"bio\":{\"type\":\"String\",\"required\":false},\"displayName\":{\"type\":\"String\",\"required\":true}}},\"required\":false},\"tags\":{\"type\":{\"kind\":\"array\",\"items\":\"String\"},\"required\":true}}".to_string(),
 					),
 				]),
 				returns: false,
@@ -2149,7 +2299,7 @@ declare const process: {
 		let framework_program = NestJsBackend::lower_program(&program).unwrap();
 		assert_eq!(framework_program.entities().len(), 1);
 		assert_eq!(framework_program.entities()[0].name(), "User");
-		assert_eq!(framework_program.entities()[0].fields().len(), 2);
+		assert_eq!(framework_program.entities()[0].fields().len(), 4);
 		assert_eq!(framework_program.entities()[0].fields()[0].name(), "email");
 		assert_eq!(
 			framework_program.entities()[0].fields()[0].type_name(),
@@ -2157,6 +2307,14 @@ declare const process: {
 		);
 		assert!(!framework_program.entities()[0].fields()[0].required());
 		assert!(framework_program.entities()[0].fields()[1].required());
+		assert!(matches!(
+			framework_program.entities()[0].fields()[2].type_schema(),
+			NestJsEntityType::RECORD { .. }
+		));
+		assert!(matches!(
+			framework_program.entities()[0].fields()[3].type_schema(),
+			NestJsEntityType::ARRAY { .. }
+		));
 		assert_eq!(framework_program.routes()[0].request_entity(), Some("User"));
 		assert_eq!(framework_program.repositories().len(), 1);
 		assert_eq!(framework_program.repositories()[0].name(), "UserRepository");
@@ -2171,8 +2329,13 @@ declare const process: {
 		let model = project.file("src/models/User.model.ts").unwrap();
 		assert!(model.contains("email?: string;"));
 		assert!(model.contains("id: number;"));
+		assert!(
+			model.contains("profile?: {\n      bio?: string;\n      displayName: string;\n    };")
+		);
+		assert!(model.contains("tags: Array<string>;"));
 		assert!(model.contains("export function validateUser(value: unknown): User"));
 		assert!(model.contains("Object.prototype.hasOwnProperty.call(record, 'email') && (typeof record.email !== 'string')"));
+		assert!(model.contains("!Array.isArray(record.tags) || !record.tags.every((item) => !(typeof item !== 'string'))"));
 		assert!(project
 			.file("src/repositories/UserRepositoryRepository.repository.ts")
 			.unwrap()

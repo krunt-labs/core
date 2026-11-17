@@ -1155,7 +1155,21 @@ mod tests {
 			ENTITY_FIELDS_PROPERTY,
 			serde_json::json!({
 				"email": {"type": "String", "required": false},
-				"id": {"type": "Integer", "required": true}
+				"id": {"type": "Integer", "required": true},
+				"profile": {
+					"type": {
+						"kind": "record",
+						"fields": {
+							"displayName": {"type": "String", "required": true},
+							"bio": {"type": "String", "required": false}
+						}
+					},
+					"required": false
+				},
+				"tags": {
+					"type": {"kind": "array", "items": "String"},
+					"required": true
+				}
 			}),
 		)
 		.unwrap();
@@ -1680,7 +1694,7 @@ mod tests {
 			.expect("entity should be lowered into IR");
 		assert_eq!(
 			entity.attributes["backend.entity.fields"],
-			"{\"email\":{\"type\":\"String\",\"required\":false},\"id\":{\"type\":\"Integer\",\"required\":true}}"
+			"{\"email\":{\"type\":\"String\",\"required\":false},\"id\":{\"type\":\"Integer\",\"required\":true},\"profile\":{\"type\":{\"kind\":\"record\",\"fields\":{\"bio\":{\"type\":\"String\",\"required\":false},\"displayName\":{\"type\":\"String\",\"required\":true}}},\"required\":false},\"tags\":{\"type\":{\"kind\":\"array\",\"items\":\"String\"},\"required\":true}}"
 		);
 		let route = result
 			.ir()
