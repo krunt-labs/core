@@ -109,6 +109,13 @@ impl Type {
 		Self::RECORD(fields)
 	}
 
+	pub fn array_element(&self) -> Option<&Type> {
+		match self {
+			Self::ARRAY(element) => Some(element),
+			_ => None,
+		}
+	}
+
 	/// Whether this type is a concrete scalar value suitable for a flat schema.
 	pub fn is_scalar(&self) -> bool {
 		matches!(

@@ -938,8 +938,8 @@ mod tests {
 		HTTP_ROUTE_REQUEST_ENTITY_PROPERTY, LOGGING_EFFECT, LOGGING_LEVEL_PROPERTY,
 		LOGGING_NODE_TYPE, QUERY_CARDINALITY_PROPERTY, QUERY_NAME_PROPERTY, QUERY_NODE_TYPE,
 		QUERY_REPOSITORY_PROPERTY, REPOSITORY_ENTITY_PROPERTY, REPOSITORY_NAME_PROPERTY,
-		REPOSITORY_NODE_TYPE, STORAGE_KEY_PROPERTY, STORAGE_NODE_TYPE, STORAGE_OPERATION_PROPERTY,
-		STORAGE_READ_EFFECT, SUCCESS_RESPONSE_NODE_TYPE,
+		REPOSITORY_NODE_TYPE, RESPONSE_BODY_TYPE_PROPERTY, STORAGE_KEY_PROPERTY, STORAGE_NODE_TYPE,
+		STORAGE_OPERATION_PROPERTY, STORAGE_READ_EFFECT, SUCCESS_RESPONSE_NODE_TYPE,
 	};
 	use krunt_graph_model::{
 		Edge, EdgeId, EdgeKind, GraphBuilder, GraphId, GraphMetadata, NodeId, NodeTypeId,
@@ -1130,6 +1130,12 @@ mod tests {
 			NodeId::new(3).unwrap(),
 			NodeTypeId::new(SUCCESS_RESPONSE_NODE_TYPE).unwrap(),
 		);
+		response = response
+			.with_property(
+				RESPONSE_BODY_TYPE_PROPERTY,
+				serde_json::Value::String("Array<User>".into()),
+			)
+			.unwrap();
 		response
 			.add_port(Port::new(
 				PortId::new(31).unwrap(),
@@ -1692,6 +1698,15 @@ mod tests {
 			vec![EffectId::new(DATABASE_READ_EFFECT).unwrap()]
 		);
 		assert_eq!(query.attributes["backend.persistence.kind"], "QUERY");
+		let response = result
+			.ir()
+			.unwrap()
+			.nodes()
+			.iter()
+			.find(|node| node.returns)
+			.expect("response should be lowered as a return operation");
+		assert_eq!(response.input_types[0].as_str(), "Array<User>");
+		assert_eq!(response.attributes["response.body_type"], "Array<User>");
 		assert!(result.ir().unwrap().nodes().iter().any(|node| {
 			matches!(&node.op, IROp::DECLARATION { name } if name.as_str() == ENTITY_NODE_TYPE)
 		}));

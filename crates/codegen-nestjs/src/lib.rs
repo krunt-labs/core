@@ -12,11 +12,11 @@ use krunt_codegen_typescript::{
 use krunt_framework_backend::{FrameworkBackend, GeneratedProject, ProjectError};
 use krunt_ir::GraphElementId;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 /// Version of the NestJS framework semantic IR.
-pub const NESTJS_PROGRAM_VERSION: u32 = 4;
+pub const NESTJS_PROGRAM_VERSION: u32 = 5;
 
 /// Framework-level semantic model consumed by NestJS project rendering.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -214,6 +214,7 @@ pub struct NestJsRoute {
 	execution_name: String,
 	status_code: u16,
 	response_kind: NestJsResponseKind,
+	response_body_type: Option<String>,
 	error_message: Option<String>,
 	request_entity: Option<String>,
 	requires_runtime: bool,
@@ -246,6 +247,10 @@ impl NestJsRoute {
 
 	pub fn response_kind(&self) -> NestJsResponseKind {
 		self.response_kind
+	}
+
+	pub fn response_body_type(&self) -> Option<&str> {
+		self.response_body_type.as_deref()
 	}
 
 	pub fn error_message(&self) -> Option<&str> {
@@ -701,6 +706,10 @@ fn lower_routes(
 				.and_then(|value| value.parse().ok())
 				.unwrap_or(200);
 			let response_kind = response_kind(function)?;
+			let response_body_type = return_operation
+				.and_then(|operation| operation.attributes().get("response.body_type"))
+				.filter(|type_name| type_name.as_str() != "ANY")
+				.cloned();
 			let request_entity = operation
 				.attributes()
 				.get("backend.http.request_entity")
@@ -732,6 +741,7 @@ fn lower_routes(
 					.flatten()
 					.and_then(|operation| operation.attributes().get("error.message").cloned()),
 				response_kind,
+				response_body_type,
 				request_entity,
 				requires_runtime: function
 					.operations()
@@ -878,11 +888,13 @@ fn app_controller(program: &NestJsProgram) -> String {
 			format!("import {{ {function} }} from './models/{entity}.model';\n")
 		})
 		.collect::<String>();
+	let response_type_imports = response_type_imports(program);
 	let mut source = format!(
 		r#"import {{ {} }} from '@nestjs/common';
 import {{ {execution_imports} }} from './generated';
 {runtime_import}
 {request_validator_imports}
+{response_type_imports}
 
 @Controller()
 export class AppController {{
@@ -917,11 +929,14 @@ export class AppController {{
 			source.push_str("')\n");
 			source.push_str("  async handle_");
 			source.push_str(&route.operation_id().to_string());
+			let route_response_type = route.response_body_type().unwrap_or("unknown");
 			if route.request_entity().is_some() {
-				source.push_str("(@Body() request: unknown): Promise<unknown> {\n");
+				source.push_str("(@Body() request: unknown): Promise<");
 			} else {
-				source.push_str("(@Req() request: unknown): Promise<unknown> {\n");
+				source.push_str("(@Req() request: unknown): Promise<");
 			}
+			source.push_str(route_response_type);
+			source.push_str("> {\n");
 			let request_expression = if let Some(entity) = route.request_entity() {
 				source.push_str("    let validatedRequest: unknown;\n");
 				source.push_str("    try {\n      validatedRequest = validate");
@@ -942,8 +957,15 @@ export class AppController {{
 				invocation.push(')');
 			}
 			if route.response_kind() == NestJsResponseKind::ERROR {
-				source.push_str("    const result = await ");
+				source.push_str("    const result = ");
+				if route.response_body_type().is_some() {
+					source.push_str("(await ");
+				}
 				source.push_str(&invocation);
+				if let Some(response_type) = route.response_body_type() {
+					source.push_str(") as ");
+					source.push_str(response_type);
+				}
 				source.push_str(";\n    throw new HttpException(result ?? '");
 				source.push_str(&escape_single_quoted(
 					route.error_message().unwrap_or("Request failed"),
@@ -953,13 +975,52 @@ export class AppController {{
 				source.push_str(");\n  }\n");
 			} else {
 				source.push_str("    return ");
-				source.push_str(&invocation);
+				if let Some(response_type) = route.response_body_type() {
+					source.push_str("(await ");
+					source.push_str(&invocation);
+					source.push_str(") as ");
+					source.push_str(response_type);
+				} else {
+					source.push_str(&invocation);
+				}
 				source.push_str(";\n  }\n");
 			}
 		}
 	}
 	source.push_str("}\n");
 	source
+}
+
+fn response_type_imports(program: &NestJsProgram) -> String {
+	let mut entities = BTreeSet::new();
+	for route in program.routes() {
+		let Some(response_type) = route.response_body_type() else {
+			continue;
+		};
+		for entity in program.entities() {
+			if response_type_contains_entity(response_type, entity.name()) {
+				entities.insert(entity.name().to_string());
+			}
+		}
+	}
+	entities
+		.into_iter()
+		.map(|entity| {
+			let identifier = type_identifier(&entity, "Entity");
+			format!("import type {{ {identifier} }} from './models/{identifier}.model';\n")
+		})
+		.collect()
+}
+
+fn response_type_contains_entity(type_value: &str, entity: &str) -> bool {
+	let type_value = type_value.trim();
+	if type_value == entity {
+		return true;
+	}
+	type_value
+		.strip_prefix("Array<")
+		.and_then(|value| value.strip_suffix('>'))
+		.is_some_and(|element| response_type_contains_entity(element, entity))
 }
 
 fn method_decorator(method: &str) -> &'static str {
@@ -1816,6 +1877,7 @@ mod tests {
 				attributes: std::collections::BTreeMap::from([
 					("response.kind".to_string(), "SUCCESS".to_string()),
 					("response.status_code".to_string(), "200".to_string()),
+					("response.body_type".to_string(), "Array<User>".to_string()),
 				]),
 				returns: true,
 				source: SourceMap::node(GraphNodeId(30)),
@@ -2376,6 +2438,10 @@ declare const process: {
 			NestJsEntityType::ARRAY { .. }
 		));
 		assert_eq!(framework_program.routes()[0].request_entity(), Some("User"));
+		assert_eq!(
+			framework_program.routes()[0].response_body_type(),
+			Some("Array<User>")
+		);
 		assert_eq!(framework_program.repositories().len(), 1);
 		assert_eq!(framework_program.repositories()[0].name(), "UserRepository");
 		assert_eq!(framework_program.repositories()[0].methods().len(), 1);
@@ -2423,6 +2489,10 @@ declare const process: {
 		let controller = project.file("src/app.controller.ts").unwrap();
 		assert!(controller.contains("@Body() request: unknown"));
 		assert!(controller.contains("validateUser(request)"));
+		assert!(controller.contains("import type { User } from './models/User.model';"));
+		assert!(controller.contains("Promise<Array<User>>"));
+		assert!(controller
+			.contains("return (await execute_1(validatedRequest, this.runtime)) as Array<User>;"));
 		assert!(controller.contains("BadRequestException"));
 	}
 

@@ -24,7 +24,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 
 pub const BACKEND_DSL_ID: &str = "krunt.backend-dsl";
-pub const BACKEND_DSL_VERSION: &str = "0.4.0";
+pub const BACKEND_DSL_VERSION: &str = "0.5.0";
 pub const HTTP_ROUTE_NODE_TYPE: &str = "backend.http_route";
 pub const HTTP_REQUEST_NODE_TYPE: &str = "backend.http_request";
 pub const CRON_NODE_TYPE: &str = "backend.cron";
@@ -60,6 +60,7 @@ pub const CRON_SCHEDULE_PROPERTY: &str = "schedule";
 pub const SUBGRAPH_ID_PROPERTY: &str = "subgraph_id";
 pub const ENTITY_NAME_PROPERTY: &str = "name";
 pub const ENTITY_FIELDS_PROPERTY: &str = "fields";
+pub const RESPONSE_BODY_TYPE_PROPERTY: &str = "body_type";
 pub const HTTP_ROUTE_REQUEST_ENTITY_PROPERTY: &str = "request_entity";
 pub const REPOSITORY_NAME_PROPERTY: &str = "name";
 pub const REPOSITORY_ENTITY_PROPERTY: &str = "entity";
@@ -732,14 +733,22 @@ impl BackendDslPlugin {
 					),
 				],
 				outputs: Vec::new(),
-				properties: vec![BackendPropertyDescriptor::new(
-					"status_code",
-					BackendPropertyKind::INTEGER,
-					false,
-					Some(Value::Number(serde_json::Number::from(
-						SUCCESS_RESPONSE_DEFAULT_STATUS_CODE,
-					))),
-				)],
+				properties: vec![
+					BackendPropertyDescriptor::new(
+						"status_code",
+						BackendPropertyKind::INTEGER,
+						false,
+						Some(Value::Number(serde_json::Number::from(
+							SUCCESS_RESPONSE_DEFAULT_STATUS_CODE,
+						))),
+					),
+					BackendPropertyDescriptor::new(
+						RESPONSE_BODY_TYPE_PROPERTY,
+						BackendPropertyKind::STRING,
+						false,
+						None,
+					),
+				],
 			},
 			BackendNodeDescriptor {
 				type_id: error_response_type,
@@ -756,14 +765,22 @@ impl BackendDslPlugin {
 					),
 				],
 				outputs: Vec::new(),
-				properties: vec![BackendPropertyDescriptor::new(
-					"status_code",
-					BackendPropertyKind::INTEGER,
-					false,
-					Some(Value::Number(serde_json::Number::from(
-						ERROR_RESPONSE_DEFAULT_STATUS_CODE,
-					))),
-				)],
+				properties: vec![
+					BackendPropertyDescriptor::new(
+						"status_code",
+						BackendPropertyKind::INTEGER,
+						false,
+						Some(Value::Number(serde_json::Number::from(
+							ERROR_RESPONSE_DEFAULT_STATUS_CODE,
+						))),
+					),
+					BackendPropertyDescriptor::new(
+						RESPONSE_BODY_TYPE_PROPERTY,
+						BackendPropertyKind::STRING,
+						false,
+						None,
+					),
+				],
 			},
 			BackendNodeDescriptor {
 				type_id: try_catch_type,
@@ -941,6 +958,7 @@ impl krunt_plugin_api::SemanticPlugin for BackendDslPlugin {
 		diagnostics.extend(validate_subgraph_references(document));
 		diagnostics.extend(validate_entity_names(document));
 		diagnostics.extend(validate_route_request_entities(document));
+		diagnostics.extend(validate_response_body_type_references(document));
 		diagnostics.extend(validate_repository_references(document));
 		diagnostics.extend(validate_query_references(document));
 		diagnostics.extend(validate_mutation_references(document));
@@ -1006,16 +1024,10 @@ impl krunt_plugin_api::SemanticPlugin for BackendDslPlugin {
 				.map(|diagnostic| *diagnostic)
 				.into_iter()
 				.collect(),
-			SUCCESS_RESPONSE_NODE_TYPE => success_response_status_code(node)
-				.err()
-				.map(|diagnostic| *diagnostic)
-				.into_iter()
-				.collect(),
-			ERROR_RESPONSE_NODE_TYPE => error_response_status_code(node)
-				.err()
-				.map(|diagnostic| *diagnostic)
-				.into_iter()
-				.collect(),
+			SUCCESS_RESPONSE_NODE_TYPE => {
+				response_node_diagnostics(node, success_response_status_code)
+			}
+			ERROR_RESPONSE_NODE_TYPE => response_node_diagnostics(node, error_response_status_code),
 			TRY_CATCH_NODE_TYPE => Vec::new(),
 			VALIDATION_ERROR_NODE_TYPE => validation_error_message(node)
 				.err()
@@ -1206,30 +1218,38 @@ impl krunt_plugin_api::SemanticPlugin for BackendDslPlugin {
 			SUCCESS_RESPONSE_NODE_TYPE => {
 				let status_code =
 					success_response_status_code(node).map_err(|error| vec![*error])?;
+				let body_type = response_body_type(node)
+					.map_err(|error| vec![*error])?
+					.unwrap_or_else(|| RESPONSE_BODY_TYPE.to_string());
 				Ok(LoweredOperation::new(
 					OperationId::new(SUCCESS_RESPONSE_NODE_TYPE)
 						.expect("static operation is valid"),
-					[TypeId::new(RESPONSE_BODY_TYPE).expect("static type is valid")],
+					[TypeId::new(body_type.clone()).expect("validated response type is valid")],
 					[],
 					AsyncKind::SYNC,
 					[],
 				)
 				.with_return(true)
 				.with_attribute("response.kind", "SUCCESS")
-				.with_attribute("response.status_code", status_code.to_string()))
+				.with_attribute("response.status_code", status_code.to_string())
+				.with_attribute("response.body_type", body_type))
 			}
 			ERROR_RESPONSE_NODE_TYPE => {
 				let status_code = error_response_status_code(node).map_err(|error| vec![*error])?;
+				let body_type = response_body_type(node)
+					.map_err(|error| vec![*error])?
+					.unwrap_or_else(|| RESPONSE_BODY_TYPE.to_string());
 				Ok(LoweredOperation::new(
 					OperationId::new(ERROR_RESPONSE_NODE_TYPE).expect("static operation is valid"),
-					[TypeId::new(RESPONSE_BODY_TYPE).expect("static type is valid")],
+					[TypeId::new(body_type.clone()).expect("validated response type is valid")],
 					[],
 					AsyncKind::SYNC,
 					[],
 				)
 				.with_return(true)
 				.with_attribute("response.kind", "ERROR")
-				.with_attribute("response.status_code", status_code.to_string()))
+				.with_attribute("response.status_code", status_code.to_string())
+				.with_attribute("response.body_type", body_type))
 			}
 			TRY_CATCH_NODE_TYPE => Ok(LoweredOperation::new(
 				OperationId::new(TRY_CATCH_NODE_TYPE).expect("static operation is valid"),
@@ -1906,6 +1926,92 @@ fn error_response_status_code(node: &Node) -> Result<u16, Box<Diagnostic>> {
 		"BACKEND_DSL.ERROR_RESPONSE_STATUS_CODE_TYPE",
 		"BACKEND_DSL.ERROR_RESPONSE_STATUS_CODE_INVALID",
 	)
+}
+
+fn response_node_diagnostics(
+	node: &Node,
+	status_code: fn(&Node) -> Result<u16, Box<Diagnostic>>,
+) -> Vec<Diagnostic> {
+	let mut diagnostics = Vec::new();
+	if let Err(error) = status_code(node) {
+		diagnostics.push(*error);
+	}
+	if let Err(error) = response_body_type(node) {
+		diagnostics.push(*error);
+	}
+	diagnostics
+}
+
+fn response_body_type(node: &Node) -> Result<Option<String>, Box<Diagnostic>> {
+	let Some(value) = node.properties().get(RESPONSE_BODY_TYPE_PROPERTY) else {
+		return Ok(None);
+	};
+	let Some(type_reference) = value.as_str() else {
+		return Err(node_diagnostic(
+			node,
+			"BACKEND_DSL.RESPONSE_BODY_TYPE_TYPE",
+			"Response property 'body_type' must be a string.",
+		));
+	};
+	if type_reference.trim().is_empty() {
+		return Err(node_diagnostic(
+			node,
+			"BACKEND_DSL.RESPONSE_BODY_TYPE_INVALID",
+			"Response property 'body_type' must not be empty.",
+		));
+	}
+	Type::from_reference(type_reference.to_string()).map_err(|_| {
+		node_diagnostic(
+			node,
+			"BACKEND_DSL.RESPONSE_BODY_TYPE_INVALID",
+			"Response property 'body_type' must be a valid graph type reference.",
+		)
+	})?;
+	Ok(Some(type_reference.to_string()))
+}
+
+fn validate_response_body_type_references(document: &GraphDocument) -> Vec<Diagnostic> {
+	let entity_names: BTreeSet<_> = document
+		.nodes()
+		.iter()
+		.filter(|node| node.type_id().as_str() == ENTITY_NODE_TYPE)
+		.filter_map(|node| entity_name(node).ok())
+		.collect();
+	let mut diagnostics = Vec::new();
+	for node in document.nodes().iter().filter(|node| {
+		matches!(
+			node.type_id().as_str(),
+			SUCCESS_RESPONSE_NODE_TYPE | ERROR_RESPONSE_NODE_TYPE
+		)
+	}) {
+		let Ok(Some(type_reference)) = response_body_type(node) else {
+			continue;
+		};
+		let Ok(parsed) = Type::from_reference(type_reference) else {
+			continue;
+		};
+		if !response_type_references_declared_entities(&parsed, &entity_names) {
+			diagnostics.push(*node_diagnostic(
+				node,
+				"BACKEND_DSL.RESPONSE_BODY_TYPE_NOT_FOUND",
+				"Response body type references an entity that is not declared.",
+			));
+		}
+	}
+	diagnostics
+}
+
+fn response_type_references_declared_entities(
+	type_value: &Type,
+	entity_names: &BTreeSet<String>,
+) -> bool {
+	if let Some(name) = type_value.as_name() {
+		return entity_names.contains(name);
+	}
+	if let Some(element) = type_value.array_element() {
+		return response_type_references_declared_entities(element, entity_names);
+	}
+	!matches!(type_value, Type::ANY)
 }
 
 fn response_status_code(
@@ -3244,13 +3350,19 @@ mod tests {
 		assert_eq!(response.label(), "Success Response");
 		assert_eq!(response.inputs().len(), 2);
 		assert!(!response.inputs()[1].contract().required());
-		assert_eq!(response.properties().len(), 1);
+		assert_eq!(response.properties().len(), 2);
 		assert_eq!(response.properties()[0].key(), "status_code");
 		assert_eq!(
 			response.properties()[0].kind(),
 			&BackendPropertyKind::INTEGER
 		);
 		assert!(!response.properties()[0].required());
+		assert_eq!(response.properties()[1].key(), RESPONSE_BODY_TYPE_PROPERTY);
+		assert_eq!(
+			response.properties()[1].kind(),
+			&BackendPropertyKind::STRING
+		);
+		assert!(!response.properties()[1].required());
 		assert_eq!(
 			response.properties()[0].default(),
 			Some(&Value::Number(serde_json::Number::from(
@@ -3269,7 +3381,11 @@ mod tests {
 		assert_eq!(error_response.label(), "Error Response");
 		assert_eq!(error_response.inputs().len(), 2);
 		assert!(!error_response.inputs()[1].contract().required());
-		assert_eq!(error_response.properties().len(), 1);
+		assert_eq!(error_response.properties().len(), 2);
+		assert_eq!(
+			error_response.properties()[1].key(),
+			RESPONSE_BODY_TYPE_PROPERTY
+		);
 		assert_eq!(
 			error_response.properties()[0].default(),
 			Some(&Value::Number(serde_json::Number::from(
@@ -4475,6 +4591,73 @@ mod tests {
 		assert!(lowered.returns());
 		assert_eq!(lowered.attributes()["response.kind"], "SUCCESS");
 		assert_eq!(lowered.attributes()["response.status_code"], "200");
+	}
+
+	#[test]
+	fn lowers_a_typed_success_response_body() {
+		let node = Node::new(
+			NodeId::new(2).unwrap(),
+			NodeTypeId::new(SUCCESS_RESPONSE_NODE_TYPE).unwrap(),
+		)
+		.with_property(
+			RESPONSE_BODY_TYPE_PROPERTY,
+			Value::String("Array<User>".to_string()),
+		)
+		.unwrap();
+		let lowered = BackendDslPlugin::new().lower_node(&node).unwrap();
+
+		assert_eq!(
+			lowered.input_types(),
+			&[TypeId::new("Array<User>").unwrap()]
+		);
+		assert_eq!(lowered.attributes()["response.body_type"], "Array<User>");
+	}
+
+	#[test]
+	fn rejects_an_invalid_response_body_type() {
+		let node = Node::new(
+			NodeId::new(2).unwrap(),
+			NodeTypeId::new(SUCCESS_RESPONSE_NODE_TYPE).unwrap(),
+		)
+		.with_property(
+			RESPONSE_BODY_TYPE_PROPERTY,
+			Value::String("Array<>".to_string()),
+		)
+		.unwrap();
+		let diagnostics = BackendDslPlugin::new().analyze_node(&node);
+
+		assert_eq!(diagnostics.len(), 1);
+		assert_eq!(
+			diagnostics[0].code().as_str(),
+			"BACKEND_DSL.RESPONSE_BODY_TYPE_INVALID"
+		);
+	}
+
+	#[test]
+	fn rejects_a_response_body_type_for_an_undeclared_entity() {
+		let node = Node::new(
+			NodeId::new(2).unwrap(),
+			NodeTypeId::new(SUCCESS_RESPONSE_NODE_TYPE).unwrap(),
+		)
+		.with_property(
+			RESPONSE_BODY_TYPE_PROPERTY,
+			Value::String("MissingEntity".to_string()),
+		)
+		.unwrap();
+		let metadata = krunt_graph_model::GraphMetadata::new(
+			krunt_graph_model::GraphId::new(99).unwrap(),
+			"backend-v1",
+			"krunt-test",
+		)
+		.unwrap();
+		let mut builder = krunt_graph_model::GraphBuilder::new(metadata);
+		builder.add_node(node).unwrap();
+
+		let diagnostics = BackendDslPlugin::new().analyze_graph(&builder.build().unwrap());
+
+		assert!(diagnostics.iter().any(|diagnostic| {
+			diagnostic.code().as_str() == "BACKEND_DSL.RESPONSE_BODY_TYPE_NOT_FOUND"
+		}));
 	}
 
 	#[test]
