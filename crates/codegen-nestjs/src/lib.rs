@@ -11,12 +11,12 @@ use krunt_codegen_typescript::{
 };
 use krunt_framework_backend::{FrameworkBackend, GeneratedProject, ProjectError};
 use krunt_ir::GraphElementId;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt;
 
 /// Version of the NestJS framework semantic IR.
-pub const NESTJS_PROGRAM_VERSION: u32 = 2;
+pub const NESTJS_PROGRAM_VERSION: u32 = 3;
 
 /// Framework-level semantic model consumed by NestJS project rendering.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -97,6 +97,7 @@ impl NestJsEntity {
 pub struct NestJsEntityField {
 	name: String,
 	type_name: String,
+	required: bool,
 }
 
 impl NestJsEntityField {
@@ -106,6 +107,10 @@ impl NestJsEntityField {
 
 	pub fn type_name(&self) -> &str {
 		&self.type_name
+	}
+
+	pub fn required(&self) -> bool {
+		self.required
 	}
 }
 
@@ -415,19 +420,19 @@ fn entity_fields(
 	let Some(serialized) = serialized else {
 		return Ok(Vec::new());
 	};
-	let fields = serde_json::from_str::<BTreeMap<String, String>>(serialized).map_err(|_| {
-		NestJsGenerationError::INVALID_ENTITY_FIELDS {
+	let fields = serde_json::from_str::<BTreeMap<String, SerializedEntityField>>(serialized)
+		.map_err(|_| NestJsGenerationError::INVALID_ENTITY_FIELDS {
 			entity: entity.to_string(),
-		}
-	})?;
+		})?;
 	let mut result = Vec::with_capacity(fields.len());
-	for (name, type_name) in fields {
+	for (name, field) in fields {
 		if !is_typescript_property_identifier(&name) {
 			return Err(NestJsGenerationError::INVALID_ENTITY_FIELD_NAME {
 				entity: entity.to_string(),
 				field: name,
 			});
 		}
+		let (type_name, required) = field.into_parts();
 		if typescript_entity_type(&type_name).is_none() {
 			return Err(NestJsGenerationError::UNSUPPORTED_ENTITY_FIELD_TYPE {
 				entity: entity.to_string(),
@@ -435,9 +440,41 @@ fn entity_fields(
 				type_name,
 			});
 		}
-		result.push(NestJsEntityField { name, type_name });
+		result.push(NestJsEntityField {
+			name,
+			type_name,
+			required,
+		});
 	}
 	Ok(result)
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(untagged)]
+enum SerializedEntityField {
+	Legacy(String),
+	Schema {
+		#[serde(rename = "type")]
+		type_name: String,
+		#[serde(default = "default_required")]
+		required: bool,
+	},
+}
+
+impl SerializedEntityField {
+	fn into_parts(self) -> (String, bool) {
+		match self {
+			Self::Legacy(type_name) => (type_name, true),
+			Self::Schema {
+				type_name,
+				required,
+			} => (type_name, required),
+		}
+	}
+}
+
+fn default_required() -> bool {
+	true
 }
 
 fn lower_repositories(program: &TypeScriptProgram) -> Vec<NestJsRepository> {
@@ -841,6 +878,9 @@ fn entity_model(entity: &NestJsEntity) -> String {
 		for field in entity.fields() {
 			source.push_str("  ");
 			source.push_str(field.name());
+			if !field.required() {
+				source.push('?');
+			}
 			source.push_str(": ");
 			source.push_str(typescript_entity_type(field.type_name()).unwrap_or("unknown"));
 			source.push_str(";\n");
@@ -878,6 +918,9 @@ fn entity_model(entity: &NestJsEntity) -> String {
 			source.push_str(field.name());
 			source.push_str(" as ");
 			source.push_str(typescript_entity_type(field.type_name()).unwrap_or("unknown"));
+			if !field.required() {
+				source.push_str(" | undefined");
+			}
 			source.push_str(",\n");
 		}
 		source.push_str("  };\n}\n");
@@ -910,32 +953,29 @@ fn entity_field_error_type(type_name: &str) -> &'static str {
 
 fn entity_field_validation(field: &NestJsEntityField) -> String {
 	let access = format!("record.{}", field.name());
-	match field.type_name().to_ascii_lowercase().as_str() {
-		"string" => format!(
-			"typeof {access} !== 'string' || !Object.prototype.hasOwnProperty.call(record, '{}')",
-			field.name()
-		),
-		"boolean" => format!(
-			"typeof {access} !== 'boolean' || !Object.prototype.hasOwnProperty.call(record, '{}')",
-			field.name()
-		),
-		"integer" => format!(
-			"typeof {access} !== 'number' || !Number.isInteger({access}) || !Object.prototype.hasOwnProperty.call(record, '{}')",
-			field.name()
-		),
-		"float" | "number" => format!(
-			"typeof {access} !== 'number' || !Number.isFinite({access}) || !Object.prototype.hasOwnProperty.call(record, '{}')",
-			field.name()
-		),
-		"null" => format!(
-			"{access} !== null || !Object.prototype.hasOwnProperty.call(record, '{}')",
-			field.name()
-		),
-		"any" => format!(
-			"!Object.prototype.hasOwnProperty.call(record, '{}')",
-			field.name()
-		),
-		_ => "true".to_string(),
+	let presence = format!(
+		"Object.prototype.hasOwnProperty.call(record, '{}')",
+		field.name()
+	);
+	let type_check = match field.type_name().to_ascii_lowercase().as_str() {
+		"string" => Some(format!("typeof {access} !== 'string'")),
+		"boolean" => Some(format!("typeof {access} !== 'boolean'")),
+		"integer" => Some(format!(
+			"typeof {access} !== 'number' || !Number.isInteger({access})"
+		)),
+		"float" | "number" => Some(format!(
+			"typeof {access} !== 'number' || !Number.isFinite({access})"
+		)),
+		"null" => Some(format!("{access} !== null")),
+		"any" => None,
+		_ => Some("true".to_string()),
+	};
+
+	match (field.required(), type_check) {
+		(true, Some(type_check)) => format!("!{presence} || {type_check}"),
+		(true, None) => format!("!{presence}"),
+		(false, Some(type_check)) => format!("{presence} && ({type_check})"),
+		(false, None) => "false".to_string(),
 	}
 }
 
@@ -1585,7 +1625,7 @@ mod tests {
 					("backend.entity.name".to_string(), "User".to_string()),
 					(
 						"backend.entity.fields".to_string(),
-						"{\"email\":\"String\",\"id\":\"Integer\"}".to_string(),
+						"{\"email\":{\"type\":\"String\",\"required\":false},\"id\":{\"type\":\"Integer\",\"required\":true}}".to_string(),
 					),
 				]),
 				returns: false,
@@ -2115,6 +2155,8 @@ declare const process: {
 			framework_program.entities()[0].fields()[0].type_name(),
 			"String"
 		);
+		assert!(!framework_program.entities()[0].fields()[0].required());
+		assert!(framework_program.entities()[0].fields()[1].required());
 		assert_eq!(framework_program.routes()[0].request_entity(), Some("User"));
 		assert_eq!(framework_program.repositories().len(), 1);
 		assert_eq!(framework_program.repositories()[0].name(), "UserRepository");
@@ -2127,9 +2169,10 @@ declare const process: {
 		let project = NestJsBackend::generate_project(&program).unwrap();
 		assert!(project.file("src/models/User.model.ts").is_some());
 		let model = project.file("src/models/User.model.ts").unwrap();
-		assert!(model.contains("email: string;"));
+		assert!(model.contains("email?: string;"));
 		assert!(model.contains("id: number;"));
 		assert!(model.contains("export function validateUser(value: unknown): User"));
+		assert!(model.contains("Object.prototype.hasOwnProperty.call(record, 'email') && (typeof record.email !== 'string')"));
 		assert!(project
 			.file("src/repositories/UserRepositoryRepository.repository.ts")
 			.unwrap()

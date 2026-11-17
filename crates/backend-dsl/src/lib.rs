@@ -24,7 +24,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 
 pub const BACKEND_DSL_ID: &str = "krunt.backend-dsl";
-pub const BACKEND_DSL_VERSION: &str = "0.1.0";
+pub const BACKEND_DSL_VERSION: &str = "0.2.0";
 pub const HTTP_ROUTE_NODE_TYPE: &str = "backend.http_route";
 pub const HTTP_REQUEST_NODE_TYPE: &str = "backend.http_request";
 pub const CRON_NODE_TYPE: &str = "backend.cron";
@@ -1241,7 +1241,14 @@ struct RouteProperties {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct EntityProperties {
 	name: String,
-	fields: BTreeMap<String, String>,
+	fields: BTreeMap<String, EntityFieldProperties>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct EntityFieldProperties {
+	#[serde(rename = "type")]
+	type_name: String,
+	required: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2391,7 +2398,7 @@ fn entity_properties(node: &Node) -> Result<EntityProperties, Box<Diagnostic>> {
 		None => BTreeMap::new(),
 		Some(Value::Object(fields)) => {
 			let mut validated = BTreeMap::new();
-			for (field_name, field_type) in fields {
+			for (field_name, field_schema) in fields {
 				if !is_identifier(field_name) {
 					return Err(node_diagnostic(
 						node,
@@ -2399,14 +2406,44 @@ fn entity_properties(node: &Node) -> Result<EntityProperties, Box<Diagnostic>> {
 						format!("Entity field name '{field_name}' must be a valid identifier."),
 					));
 				}
-				let Some(field_type) = field_type.as_str() else {
-					return Err(node_diagnostic(
-						node,
-						"BACKEND_DSL.ENTITY_FIELD_TYPE",
-						format!("Entity field '{field_name}' type must be a string."),
-					));
+				let (field_type, required) = match field_schema {
+					Value::String(field_type) => (field_type.clone(), true),
+					Value::Object(schema) => {
+						let Some(field_type) = schema.get("type").and_then(Value::as_str) else {
+							return Err(node_diagnostic(
+								node,
+								"BACKEND_DSL.ENTITY_FIELD_TYPE",
+								format!(
+									"Entity field '{field_name}' schema must contain a string 'type'."
+								),
+							));
+						};
+						let required = match schema.get("required") {
+							None => true,
+							Some(Value::Bool(required)) => *required,
+							Some(_) => {
+								return Err(node_diagnostic(
+									node,
+									"BACKEND_DSL.ENTITY_FIELD_REQUIRED_TYPE",
+									format!(
+										"Entity field '{field_name}' property 'required' must be a boolean."
+									),
+								));
+							}
+						};
+						(field_type.to_string(), required)
+					}
+					_ => {
+						return Err(node_diagnostic(
+							node,
+							"BACKEND_DSL.ENTITY_FIELD_TYPE",
+							format!(
+								"Entity field '{field_name}' must be a type string or a schema object."
+							),
+						));
+					}
 				};
-				let parsed_type = Type::from_reference(field_type).map_err(|_| {
+				let parsed_type = Type::from_reference(field_type.as_str()).map_err(|_| {
 					node_diagnostic(
 						node,
 						"BACKEND_DSL.ENTITY_FIELD_TYPE_INVALID",
@@ -2422,7 +2459,13 @@ fn entity_properties(node: &Node) -> Result<EntityProperties, Box<Diagnostic>> {
 						),
 					));
 				}
-				validated.insert(field_name.clone(), field_type.to_string());
+				validated.insert(
+					field_name.clone(),
+					EntityFieldProperties {
+						type_name: field_type,
+						required,
+					},
+				);
 			}
 			validated
 		}
@@ -3213,14 +3256,17 @@ mod tests {
 		.unwrap()
 		.with_property(
 			ENTITY_FIELDS_PROPERTY,
-			serde_json::json!({"email": "String", "id": "Integer"}),
+			serde_json::json!({
+				"email": {"type": "String", "required": false},
+				"id": {"type": "Integer", "required": true}
+			}),
 		)
 		.unwrap();
 		let lowered = plugin.lower_node(&node).unwrap();
 
 		assert_eq!(
 			lowered.attributes()["backend.entity.fields"],
-			"{\"email\":\"String\",\"id\":\"Integer\"}"
+			"{\"email\":{\"type\":\"String\",\"required\":false},\"id\":{\"type\":\"Integer\",\"required\":true}}"
 		);
 	}
 
@@ -3241,6 +3287,13 @@ mod tests {
 			.clone()
 			.with_property(ENTITY_FIELDS_PROPERTY, serde_json::json!({"id": 1}))
 			.unwrap();
+		let wrong_required = base
+			.clone()
+			.with_property(
+				ENTITY_FIELDS_PROPERTY,
+				serde_json::json!({"id": {"type": "Integer", "required": "yes"}}),
+			)
+			.unwrap();
 		let unsupported = base
 			.with_property(
 				ENTITY_FIELDS_PROPERTY,
@@ -3255,6 +3308,10 @@ mod tests {
 		assert_eq!(
 			plugin.analyze_node(&wrong_type)[0].code().as_str(),
 			"BACKEND_DSL.ENTITY_FIELD_TYPE"
+		);
+		assert_eq!(
+			plugin.analyze_node(&wrong_required)[0].code().as_str(),
+			"BACKEND_DSL.ENTITY_FIELD_REQUIRED_TYPE"
 		);
 		assert_eq!(
 			plugin.analyze_node(&unsupported)[0].code().as_str(),

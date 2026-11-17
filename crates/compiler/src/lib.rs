@@ -1153,7 +1153,10 @@ mod tests {
 		.unwrap()
 		.with_property(
 			ENTITY_FIELDS_PROPERTY,
-			serde_json::json!({"email": "String", "id": "Integer"}),
+			serde_json::json!({
+				"email": {"type": "String", "required": false},
+				"id": {"type": "Integer", "required": true}
+			}),
 		)
 		.unwrap();
 		let repository = Node::new(
@@ -1677,7 +1680,7 @@ mod tests {
 			.expect("entity should be lowered into IR");
 		assert_eq!(
 			entity.attributes["backend.entity.fields"],
-			"{\"email\":\"String\",\"id\":\"Integer\"}"
+			"{\"email\":{\"type\":\"String\",\"required\":false},\"id\":{\"type\":\"Integer\",\"required\":true}}"
 		);
 		let route = result
 			.ir()

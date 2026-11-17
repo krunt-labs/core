@@ -1197,7 +1197,7 @@ mod tests {
 					("backend.entity.name".to_string(), "User".to_string()),
 					(
 						"backend.entity.fields".to_string(),
-						"{\"id\":\"Integer\"}".to_string(),
+						"{\"id\":{\"type\":\"Integer\",\"required\":true}}".to_string(),
 					),
 				]),
 				returns: false,
@@ -1228,7 +1228,7 @@ mod tests {
 		assert_eq!(declaration.attributes()["backend.entity.name"], "User");
 		assert_eq!(
 			declaration.attributes()["backend.entity.fields"],
-			"{\"id\":\"Integer\"}"
+			"{\"id\":{\"type\":\"Integer\",\"required\":true}}"
 		);
 		assert_eq!(
 			declaration.source().primary,
