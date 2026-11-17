@@ -591,10 +591,11 @@ fn render_function(function: &TypeScriptFunction) -> String {
 	} else {
 		""
 	};
+	let response_type = http_response_type(function);
 	let return_type = if function.async_kind == AsyncKind::ASYNC {
-		"Promise<unknown>"
+		format!("Promise<{response_type}>")
 	} else {
-		"unknown"
+		response_type
 	};
 	let request_parameter = http_request_parameter(function);
 	let parameters = match (accepts_request, requires_runtime) {
@@ -672,6 +673,17 @@ fn http_request_parameter(function: &TypeScriptFunction) -> String {
 		Some(request_type) => format!("request: {request_type}"),
 		None => "request: unknown = undefined".to_string(),
 	}
+}
+
+fn http_response_type(function: &TypeScriptFunction) -> String {
+	function
+		.operations
+		.iter()
+		.find(|operation| matches!(operation.kind(), TypeScriptOperationKind::RETURN))
+		.and_then(|operation| operation.attributes().get("response.body_type"))
+		.filter(|type_name| type_name.as_str() != "ANY")
+		.cloned()
+		.unwrap_or_else(|| "unknown".to_string())
 }
 
 fn operation_declarations(function: &TypeScriptFunction) -> BTreeMap<String, String> {
@@ -1453,6 +1465,70 @@ mod tests {
 				source: SourceMap::node(GraphNodeId(10)),
 			})
 			.unwrap();
+		builder
+			.add_node(IRNode {
+				id: krunt_ir::IrNodeId(2),
+				op: IROp::OPERATION {
+					name: OperationId::new("backend.query").unwrap(),
+				},
+				input_types: Vec::new(),
+				output_types: vec![TypeId::new("Array<User>").unwrap()],
+				async_kind: AsyncKind::ASYNC,
+				effects: Vec::new(),
+				attributes: BTreeMap::from([
+					("backend.persistence.kind".to_string(), "QUERY".to_string()),
+					("backend.query.name".to_string(), "ListUsers".to_string()),
+					(
+						"backend.query.repository".to_string(),
+						"UserRepository".to_string(),
+					),
+				]),
+				returns: false,
+				source: SourceMap::node(GraphNodeId(20)),
+			})
+			.unwrap();
+		builder
+			.add_node(IRNode {
+				id: krunt_ir::IrNodeId(3),
+				op: IROp::RETURN,
+				input_types: vec![TypeId::new("Array<User>").unwrap()],
+				output_types: Vec::new(),
+				async_kind: AsyncKind::ASYNC,
+				effects: Vec::new(),
+				attributes: BTreeMap::from([(
+					"response.body_type".to_string(),
+					"Array<User>".to_string(),
+				)]),
+				returns: true,
+				source: SourceMap::node(GraphNodeId(30)),
+			})
+			.unwrap();
+		for (from, to) in [(1, 2), (2, 3)] {
+			builder
+				.add_control_edge(ControlEdge {
+					from: PortRef {
+						node: krunt_ir::IrNodeId(from),
+						index: 0,
+					},
+					to: PortRef {
+						node: krunt_ir::IrNodeId(to),
+						index: 0,
+					},
+				})
+				.unwrap();
+		}
+		builder
+			.add_data_edge(DataEdge {
+				from: PortRef {
+					node: krunt_ir::IrNodeId(2),
+					index: 0,
+				},
+				to: PortRef {
+					node: krunt_ir::IrNodeId(3),
+					index: 0,
+				},
+			})
+			.unwrap();
 
 		let program = TypeScriptBackend::lower_graph(&builder.build().unwrap()).unwrap();
 		let source = TypeScriptSourceRenderer::render_program(&program)
@@ -1460,7 +1536,11 @@ mod tests {
 			.remove("generated.ts")
 			.unwrap();
 
-		assert!(source.contains("export async function execute_1(request: User): Promise<unknown>"));
+		assert!(
+			source.contains(
+				"export async function execute_1(request: User, runtime: KruntRuntime): Promise<Array<User>>",
+			)
+		);
 	}
 
 	#[test]

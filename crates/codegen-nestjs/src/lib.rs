@@ -963,13 +963,9 @@ export class AppController {{
 			if route.response_kind() == NestJsResponseKind::ERROR {
 				source.push_str("    const result = ");
 				if route.response_body_type().is_some() {
-					source.push_str("(await ");
+					source.push_str("await ");
 				}
 				source.push_str(&invocation);
-				if let Some(response_type) = route.response_body_type() {
-					source.push_str(") as ");
-					source.push_str(response_type);
-				}
 				source.push_str(";\n    throw new HttpException(result ?? '");
 				source.push_str(&escape_single_quoted(
 					route.error_message().unwrap_or("Request failed"),
@@ -979,11 +975,9 @@ export class AppController {{
 				source.push_str(");\n  }\n");
 			} else {
 				source.push_str("    return ");
-				if let Some(response_type) = route.response_body_type() {
-					source.push_str("(await ");
+				if route.response_body_type().is_some() {
+					source.push_str("await ");
 					source.push_str(&invocation);
-					source.push_str(") as ");
-					source.push_str(response_type);
 				} else {
 					source.push_str(&invocation);
 				}
@@ -2493,15 +2487,14 @@ declare const process: {
 		assert!(project
 			.file("src/generated.ts")
 			.unwrap()
-			.contains("export async function execute_1(request: User, runtime: KruntRuntime): Promise<unknown>"));
+			.contains("export async function execute_1(request: User, runtime: KruntRuntime): Promise<Array<User>>"));
 		let controller = project.file("src/app.controller.ts").unwrap();
 		assert!(controller.contains("@Body() request: User"));
 		assert!(controller.contains("let validatedRequest: User;"));
 		assert!(controller.contains("validateUser(request)"));
 		assert!(controller.contains("import type { User } from './models/User.model';"));
 		assert!(controller.contains("Promise<Array<User>>"));
-		assert!(controller
-			.contains("return (await execute_1(validatedRequest, this.runtime)) as Array<User>;"));
+		assert!(controller.contains("return await execute_1(validatedRequest, this.runtime);"));
 		assert!(controller.contains("BadRequestException"));
 	}
 
