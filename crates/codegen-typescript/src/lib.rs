@@ -717,8 +717,8 @@ fn is_runtime_operation(operation: &TypeScriptOperation) -> bool {
 fn runtime_interface() -> &'static str {
 	r#"export interface KruntRuntime {
   httpRequest(method: string, url: string, request: unknown): Promise<unknown>;
-  query(name: string, repository: string): Promise<unknown>;
-  mutation(name: string, repository: string, value: unknown): Promise<unknown>;
+  query<TOutput>(name: string, repository: string): Promise<TOutput>;
+  mutation<TInput, TOutput>(name: string, repository: string, value: TInput): Promise<TOutput>;
   log(level: string, message: unknown): void;
   storageRead(key: string): Promise<unknown>;
   storageWrite(key: string, value: unknown): Promise<unknown>;
@@ -799,7 +799,8 @@ fn runtime_invocation(
 		== Some("QUERY")
 	{
 		return Some(format!(
-			"runtime.query({}, {})",
+			"runtime.query<{}>({}, {})",
+			render_type_annotation(operation.output_types().first()),
 			string_literal(attributes.get("backend.query.name")?),
 			string_literal(attributes.get("backend.query.repository")?),
 		));
@@ -810,7 +811,9 @@ fn runtime_invocation(
 		== Some("MUTATION")
 	{
 		return Some(format!(
-			"runtime.mutation({}, {}, {})",
+			"runtime.mutation<{}, {}>({}, {}, {})",
+			render_type_annotation(operation.input_types().first()),
+			render_type_annotation(operation.output_types().first()),
 			string_literal(attributes.get("backend.mutation.name")?),
 			string_literal(attributes.get("backend.mutation.repository")?),
 			input(0),
@@ -845,6 +848,13 @@ fn runtime_invocation(
 			_ => None,
 		},
 		_ => None,
+	}
+}
+
+fn render_type_annotation(type_value: Option<&TypeScriptType>) -> String {
+	match type_value {
+		Some(TypeScriptType::ANY) | None => "unknown".to_string(),
+		Some(TypeScriptType::NAMED { name }) => name.clone(),
 	}
 }
 

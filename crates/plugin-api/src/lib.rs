@@ -102,6 +102,22 @@ impl LoweredOperation {
 		self
 	}
 
+	/// Replace the lowered data input types after semantic context has been
+	/// resolved. This is used by plugins whose ports depend on declarations in
+	/// the surrounding graph document.
+	pub fn with_input_types(mut self, input_types: impl IntoIterator<Item = TypeId>) -> Self {
+		self.input_types = input_types.into_iter().collect();
+		self
+	}
+
+	/// Replace the lowered data output types after semantic context has been
+	/// resolved. This is used by plugins whose ports depend on declarations in
+	/// the surrounding graph document.
+	pub fn with_output_types(mut self, output_types: impl IntoIterator<Item = TypeId>) -> Self {
+		self.output_types = output_types.into_iter().collect();
+		self
+	}
+
 	/// Mark this operation as a target-neutral return/terminal operation.
 	pub fn with_return(mut self, returns: bool) -> Self {
 		self.returns = returns;
@@ -309,6 +325,19 @@ pub trait SemanticPlugin: Send + Sync {
 	}
 
 	fn lower_node(&self, node: &Node) -> Result<LoweredOperation, Vec<Diagnostic>>;
+
+	/// Lower a node with access to the complete source document when a semantic
+	/// plugin needs to resolve declarations or references outside the node.
+	/// Plugins that do not need document context retain the simple node-only
+	/// lowering contract by inheriting this default.
+	fn lower_node_in_document(
+		&self,
+		node: &Node,
+		document: &GraphDocument,
+	) -> Result<LoweredOperation, Vec<Diagnostic>> {
+		let _ = document;
+		self.lower_node(node)
+	}
 }
 
 /// Deterministic, explicitly-owned registry of semantic plugins.

@@ -24,7 +24,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 
 pub const BACKEND_DSL_ID: &str = "krunt.backend-dsl";
-pub const BACKEND_DSL_VERSION: &str = "0.3.0";
+pub const BACKEND_DSL_VERSION: &str = "0.4.0";
 pub const HTTP_ROUTE_NODE_TYPE: &str = "backend.http_route";
 pub const HTTP_REQUEST_NODE_TYPE: &str = "backend.http_request";
 pub const CRON_NODE_TYPE: &str = "backend.cron";
@@ -65,6 +65,7 @@ pub const REPOSITORY_NAME_PROPERTY: &str = "name";
 pub const REPOSITORY_ENTITY_PROPERTY: &str = "entity";
 pub const QUERY_NAME_PROPERTY: &str = "name";
 pub const QUERY_REPOSITORY_PROPERTY: &str = "repository";
+pub const QUERY_CARDINALITY_PROPERTY: &str = "cardinality";
 pub const MUTATION_NAME_PROPERTY: &str = "name";
 pub const MUTATION_REPOSITORY_PROPERTY: &str = "repository";
 pub const HTTP_REQUEST_METHOD_PROPERTY: &str = "method";
@@ -98,6 +99,29 @@ impl StorageOperation {
 			Self::WRITE => STORAGE_WRITE_EFFECT,
 		};
 		EffectId::new(effect).expect("static effect is valid")
+	}
+}
+
+#[allow(non_camel_case_types)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum QueryCardinality {
+	MANY,
+	SINGLE,
+}
+
+impl QueryCardinality {
+	fn as_str(self) -> &'static str {
+		match self {
+			Self::MANY => "many",
+			Self::SINGLE => "single",
+		}
+	}
+
+	fn output_type(self, entity: &str) -> String {
+		match self {
+			Self::MANY => format!("Array<{entity}>"),
+			Self::SINGLE => entity.to_string(),
+		}
 	}
 }
 
@@ -618,6 +642,14 @@ impl BackendDslPlugin {
 						true,
 						None,
 					),
+					BackendPropertyDescriptor::new(
+						QUERY_CARDINALITY_PROPERTY,
+						BackendPropertyKind::ENUM {
+							values: vec!["many".to_string(), "single".to_string()],
+						},
+						false,
+						Some(Value::String("many".to_string())),
+					),
 				],
 			},
 			BackendNodeDescriptor {
@@ -1118,7 +1150,8 @@ impl krunt_plugin_api::SemanticPlugin for BackendDslPlugin {
 				)
 				.with_attribute("backend.persistence.kind", "QUERY")
 				.with_attribute("backend.query.name", properties.name)
-				.with_attribute("backend.query.repository", properties.repository))
+				.with_attribute("backend.query.repository", properties.repository)
+				.with_attribute("backend.query.cardinality", properties.cardinality.as_str()))
 			}
 			MUTATION_NODE_TYPE => {
 				let properties = mutation_properties(node).map_err(|error| vec![*error])?;
@@ -1229,6 +1262,77 @@ impl krunt_plugin_api::SemanticPlugin for BackendDslPlugin {
 			_ => unreachable!("registry only resolves Backend DSL node types"),
 		}
 	}
+
+	fn lower_node_in_document(
+		&self,
+		node: &Node,
+		document: &GraphDocument,
+	) -> Result<LoweredOperation, Vec<Diagnostic>> {
+		let lowered = self.lower_node(node)?;
+		match node.type_id().as_str() {
+			QUERY_NODE_TYPE => {
+				let properties = query_properties(node).map_err(|error| vec![*error])?;
+				let entity = repository_entity(document, node, &properties.repository)?;
+				let output_type = properties.cardinality.output_type(&entity);
+				Ok(lowered
+					.with_output_types([TypeId::new(output_type.clone())
+						.expect("validated persistence output type is valid")])
+					.with_attribute("backend.persistence.entity", entity)
+					.with_attribute("backend.persistence.output_type", output_type))
+			}
+			MUTATION_NODE_TYPE => {
+				let properties = mutation_properties(node).map_err(|error| vec![*error])?;
+				let entity = repository_entity(document, node, &properties.repository)?;
+				let entity_type = TypeId::new(entity.clone())
+					.expect("validated persistence entity type is valid");
+				Ok(lowered
+					.with_input_types([entity_type.clone()])
+					.with_output_types([entity_type])
+					.with_attribute("backend.persistence.entity", entity.clone())
+					.with_attribute("backend.persistence.input_type", entity.clone())
+					.with_attribute("backend.persistence.output_type", entity))
+			}
+			_ => Ok(lowered),
+		}
+	}
+}
+
+fn repository_entity(
+	document: &GraphDocument,
+	node: &Node,
+	repository_name: &str,
+) -> Result<String, Vec<Diagnostic>> {
+	for repository in document
+		.nodes()
+		.iter()
+		.filter(|candidate| candidate.type_id().as_str() == REPOSITORY_NODE_TYPE)
+	{
+		let Ok(properties) = repository_properties(repository) else {
+			continue;
+		};
+		if properties.name == repository_name {
+			return Ok(properties.entity);
+		}
+	}
+
+	let code = if node.type_id().as_str() == QUERY_NODE_TYPE {
+		"BACKEND_DSL.QUERY_REPOSITORY_NOT_FOUND"
+	} else {
+		"BACKEND_DSL.MUTATION_REPOSITORY_NOT_FOUND"
+	};
+	Err(vec![*node_diagnostic(
+		node,
+		code,
+		format!(
+			"{} references repository '{}', but that repository is not declared.",
+			if node.type_id().as_str() == QUERY_NODE_TYPE {
+				"Query"
+			} else {
+				"Mutation"
+			},
+			repository_name
+		),
+	)])
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2630,6 +2734,7 @@ fn repository_properties(node: &Node) -> Result<RepositoryProperties, Box<Diagno
 struct QueryProperties {
 	name: String,
 	repository: String,
+	cardinality: QueryCardinality,
 }
 
 fn query_properties(node: &Node) -> Result<QueryProperties, Box<Diagnostic>> {
@@ -2651,7 +2756,32 @@ fn query_properties(node: &Node) -> Result<QueryProperties, Box<Diagnostic>> {
 		"BACKEND_DSL.QUERY_REPOSITORY_TYPE",
 		"BACKEND_DSL.QUERY_REPOSITORY_INVALID",
 	)?;
-	Ok(QueryProperties { name, repository })
+	let cardinality = match node.properties().get(QUERY_CARDINALITY_PROPERTY) {
+		None => QueryCardinality::MANY,
+		Some(Value::String(value)) => match value.as_str() {
+			"many" => QueryCardinality::MANY,
+			"single" => QueryCardinality::SINGLE,
+			_ => {
+				return Err(node_diagnostic(
+					node,
+					"BACKEND_DSL.QUERY_CARDINALITY_INVALID",
+					"Query cardinality must be either 'many' or 'single'.",
+				))
+			}
+		},
+		Some(_) => {
+			return Err(node_diagnostic(
+				node,
+				"BACKEND_DSL.QUERY_CARDINALITY_TYPE",
+				"Query property 'cardinality' must be a string.",
+			))
+		}
+	};
+	Ok(QueryProperties {
+		name,
+		repository,
+		cardinality,
+	})
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -3665,13 +3795,13 @@ mod tests {
 		assert_eq!(descriptor.inputs()[0].name(), "in");
 		assert_eq!(descriptor.outputs()[0].name(), "next");
 		assert_eq!(descriptor.outputs()[1].name(), "result");
-		assert_eq!(descriptor.properties().len(), 2);
+		assert_eq!(descriptor.properties().len(), 3);
 		assert_eq!(descriptor.properties()[0].key(), QUERY_NAME_PROPERTY);
 		assert_eq!(descriptor.properties()[1].key(), QUERY_REPOSITORY_PROPERTY);
-		assert!(descriptor
-			.properties()
-			.iter()
-			.all(|property| property.required()));
+		assert_eq!(descriptor.properties()[2].key(), QUERY_CARDINALITY_PROPERTY);
+		assert!(descriptor.properties()[0].required());
+		assert!(descriptor.properties()[1].required());
+		assert!(!descriptor.properties()[2].required());
 
 		let node = Node::new(
 			NodeId::new(2).unwrap(),
@@ -3702,6 +3832,7 @@ mod tests {
 			lowered.attributes()["backend.query.repository"],
 			"UserRepository"
 		);
+		assert_eq!(lowered.attributes()["backend.query.cardinality"], "many");
 	}
 
 	#[test]
@@ -3726,6 +3857,18 @@ mod tests {
 				Value::String("User Repository".to_string()),
 			)
 			.unwrap();
+		let invalid_cardinality = missing_repository
+			.clone()
+			.with_property(
+				QUERY_REPOSITORY_PROPERTY,
+				Value::String("UserRepository".to_string()),
+			)
+			.unwrap()
+			.with_property(
+				QUERY_CARDINALITY_PROPERTY,
+				Value::String("invalid".to_string()),
+			)
+			.unwrap();
 
 		assert_eq!(
 			plugin.analyze_node(&missing)[0].code().as_str(),
@@ -3742,6 +3885,10 @@ mod tests {
 		assert_eq!(
 			plugin.analyze_node(&invalid_repository)[0].code().as_str(),
 			"BACKEND_DSL.QUERY_REPOSITORY_INVALID"
+		);
+		assert_eq!(
+			plugin.analyze_node(&invalid_cardinality)[0].code().as_str(),
+			"BACKEND_DSL.QUERY_CARDINALITY_INVALID"
 		);
 
 		let metadata = krunt_graph_model::GraphMetadata::new(

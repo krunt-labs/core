@@ -89,7 +89,7 @@ pub fn compile(document: &GraphDocument, plugins: &PluginRegistry) -> Compilatio
 			.get(&node.id())
 			.expect("contracts were collected during semantic analysis");
 
-		match plugin.lower_node(node) {
+		match plugin.lower_node_in_document(node, document) {
 			Ok(lowered) => {
 				if !validate_lowered_operation(node, contract, &lowered, &mut diagnostics) {
 					continue;
@@ -267,7 +267,7 @@ fn validate_lowered_operation(
 	for (actual, expected) in lowered.input_types().iter().zip(expected_inputs) {
 		if expected
 			.type_id()
-			.is_some_and(|expected| expected != actual)
+			.is_some_and(|expected| expected.as_str() != "ANY" && expected != actual)
 		{
 			valid = false;
 			diagnostics.push(contract_diagnostic(
@@ -283,7 +283,7 @@ fn validate_lowered_operation(
 	for (actual, expected) in lowered.output_types().iter().zip(expected_outputs) {
 		if expected
 			.type_id()
-			.is_some_and(|expected| expected != actual)
+			.is_some_and(|expected| expected.as_str() != "ANY" && expected != actual)
 		{
 			valid = false;
 			diagnostics.push(contract_diagnostic(
@@ -936,10 +936,10 @@ mod tests {
 		ENTITY_NODE_TYPE, HTTP_REQUEST_EFFECT, HTTP_REQUEST_METHOD_PROPERTY,
 		HTTP_REQUEST_NODE_TYPE, HTTP_REQUEST_TYPE, HTTP_REQUEST_URL_PROPERTY, HTTP_ROUTE_NODE_TYPE,
 		HTTP_ROUTE_REQUEST_ENTITY_PROPERTY, LOGGING_EFFECT, LOGGING_LEVEL_PROPERTY,
-		LOGGING_NODE_TYPE, QUERY_NAME_PROPERTY, QUERY_NODE_TYPE, QUERY_REPOSITORY_PROPERTY,
-		REPOSITORY_ENTITY_PROPERTY, REPOSITORY_NAME_PROPERTY, REPOSITORY_NODE_TYPE,
-		STORAGE_KEY_PROPERTY, STORAGE_NODE_TYPE, STORAGE_OPERATION_PROPERTY, STORAGE_READ_EFFECT,
-		SUCCESS_RESPONSE_NODE_TYPE,
+		LOGGING_NODE_TYPE, QUERY_CARDINALITY_PROPERTY, QUERY_NAME_PROPERTY, QUERY_NODE_TYPE,
+		QUERY_REPOSITORY_PROPERTY, REPOSITORY_ENTITY_PROPERTY, REPOSITORY_NAME_PROPERTY,
+		REPOSITORY_NODE_TYPE, STORAGE_KEY_PROPERTY, STORAGE_NODE_TYPE, STORAGE_OPERATION_PROPERTY,
+		STORAGE_READ_EFFECT, SUCCESS_RESPONSE_NODE_TYPE,
 	};
 	use krunt_graph_model::{
 		Edge, EdgeId, EdgeKind, GraphBuilder, GraphId, GraphMetadata, NodeId, NodeTypeId,
@@ -1095,6 +1095,12 @@ mod tests {
 			serde_json::Value::String("UserRepository".into()),
 		)
 		.unwrap();
+		query = query
+			.with_property(
+				QUERY_CARDINALITY_PROPERTY,
+				serde_json::Value::String("many".into()),
+			)
+			.unwrap();
 		query
 			.add_port(Port::new(
 				PortId::new(21).unwrap(),
@@ -1675,6 +1681,12 @@ mod tests {
 			.expect("query should be lowered into IR");
 		assert_eq!(query.async_kind, AsyncKind::ASYNC);
 		assert_eq!(query.output_types.len(), 1);
+		assert_eq!(query.output_types[0].as_str(), "Array<User>");
+		assert_eq!(query.attributes["backend.persistence.entity"], "User");
+		assert_eq!(
+			query.attributes["backend.persistence.output_type"],
+			"Array<User>"
+		);
 		assert_eq!(
 			query.effects,
 			vec![EffectId::new(DATABASE_READ_EFFECT).unwrap()]

@@ -7,7 +7,7 @@
 
 use krunt_codegen_typescript::{
 	TypeScriptFunction, TypeScriptOperation, TypeScriptOperationKind, TypeScriptProgram,
-	TypeScriptRenderError, TypeScriptSourceRenderer,
+	TypeScriptRenderError, TypeScriptSourceRenderer, TypeScriptType,
 };
 use krunt_framework_backend::{FrameworkBackend, GeneratedProject, ProjectError};
 use krunt_ir::GraphElementId;
@@ -141,6 +141,8 @@ pub struct NestJsRepositoryMethod {
 	operation_id: u32,
 	name: String,
 	kind: NestJsRepositoryMethodKind,
+	input_type: String,
+	output_type: String,
 	source: String,
 }
 
@@ -155,6 +157,14 @@ impl NestJsRepositoryMethod {
 
 	pub fn kind(&self) -> NestJsRepositoryMethodKind {
 		self.kind
+	}
+
+	pub fn input_type(&self) -> &str {
+		&self.input_type
+	}
+
+	pub fn output_type(&self) -> &str {
+		&self.output_type
 	}
 
 	pub fn source(&self) -> &str {
@@ -288,6 +298,11 @@ impl FrameworkBackend for NestJsBackend {
 		for (path, content) in TypeScriptSourceRenderer::render_program(program)
 			.map_err(NestJsGenerationError::TYPESCRIPT_RENDER)?
 		{
+			let content = if path == "generated.ts" {
+				prepend_entity_type_imports(content, &framework_program)
+			} else {
+				content
+			};
 			files.push((format!("src/{path}"), content));
 		}
 		files.extend(static_project_files(&framework_program));
@@ -612,6 +627,16 @@ fn lower_repositories(program: &TypeScriptProgram) -> Vec<NestJsRepository> {
 			operation_id: operation.id().as_u32(),
 			name: name.clone(),
 			kind,
+			input_type: operation
+				.input_types()
+				.first()
+				.map(render_typescript_type)
+				.unwrap_or_else(|| "unknown".to_string()),
+			output_type: operation
+				.output_types()
+				.first()
+				.map(render_typescript_type)
+				.unwrap_or_else(|| "unknown".to_string()),
 			source: source_marker(operation.source()),
 		});
 	}
@@ -622,6 +647,13 @@ fn lower_repositories(program: &TypeScriptProgram) -> Vec<NestJsRepository> {
 		repository.methods.dedup();
 	}
 	repositories
+}
+
+fn render_typescript_type(type_value: &TypeScriptType) -> String {
+	match type_value {
+		TypeScriptType::ANY => "unknown".to_string(),
+		TypeScriptType::NAMED { name } => name.clone(),
+	}
 }
 
 fn persistence_operation(
@@ -766,6 +798,22 @@ fn static_project_files(program: &NestJsProgram) -> Vec<(String, String)> {
 		files.push(("src/krunt-runtime.ts".to_string(), krunt_runtime(program)));
 	}
 	files
+}
+
+fn prepend_entity_type_imports(mut source: String, program: &NestJsProgram) -> String {
+	let imports = program
+		.entities()
+		.iter()
+		.map(|entity| {
+			let name = type_identifier(entity.name(), "Entity");
+			format!("import type {{ {name} }} from './models/{name}.model';\n",)
+		})
+		.collect::<String>();
+	if imports.is_empty() {
+		return source;
+	}
+	source.insert_str(0, &format!("{imports}\n"));
+	source
 }
 
 fn needs_runtime_file(program: &NestJsProgram) -> bool {
@@ -1188,9 +1236,15 @@ fn repository_provider(repository: &NestJsRepository) -> String {
 		source.push_str("  async ");
 		source.push_str(&method_identifier(method.name(), "operation"));
 		if method.kind() == NestJsRepositoryMethodKind::MUTATION {
-			source.push_str("(value: unknown): Promise<unknown> {\n");
+			source.push_str("(value: ");
+			source.push_str(method.input_type());
+			source.push_str("): Promise<");
+			source.push_str(method.output_type());
+			source.push_str("> {\n");
 		} else {
-			source.push_str("(): Promise<unknown> {\n");
+			source.push_str("(): Promise<");
+			source.push_str(method.output_type());
+			source.push_str("> {\n");
 		}
 		source.push_str("    throw new Error('Repository method ");
 		source.push_str(&escape_single_quoted(repository.name()));
@@ -1469,20 +1523,20 @@ fn krunt_runtime(program: &NestJsProgram) -> String {
     }
   }
 
-  async query(name: string, repository: string): Promise<unknown> {
+  async query<TOutput>(name: string, repository: string): Promise<TOutput> {
     const adapter = this.repository(repository);
     if (adapter === undefined) {
       throw new Error(`No repository provider configured for query ${repository}.${name}`);
     }
-    return adapter.execute('QUERY', name, undefined);
+    return adapter.execute('QUERY', name, undefined) as Promise<TOutput>;
   }
 
-  async mutation(name: string, repository: string, value: unknown): Promise<unknown> {
+  async mutation<TInput, TOutput>(name: string, repository: string, value: TInput): Promise<TOutput> {
     const adapter = this.repository(repository);
     if (adapter === undefined) {
       throw new Error(`No repository provider configured for mutation ${repository}.${name}`);
     }
-    return adapter.execute('MUTATION', name, value);
+    return adapter.execute('MUTATION', name, value) as Promise<TOutput>;
   }
 
   log(level: string, message: unknown): void {
@@ -1730,12 +1784,18 @@ mod tests {
 					name: OperationId::new("backend.query").unwrap(),
 				},
 				input_types: Vec::new(),
-				output_types: vec![TypeId::new("ResponseBody").unwrap()],
+				output_types: vec![TypeId::new("Array<User>").unwrap()],
 				async_kind: AsyncKind::ASYNC,
 				effects: Vec::new(),
 				attributes: std::collections::BTreeMap::from([
 					("backend.persistence.kind".to_string(), "QUERY".to_string()),
 					("backend.query.name".to_string(), "ListUsers".to_string()),
+					("backend.query.cardinality".to_string(), "many".to_string()),
+					("backend.persistence.entity".to_string(), "User".to_string()),
+					(
+						"backend.persistence.output_type".to_string(),
+						"Array<User>".to_string(),
+					),
 					(
 						"backend.query.repository".to_string(),
 						"UserRepository".to_string(),
@@ -1749,7 +1809,7 @@ mod tests {
 			.add_node(IRNode {
 				id: krunt_ir::IrNodeId(3),
 				op: IROp::RETURN,
-				input_types: vec![TypeId::new("ResponseBody").unwrap()],
+				input_types: vec![TypeId::new("Array<User>").unwrap()],
 				output_types: Vec::new(),
 				async_kind: AsyncKind::ASYNC,
 				effects: Vec::new(),
@@ -2323,6 +2383,14 @@ declare const process: {
 			framework_program.repositories()[0].methods()[0].kind(),
 			NestJsRepositoryMethodKind::QUERY
 		);
+		assert_eq!(
+			framework_program.repositories()[0].methods()[0].input_type(),
+			"unknown"
+		);
+		assert_eq!(
+			framework_program.repositories()[0].methods()[0].output_type(),
+			"Array<User>"
+		);
 
 		let project = NestJsBackend::generate_project(&program).unwrap();
 		assert!(project.file("src/models/User.model.ts").is_some());
@@ -2339,7 +2407,7 @@ declare const process: {
 		assert!(project
 			.file("src/repositories/UserRepositoryRepository.repository.ts")
 			.unwrap()
-			.contains("async listUsers(): Promise<unknown>"));
+			.contains("async listUsers(): Promise<Array<User>>"));
 		assert!(project
 			.file("src/app.module.ts")
 			.unwrap()
@@ -2351,7 +2419,7 @@ declare const process: {
 		assert!(project
 			.file("src/generated.ts")
 			.unwrap()
-			.contains("runtime.query(\"ListUsers\", \"UserRepository\")"));
+			.contains("runtime.query<Array<User>>(\"ListUsers\", \"UserRepository\")"));
 		let controller = project.file("src/app.controller.ts").unwrap();
 		assert!(controller.contains("@Body() request: unknown"));
 		assert!(controller.contains("validateUser(request)"));
