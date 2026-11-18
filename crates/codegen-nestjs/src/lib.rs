@@ -135,12 +135,21 @@ pub enum NestJsRepositoryMethodKind {
 	QUERY,
 }
 
+/// Cardinality preserved for a generated repository query.
+#[allow(non_camel_case_types)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+pub enum NestJsQueryCardinality {
+	MANY,
+	SINGLE,
+}
+
 /// One query or mutation method exposed by a generated repository provider.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct NestJsRepositoryMethod {
 	operation_id: u32,
 	name: String,
 	kind: NestJsRepositoryMethodKind,
+	query_cardinality: Option<NestJsQueryCardinality>,
 	input_type: String,
 	output_type: String,
 	source: String,
@@ -157,6 +166,10 @@ impl NestJsRepositoryMethod {
 
 	pub fn kind(&self) -> NestJsRepositoryMethodKind {
 		self.kind
+	}
+
+	pub fn query_cardinality(&self) -> Option<NestJsQueryCardinality> {
+		self.query_cardinality
 	}
 
 	pub fn input_type(&self) -> &str {
@@ -632,6 +645,14 @@ fn lower_repositories(program: &TypeScriptProgram) -> Vec<NestJsRepository> {
 			operation_id: operation.id().as_u32(),
 			name: name.clone(),
 			kind,
+			query_cardinality: (kind == NestJsRepositoryMethodKind::QUERY).then(|| match operation
+				.attributes()
+				.get("backend.query.cardinality")
+				.map(String::as_str)
+			{
+				Some("single") => NestJsQueryCardinality::SINGLE,
+				_ => NestJsQueryCardinality::MANY,
+			}),
 			input_type: operation
 				.input_types()
 				.first()
@@ -1263,6 +1284,9 @@ fn repository_provider(repository: &NestJsRepository) -> String {
 	source.push_str("export class ");
 	source.push_str(&class_name);
 	source.push_str(" implements KruntRepository {\n");
+	source.push_str("  private readonly records: Array<");
+	source.push_str(&entity_name);
+	source.push_str("> = [];\n\n");
 	source.push_str(
 		"  async execute(kind: KruntRepositoryOperation, name: string, value: unknown): Promise<unknown> {\n",
 	);
@@ -1278,7 +1302,9 @@ fn repository_provider(repository: &NestJsRepository) -> String {
 		source.push_str("': return this.");
 		source.push_str(&method_identifier(method.name(), "operation"));
 		if method.kind() == NestJsRepositoryMethodKind::MUTATION {
-			source.push_str("(value);");
+			source.push_str("(value as ");
+			source.push_str(method.input_type());
+			source.push_str(");");
 		} else {
 			source.push_str("();");
 		}
@@ -1303,11 +1329,33 @@ fn repository_provider(repository: &NestJsRepository) -> String {
 			source.push_str(method.output_type());
 			source.push_str("> {\n");
 		}
-		source.push_str("    throw new Error('Repository method ");
-		source.push_str(&escape_single_quoted(repository.name()));
-		source.push('.');
-		source.push_str(&escape_single_quoted(method.name()));
-		source.push_str(" requires a persistence adapter.');\n  }\n\n");
+		match method.kind() {
+			NestJsRepositoryMethodKind::QUERY => match method.query_cardinality() {
+				Some(NestJsQueryCardinality::SINGLE) => {
+					source.push_str("    const record = this.records[0];\n");
+					source.push_str("    if (record === undefined) {\n      throw new Error('No record found for repository query ");
+					source.push_str(&escape_single_quoted(repository.name()));
+					source.push('.');
+					source.push_str(&escape_single_quoted(method.name()));
+					source.push_str(".');\n    }\n    return record as ");
+					source.push_str(method.output_type());
+					source.push_str(";\n");
+				}
+				Some(NestJsQueryCardinality::MANY) | None => {
+					source.push_str("    return this.records as ");
+					source.push_str(method.output_type());
+					source.push_str(";\n");
+				}
+			},
+			NestJsRepositoryMethodKind::MUTATION => {
+				source.push_str("    const record = value as ");
+				source.push_str(entity_name.as_str());
+				source.push_str(";\n    this.records.push(record);\n    return record as ");
+				source.push_str(method.output_type());
+				source.push_str(";\n");
+			}
+		}
+		source.push_str("  }\n\n");
 	}
 	source.push_str("}\n");
 	source
@@ -1498,7 +1546,7 @@ fn package_json() -> String {
 
 fn project_readme(program: &NestJsProgram) -> String {
 	let runtime_note = if needs_runtime_file(program) {
-		"\n`src/krunt-runtime.ts` is the generated runtime adapter. Repository providers are generated as readable persistence seams; replace their stub methods with the application's database integrations before production deployment.\n"
+		"\n`src/krunt-runtime.ts` is the generated runtime adapter. Repository providers use a deterministic in-memory store so the generated project can run immediately; replace that provider implementation with the application's database integration before production deployment.\n"
 	} else {
 		""
 	};
@@ -2210,6 +2258,68 @@ mod tests {
 		fs::remove_dir_all(&directory).expect("remove generated project typecheck directory");
 	}
 
+	fn assert_generated_project_runtime_smokes(project: &GeneratedProject, label: &str) {
+		let directory = std::env::temp_dir().join(format!(
+			"krunt-generated-runtime-{label}-{}-{}",
+			std::process::id(),
+			TYPECHECK_DIRECTORY_COUNTER.fetch_add(1, Ordering::Relaxed)
+		));
+		fs::create_dir_all(&directory).expect("create generated project runtime directory");
+
+		for (path, content) in project.files() {
+			let file_path = directory.join(path);
+			if let Some(parent) = file_path.parent() {
+				fs::create_dir_all(parent)
+					.expect("create generated project runtime file directory");
+			}
+			fs::write(file_path, content).expect("write generated project runtime file");
+		}
+		fs::write(directory.join("runtime-smoke.ts"), RUNTIME_SMOKE_SOURCE)
+			.expect("write generated project runtime smoke source");
+		fs::write(directory.join("tsconfig.runtime.json"), RUNTIME_TSCONFIG)
+			.expect("write generated project runtime configuration");
+
+		let tsc = std::env::var("KRUNT_TSC").unwrap_or_else(|_| "tsc".to_string());
+		let compile = Command::new(&tsc)
+			.args(["-p", "tsconfig.runtime.json", "--pretty", "false"])
+			.current_dir(&directory)
+			.output()
+			.unwrap_or_else(|error| {
+				panic!(
+					"generated project runtime compilation could not start for {label} using {tsc}: {error}. Set KRUNT_TSC to a TypeScript compiler path."
+				)
+			});
+		if !compile.status.success() {
+			let stdout = String::from_utf8_lossy(&compile.stdout);
+			let stderr = String::from_utf8_lossy(&compile.stderr);
+			panic!(
+				"generated project runtime compilation failed for {label} in {}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+				directory.display()
+			);
+		}
+
+		let node = std::env::var("KRUNT_NODE").unwrap_or_else(|_| "node".to_string());
+		let run = Command::new(&node)
+			.arg("dist/runtime-smoke.js")
+			.current_dir(&directory)
+			.output()
+			.unwrap_or_else(|error| {
+				panic!(
+					"generated project runtime smoke could not start for {label} using {node}: {error}. Set KRUNT_NODE to a Node.js path."
+				)
+			});
+		if !run.status.success() {
+			let stdout = String::from_utf8_lossy(&run.stdout);
+			let stderr = String::from_utf8_lossy(&run.stderr);
+			panic!(
+				"generated project runtime smoke failed for {label} in {}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+				directory.display()
+			);
+		}
+
+		fs::remove_dir_all(&directory).expect("remove generated project runtime directory");
+	}
+
 	const TYPECHECK_TSCONFIG: &str = r#"{
   "extends": "./tsconfig.json",
   "compilerOptions": {
@@ -2252,6 +2362,50 @@ declare module '@nestjs/core' {
 declare const process: {
   env: Record<string, string | undefined>;
 };
+"#;
+
+	const RUNTIME_TSCONFIG: &str = r#"{
+  "compilerOptions": {
+    "target": "ES2021",
+    "module": "commonjs",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "outDir": "dist",
+    "types": []
+  },
+  "include": [
+    "src/generated.ts",
+    "src/krunt-runtime.ts",
+    "src/models/**/*.ts",
+    "src/repositories/**/*.ts",
+    "runtime-smoke.ts"
+  ]
+}
+"#;
+
+	const RUNTIME_SMOKE_SOURCE: &str = r#"import { execute_1 } from './src/generated';
+import { KruntRuntimeService } from './src/krunt-runtime';
+import { UserRepositoryRepository } from './src/repositories/UserRepositoryRepository.repository';
+import type { User } from './src/models/User.model';
+
+async function main(): Promise<void> {
+  const runtime = new KruntRuntimeService(new UserRepositoryRepository());
+  const users = await execute_1({ id: 1, tags: [] } satisfies User, runtime);
+  if (!Array.isArray(users) || users.length !== 0) {
+    throw new Error('expected the generated repository query to start empty');
+  }
+  const value = await runtime.storageWrite('smoke', { ok: true });
+  const stored = await runtime.storageRead('smoke');
+  if (value !== stored) {
+    throw new Error('expected generated storage effects to round-trip');
+  }
+}
+
+void main().catch((error: unknown) => {
+  console.error(error);
+  throw error;
+});
 "#;
 
 	#[test]
@@ -2478,6 +2632,10 @@ declare const process: {
 			framework_program.repositories()[0].methods()[0].output_type(),
 			"Array<User>"
 		);
+		assert_eq!(
+			framework_program.repositories()[0].methods()[0].query_cardinality(),
+			Some(NestJsQueryCardinality::MANY)
+		);
 
 		let project = NestJsBackend::generate_project(&program).unwrap();
 		assert!(project.file("src/models/User.model.ts").is_some());
@@ -2495,6 +2653,18 @@ declare const process: {
 			.file("src/repositories/UserRepositoryRepository.repository.ts")
 			.unwrap()
 			.contains("async listUsers(): Promise<Array<User>>"));
+		assert!(project
+			.file("src/repositories/UserRepositoryRepository.repository.ts")
+			.unwrap()
+			.contains("private readonly records: Array<User> = [];"));
+		assert!(project
+			.file("src/repositories/UserRepositoryRepository.repository.ts")
+			.unwrap()
+			.contains("return this.records as Array<User>;"));
+		assert!(!project
+			.file("src/repositories/UserRepositoryRepository.repository.ts")
+			.unwrap()
+			.contains("requires a persistence adapter"));
 		assert!(project
 			.file("src/app.module.ts")
 			.unwrap()
@@ -2519,6 +2689,44 @@ declare const process: {
 		assert!(controller.contains("Promise<Array<User>>"));
 		assert!(controller.contains("return await execute_1(validatedRequest, this.runtime);"));
 		assert!(controller.contains("BadRequestException"));
+		assert_generated_project_runtime_smokes(&project, "persistence");
+	}
+
+	#[test]
+	fn renders_typed_in_memory_repository_queries_and_mutations() {
+		let repository = NestJsRepository {
+			id: 1,
+			name: "UserRepository".to_string(),
+			entity: "User".to_string(),
+			source: "node:1".to_string(),
+			methods: vec![
+				NestJsRepositoryMethod {
+					operation_id: 2,
+					name: "FindUser".to_string(),
+					kind: NestJsRepositoryMethodKind::QUERY,
+					query_cardinality: Some(NestJsQueryCardinality::SINGLE),
+					input_type: "unknown".to_string(),
+					output_type: "User".to_string(),
+					source: "node:2".to_string(),
+				},
+				NestJsRepositoryMethod {
+					operation_id: 3,
+					name: "CreateUser".to_string(),
+					kind: NestJsRepositoryMethodKind::MUTATION,
+					query_cardinality: None,
+					input_type: "User".to_string(),
+					output_type: "User".to_string(),
+					source: "node:3".to_string(),
+				},
+			],
+		};
+		let source = repository_provider(&repository);
+
+		assert!(source.contains("const record = this.records[0];"));
+		assert!(source.contains("No record found for repository query UserRepository.FindUser."));
+		assert!(source.contains("createUser(value as User)"));
+		assert!(source.contains("this.records.push(record);"));
+		assert!(source.contains("return record as User;"));
 	}
 
 	#[test]
