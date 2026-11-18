@@ -10,7 +10,7 @@
 use krunt_diagnostics::{CompilerStage, Diagnostic, DiagnosticCode, GraphElementId, Severity};
 use krunt_graph_model::{
 	EdgeKind, GraphDocument, Node, NodeId, NodeTypeId, PluginReference, PortDirection, PortId,
-	PortKind, SubgraphId,
+	PortKind, Subgraph, SubgraphId,
 };
 use krunt_ir::{AsyncKind, EffectId, OperationId, TypeId};
 use krunt_plugin_api::{
@@ -1113,12 +1113,12 @@ impl krunt_plugin_api::SemanticPlugin for BackendDslPlugin {
 					OperationId::new(SUBGRAPH_NODE_TYPE).expect("static operation is valid"),
 					[],
 					[],
-					AsyncKind::SYNC,
+					AsyncKind::ASYNC,
 					[],
 				)
 				.with_kind(LoweredOperationKind::SUBGRAPH)
 				.with_attribute("control.kind", "SUBGRAPH")
-				.with_attribute("backend.subgraph.id", subgraph_id.as_u64().to_string()))
+				.with_subgraph_id(subgraph_id.as_u64()))
 			}
 			ENTITY_NODE_TYPE => {
 				let properties = entity_properties(node).map_err(|error| vec![*error])?;
@@ -1664,7 +1664,7 @@ fn subgraph_contract() -> NodeContract {
 		[],
 		[],
 		[],
-		AsyncKind::SYNC,
+		AsyncKind::ASYNC,
 		[],
 	)
 }
@@ -2139,9 +2139,21 @@ fn validate_subgraph_references(document: &GraphDocument) -> Vec<Diagnostic> {
 		.iter()
 		.map(|subgraph| (subgraph.id(), subgraph))
 		.collect();
+	let node_port_owners: BTreeMap<PortId, NodeId> = document
+		.nodes()
+		.iter()
+		.flat_map(|node| node.ports().iter().map(move |port| (port.id(), node.id())))
+		.collect();
 	let mut dependencies = BTreeMap::<SubgraphId, BTreeSet<SubgraphId>>::new();
 	let mut invocations = Vec::new();
 	let mut diagnostics = Vec::new();
+	for subgraph in document.subgraphs() {
+		diagnostics.extend(validate_subgraph_boundaries(
+			document,
+			subgraph,
+			&node_port_owners,
+		));
+	}
 
 	for node in document
 		.nodes()
@@ -2224,6 +2236,23 @@ fn subgraph_reaches(
 		}
 	}
 	false
+}
+
+fn subgraph_port_diagnostic(
+	port: PortId,
+	code: &str,
+	message: impl Into<String>,
+) -> Box<Diagnostic> {
+	Box::new(
+		Diagnostic::new(
+			DiagnosticCode::new(code).expect("static diagnostic code is valid"),
+			Severity::ERROR,
+			CompilerStage::SEMANTIC_ANALYSIS,
+			message,
+			GraphElementId::PORT(port),
+		)
+		.expect("static Backend DSL diagnostic is valid"),
+	)
 }
 
 fn validate_entity_names(document: &GraphDocument) -> Vec<Diagnostic> {
@@ -3074,6 +3103,116 @@ fn port_diagnostic(
 	)
 }
 
+fn validate_subgraph_boundaries(
+	document: &GraphDocument,
+	subgraph: &Subgraph,
+	node_port_owners: &BTreeMap<PortId, NodeId>,
+) -> Vec<Diagnostic> {
+	let mut diagnostics = Vec::new();
+	let input_boundaries = subgraph
+		.ports()
+		.iter()
+		.filter(|port| {
+			port.direction() == PortDirection::OUTPUT && port.kind() == PortKind::EXECUTION
+		})
+		.count();
+	let output_boundaries = subgraph
+		.ports()
+		.iter()
+		.filter(|port| {
+			port.direction() == PortDirection::INPUT && port.kind() == PortKind::EXECUTION
+		})
+		.count();
+	if input_boundaries != 1 {
+		diagnostics.push(*subgraph_diagnostic(
+			document,
+			"BACKEND_DSL.SUBGRAPH_INPUT_BOUNDARY_COUNT",
+			format!(
+				"Subgraph {} must declare exactly one execution input boundary.",
+				subgraph.id().as_u64()
+			),
+		));
+	}
+	if output_boundaries != 1 {
+		diagnostics.push(*subgraph_diagnostic(
+			document,
+			"BACKEND_DSL.SUBGRAPH_OUTPUT_BOUNDARY_COUNT",
+			format!(
+				"Subgraph {} must declare exactly one execution output boundary.",
+				subgraph.id().as_u64()
+			),
+		));
+	}
+
+	for port in subgraph.ports() {
+		if port.kind() != PortKind::EXECUTION {
+			diagnostics.push(*subgraph_port_diagnostic(
+				port.id(),
+				"BACKEND_DSL.SUBGRAPH_BOUNDARY_KIND",
+				"Subgraph boundaries must use execution ports in Backend DSL v1.",
+			));
+			continue;
+		}
+		let matching_edges: Vec<_> = document
+			.edges()
+			.iter()
+			.filter(|edge| match port.direction() {
+				PortDirection::OUTPUT => edge.from() == port.id(),
+				PortDirection::INPUT => edge.to() == port.id(),
+			})
+			.collect();
+		if matching_edges.len() != 1 {
+			diagnostics.push(*subgraph_port_diagnostic(
+				port.id(),
+				"BACKEND_DSL.SUBGRAPH_BOUNDARY_UNCONNECTED",
+				"Every subgraph execution boundary must have exactly one connecting edge.",
+			));
+			continue;
+		}
+		let edge = matching_edges[0];
+		let connected_port = match port.direction() {
+			PortDirection::OUTPUT => edge.to(),
+			PortDirection::INPUT => edge.from(),
+		};
+		let Some(owner) = node_port_owners.get(&connected_port) else {
+			diagnostics.push(*subgraph_port_diagnostic(
+				port.id(),
+				"BACKEND_DSL.SUBGRAPH_BOUNDARY_TARGET",
+				"Subgraph boundaries must connect directly to a node port.",
+			));
+			continue;
+		};
+		if !subgraph.nodes().contains(owner) {
+			diagnostics.push(*subgraph_port_diagnostic(
+				port.id(),
+				"BACKEND_DSL.SUBGRAPH_BOUNDARY_TARGET",
+				"Subgraph boundaries must connect to a node inside the referenced subgraph.",
+			));
+		}
+	}
+
+	diagnostics
+}
+
+fn subgraph_diagnostic(
+	document: &GraphDocument,
+	code: &str,
+	message: impl Into<String>,
+) -> Box<Diagnostic> {
+	Box::new(
+		Diagnostic::new(
+			DiagnosticCode::new(code).expect("static diagnostic code is valid"),
+			Severity::ERROR,
+			CompilerStage::SEMANTIC_ANALYSIS,
+			message,
+			GraphElementId::GRAPH(
+				krunt_graph_model::GraphId::new(document.metadata().graph_id().as_u64()).unwrap(),
+			),
+		)
+		.expect("static Backend DSL diagnostic is valid"),
+	)
+}
+
 impl fmt::Display for BackendPropertyKind {
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		write!(formatter, "{self:?}")
@@ -3451,7 +3590,7 @@ mod tests {
 		let lowered = plugin.lower_node(&node).unwrap();
 		assert_eq!(lowered.kind(), LoweredOperationKind::SUBGRAPH);
 		assert_eq!(lowered.attributes()["control.kind"], "SUBGRAPH");
-		assert_eq!(lowered.attributes()["backend.subgraph.id"], "40");
+		assert_eq!(lowered.subgraph_id(), Some(40));
 	}
 
 	#[test]
@@ -3555,6 +3694,54 @@ mod tests {
 		assert!(diagnostics
 			.iter()
 			.any(|diagnostic| diagnostic.code().as_str() == "BACKEND_DSL.SUBGRAPH_RECURSION"));
+	}
+
+	#[test]
+	fn rejects_subgraph_boundaries_without_one_connected_execution_input_and_output() {
+		let metadata = krunt_graph_model::GraphMetadata::new(
+			krunt_graph_model::GraphId::new(21).unwrap(),
+			"backend-v1",
+			"krunt-test",
+		)
+		.unwrap();
+		let invocation = Node::new(
+			NodeId::new(1).unwrap(),
+			NodeTypeId::new(SUBGRAPH_NODE_TYPE).unwrap(),
+		)
+		.with_property(
+			SUBGRAPH_ID_PROPERTY,
+			Value::Number(serde_json::Number::from(40)),
+		)
+		.unwrap();
+		let mut builder = krunt_graph_model::GraphBuilder::new(metadata);
+		builder.add_node(invocation).unwrap();
+		builder
+			.add_subgraph(
+				krunt_graph_model::Subgraph::new(
+					SubgraphId::new(40).unwrap(),
+					[],
+					[krunt_graph_model::SubgraphPort::new(
+						PortId::new(41).unwrap(),
+						PortDirection::OUTPUT,
+						PortKind::DATA,
+					)],
+				)
+				.unwrap(),
+			)
+			.unwrap();
+
+		let diagnostics = BackendDslPlugin::new().analyze_graph(&builder.build().unwrap());
+		assert!(diagnostics
+			.iter()
+			.any(|diagnostic| diagnostic.code().as_str() == "BACKEND_DSL.SUBGRAPH_BOUNDARY_KIND"));
+		assert!(diagnostics
+			.iter()
+			.any(|diagnostic| diagnostic.code().as_str()
+				== "BACKEND_DSL.SUBGRAPH_INPUT_BOUNDARY_COUNT"));
+		assert!(diagnostics
+			.iter()
+			.any(|diagnostic| diagnostic.code().as_str()
+				== "BACKEND_DSL.SUBGRAPH_OUTPUT_BOUNDARY_COUNT"));
 	}
 
 	#[test]

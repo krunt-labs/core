@@ -9,8 +9,8 @@ use krunt_diagnostics::{
 };
 use krunt_graph_model::{EdgeKind, GraphDocument, Node, PortDirection, PortId, PortKind};
 use krunt_ir::{
-	eliminate_unreachable_nodes, BuildError, ControlEdge, DataEdge, GraphNodeId, IRBuilder,
-	IRGraph, IRNode, IROp, PortRef, SourceMap,
+	eliminate_unreachable_nodes, BuildError, ControlEdge, DataEdge, GraphNodeId, GraphSubgraphId,
+	IRBuilder, IRGraph, IRNode, IROp, IRSubgraph, IRSubgraphBoundary, PortRef, SourceMap,
 };
 use krunt_plugin_api::{
 	CapabilityId, LoweredOperation, LoweredOperationKind, NodeContract, PluginRegistry,
@@ -110,7 +110,15 @@ pub fn compile(document: &GraphDocument, plugins: &PluginRegistry) -> Compilatio
 	}
 
 	if !diagnostics.has_errors() {
+		let subgraph_ports: BTreeSet<_> = document
+			.subgraphs()
+			.iter()
+			.flat_map(|subgraph| subgraph.ports().iter().map(|port| port.id()))
+			.collect();
 		for edge in document.edges() {
+			if subgraph_ports.contains(&edge.from()) || subgraph_ports.contains(&edge.to()) {
+				continue;
+			}
 			match edge.kind() {
 				EdgeKind::EXECUTION => add_control_edge(
 					edge.from(),
@@ -128,6 +136,7 @@ pub fn compile(document: &GraphDocument, plugins: &PluginRegistry) -> Compilatio
 				),
 			}
 		}
+		build_ir_subgraphs(document, &port_bindings, &mut builder, &mut diagnostics);
 	}
 
 	let ir = if diagnostics.has_errors() {
@@ -318,6 +327,17 @@ fn validate_lowered_operation(
 			GraphElementId::NODE(krunt_graph_model::NodeId::new(node.id().as_u64()).unwrap()),
 		));
 	}
+	if lowered.kind() == LoweredOperationKind::SUBGRAPH && lowered.subgraph_id().is_none() {
+		valid = false;
+		diagnostics.push(contract_diagnostic(
+			"CONTRACT.SUBGRAPH_TARGET",
+			format!(
+				"Node '{}' lowered as a subgraph without a target identity.",
+				node.type_id().as_str()
+			),
+			GraphElementId::NODE(krunt_graph_model::NodeId::new(node.id().as_u64()).unwrap()),
+		));
+	}
 	valid
 }
 
@@ -487,9 +507,13 @@ fn validate_whole_graph(
 		.nodes()
 		.iter()
 		.filter(|node| {
-			contracts
-				.get(&node.id())
-				.is_some_and(NodeContract::is_entry)
+			!document
+				.subgraphs()
+				.iter()
+				.any(|subgraph| subgraph.nodes().contains(&node.id()))
+				&& contracts
+					.get(&node.id())
+					.is_some_and(NodeContract::is_entry)
 		})
 		.map(Node::id)
 		.collect();
@@ -519,6 +543,13 @@ fn validate_whole_graph(
 			}
 		}
 		for node in document.nodes() {
+			if document
+				.subgraphs()
+				.iter()
+				.any(|subgraph| subgraph.nodes().contains(&node.id()))
+			{
+				continue;
+			}
 			if contracts
 				.get(&node.id())
 				.is_some_and(|contract| is_declaration_node(node, contract))
@@ -710,6 +741,86 @@ fn register_port_bindings(
 	}
 }
 
+fn build_ir_subgraphs(
+	document: &GraphDocument,
+	port_bindings: &BTreeMap<PortId, PortBinding>,
+	builder: &mut IRBuilder,
+	diagnostics: &mut Diagnostics,
+) {
+	let node_ir_ids: BTreeMap<_, _> = document
+		.nodes()
+		.iter()
+		.enumerate()
+		.map(|(index, node)| (node.id(), krunt_ir::IrNodeId((index + 1) as u32)))
+		.collect();
+
+	for subgraph in document.subgraphs() {
+		let nodes: Vec<_> = subgraph
+			.nodes()
+			.iter()
+			.filter_map(|node| node_ir_ids.get(node).copied())
+			.collect();
+		let mut inputs = Vec::new();
+		let mut outputs = Vec::new();
+
+		for source_boundary in subgraph.ports() {
+			let Some(edge) =
+				document
+					.edges()
+					.iter()
+					.find(|edge| match source_boundary.direction() {
+						PortDirection::OUTPUT => edge.from() == source_boundary.id(),
+						PortDirection::INPUT => edge.to() == source_boundary.id(),
+					})
+			else {
+				continue;
+			};
+			let connected_port = match source_boundary.direction() {
+				PortDirection::OUTPUT => edge.to(),
+				PortDirection::INPUT => edge.from(),
+			};
+			let Some(binding) = port_bindings.get(&connected_port).copied() else {
+				diagnostics.push(missing_port_diagnostic(connected_port));
+				continue;
+			};
+			if !subgraph
+				.nodes()
+				.iter()
+				.any(|node| node_ir_ids.get(node) == Some(&binding.ir_node))
+			{
+				continue;
+			}
+			let boundary = IRSubgraphBoundary {
+				port: krunt_ir::GraphPortId(source_boundary.id().as_u64()),
+				target: PortRef {
+					node: binding.ir_node,
+					index: binding.index,
+				},
+			};
+			match source_boundary.direction() {
+				PortDirection::OUTPUT => inputs.push(boundary),
+				PortDirection::INPUT => outputs.push(boundary),
+			}
+		}
+
+		let ir_subgraph = IRSubgraph {
+			id: GraphSubgraphId(subgraph.id().as_u64()),
+			nodes,
+			inputs,
+			outputs,
+		};
+		if let Err(error) = builder.add_subgraph(ir_subgraph) {
+			diagnostics.push(ir_build_diagnostic(
+				GraphElementId::GRAPH(
+					krunt_graph_model::GraphId::new(document.metadata().graph_id().as_u64())
+						.unwrap(),
+				),
+				error,
+			));
+		}
+	}
+}
+
 fn add_control_edge(
 	from: PortId,
 	to: PortId,
@@ -822,7 +933,13 @@ fn ir_node(
 				LoweredOperationKind::BRANCH => IROp::BRANCH,
 				LoweredOperationKind::MERGE => IROp::MERGE,
 				LoweredOperationKind::LOOP => IROp::LOOP,
-				LoweredOperationKind::SUBGRAPH => IROp::SUBGRAPH,
+				LoweredOperationKind::SUBGRAPH => IROp::SUBGRAPH {
+					id: GraphSubgraphId(
+						lowered
+							.subgraph_id()
+							.expect("subgraph lowering was validated before IR construction"),
+					),
+				},
 			}
 		},
 		input_types: lowered.input_types().to_vec(),

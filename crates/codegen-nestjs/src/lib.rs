@@ -420,12 +420,7 @@ fn lower_nestjs_program(
 			.modules()
 			.iter()
 			.flat_map(|module| module.functions())
-			.any(|function| {
-				function
-					.operations()
-					.iter()
-					.any(|operation| operation.requires_runtime())
-			}),
+			.any(TypeScriptFunction::requires_runtime),
 		entities,
 		repositories,
 		routes,
@@ -764,10 +759,7 @@ fn lower_routes(
 				response_kind,
 				response_body_type,
 				request_entity,
-				requires_runtime: function
-					.operations()
-					.iter()
-					.any(|operation| operation.requires_runtime()),
+				requires_runtime: function.requires_runtime(),
 			});
 		}
 	}
@@ -1723,14 +1715,15 @@ fn tsconfig_build() -> String {
 mod tests {
 	use super::*;
 	use krunt_backend_dsl::{
-		BackendDslPlugin, ERROR_RESPONSE_NODE_TYPE, HTTP_REQUEST_TYPE, HTTP_ROUTE_NODE_TYPE,
+		BackendDslPlugin, ENTITY_NODE_TYPE, ERROR_RESPONSE_NODE_TYPE, HTTP_REQUEST_TYPE,
+		HTTP_ROUTE_NODE_TYPE, QUERY_NODE_TYPE, REPOSITORY_NODE_TYPE, SUBGRAPH_NODE_TYPE,
 		SUCCESS_RESPONSE_NODE_TYPE, TRANSFORM_NODE_TYPE, VALIDATION_ERROR_NODE_TYPE,
 	};
 	use krunt_codegen_typescript::TypeScriptBackend;
 	use krunt_framework_backend::GeneratedProject;
 	use krunt_graph_model::{
 		Edge, EdgeId, EdgeKind, GraphBuilder, GraphId, GraphMetadata, Node, NodeId, NodeTypeId,
-		Port, PortDirection, PortId, PortKind, TypeReference,
+		Port, PortDirection, PortId, PortKind, Subgraph, SubgraphId, SubgraphPort, TypeReference,
 	};
 	use krunt_ir::{
 		AsyncKind, ControlEdge, DataEdge, GraphNodeId, IRBuilder, IRNode, IROp, OperationId,
@@ -2025,6 +2018,193 @@ mod tests {
 		backend_dsl_program_with_response(VALIDATION_ERROR_NODE_TYPE, 422)
 	}
 
+	fn backend_dsl_subgraph_program() -> TypeScriptProgram {
+		let metadata =
+			GraphMetadata::new(GraphId::new(40).unwrap(), "backend-v1", "krunt-test").unwrap();
+		let mut builder = GraphBuilder::new(metadata);
+
+		let mut route = Node::new(
+			NodeId::new(1).unwrap(),
+			NodeTypeId::new(HTTP_ROUTE_NODE_TYPE).unwrap(),
+		)
+		.with_property("method", Value::String("GET".to_string()))
+		.unwrap()
+		.with_property("path", Value::String("/users".to_string()))
+		.unwrap()
+		.with_property("request_entity", Value::String("User".to_string()))
+		.unwrap();
+		route
+			.add_port(Port::new(
+				PortId::new(11).unwrap(),
+				PortDirection::OUTPUT,
+				PortKind::EXECUTION,
+			))
+			.unwrap();
+		route
+			.add_port(
+				Port::new(
+					PortId::new(12).unwrap(),
+					PortDirection::OUTPUT,
+					PortKind::DATA,
+				)
+				.with_type_reference(TypeReference::new("ANY").unwrap()),
+			)
+			.unwrap();
+
+		let mut invocation = Node::new(
+			NodeId::new(2).unwrap(),
+			NodeTypeId::new(SUBGRAPH_NODE_TYPE).unwrap(),
+		)
+		.with_property("subgraph_id", Value::Number(serde_json::Number::from(40)))
+		.unwrap();
+		invocation
+			.add_port(Port::new(
+				PortId::new(21).unwrap(),
+				PortDirection::INPUT,
+				PortKind::EXECUTION,
+			))
+			.unwrap();
+		invocation
+			.add_port(Port::new(
+				PortId::new(22).unwrap(),
+				PortDirection::OUTPUT,
+				PortKind::EXECUTION,
+			))
+			.unwrap();
+
+		let mut response = Node::new(
+			NodeId::new(3).unwrap(),
+			NodeTypeId::new(SUCCESS_RESPONSE_NODE_TYPE).unwrap(),
+		)
+		.with_property("status_code", Value::Number(serde_json::Number::from(200)))
+		.unwrap()
+		.with_property("body_type", Value::String("User".to_string()))
+		.unwrap();
+		response
+			.add_port(Port::new(
+				PortId::new(31).unwrap(),
+				PortDirection::INPUT,
+				PortKind::EXECUTION,
+			))
+			.unwrap();
+		response
+			.add_port(
+				Port::new(
+					PortId::new(32).unwrap(),
+					PortDirection::INPUT,
+					PortKind::DATA,
+				)
+				.with_type_reference(TypeReference::new("ANY").unwrap()),
+			)
+			.unwrap();
+
+		let entity = Node::new(
+			NodeId::new(4).unwrap(),
+			NodeTypeId::new(ENTITY_NODE_TYPE).unwrap(),
+		)
+		.with_property("name", Value::String("User".to_string()))
+		.unwrap()
+		.with_property(
+			"fields",
+			serde_json::json!({
+				"id": { "type": "Integer", "required": true },
+				"tags": { "type": { "kind": "array", "items": "String" }, "required": true }
+			}),
+		)
+		.unwrap();
+		let repository = Node::new(
+			NodeId::new(5).unwrap(),
+			NodeTypeId::new(REPOSITORY_NODE_TYPE).unwrap(),
+		)
+		.with_property("name", Value::String("UserRepository".to_string()))
+		.unwrap()
+		.with_property("entity", Value::String("User".to_string()))
+		.unwrap();
+
+		let mut query = Node::new(
+			NodeId::new(6).unwrap(),
+			NodeTypeId::new(QUERY_NODE_TYPE).unwrap(),
+		)
+		.with_property("name", Value::String("ListUsers".to_string()))
+		.unwrap()
+		.with_property("repository", Value::String("UserRepository".to_string()))
+		.unwrap()
+		.with_property("cardinality", Value::String("many".to_string()))
+		.unwrap();
+		query
+			.add_port(Port::new(
+				PortId::new(61).unwrap(),
+				PortDirection::INPUT,
+				PortKind::EXECUTION,
+			))
+			.unwrap();
+		query
+			.add_port(Port::new(
+				PortId::new(62).unwrap(),
+				PortDirection::OUTPUT,
+				PortKind::EXECUTION,
+			))
+			.unwrap();
+		query
+			.add_port(
+				Port::new(
+					PortId::new(63).unwrap(),
+					PortDirection::OUTPUT,
+					PortKind::DATA,
+				)
+				.with_type_reference(TypeReference::new("ANY").unwrap()),
+			)
+			.unwrap();
+
+		for node in [route, invocation, response, entity, repository, query] {
+			builder.add_node(node).unwrap();
+		}
+		for (id, from, to) in [(101, 11, 21), (102, 22, 31), (103, 41, 61), (104, 62, 42)] {
+			builder
+				.add_edge(Edge::new(
+					EdgeId::new(id).unwrap(),
+					PortId::new(from).unwrap(),
+					PortId::new(to).unwrap(),
+					EdgeKind::EXECUTION,
+				))
+				.unwrap();
+		}
+		builder
+			.add_subgraph(
+				Subgraph::new(
+					SubgraphId::new(40).unwrap(),
+					[NodeId::new(6).unwrap()],
+					[
+						SubgraphPort::new(
+							PortId::new(41).unwrap(),
+							PortDirection::OUTPUT,
+							PortKind::EXECUTION,
+						),
+						SubgraphPort::new(
+							PortId::new(42).unwrap(),
+							PortDirection::INPUT,
+							PortKind::EXECUTION,
+						),
+					],
+				)
+				.unwrap(),
+			)
+			.unwrap();
+
+		let document = builder.build().unwrap();
+		let mut registry = PluginRegistry::new();
+		BackendDslPlugin::register(&mut registry).unwrap();
+		let result = krunt_compiler::compile(&document, &registry);
+		assert!(
+			!result.has_errors(),
+			"compiler diagnostics: {:?}",
+			result.diagnostics()
+		);
+		let ir = result.ir().expect("valid graph should lower");
+		assert_eq!(ir.subgraphs().len(), 1);
+		TypeScriptBackend::lower_graph(ir).unwrap()
+	}
+
 	fn backend_dsl_program_with_response(
 		response_node_type: &str,
 		status_code: u16,
@@ -2260,6 +2440,14 @@ mod tests {
 	}
 
 	fn assert_generated_project_runtime_smokes(project: &GeneratedProject, label: &str) {
+		assert_generated_project_runtime_smokes_with_source(project, label, RUNTIME_SMOKE_SOURCE);
+	}
+
+	fn assert_generated_project_runtime_smokes_with_source(
+		project: &GeneratedProject,
+		label: &str,
+		smoke_source: &str,
+	) {
 		let directory = std::env::temp_dir().join(format!(
 			"krunt-generated-runtime-{label}-{}-{}",
 			std::process::id(),
@@ -2275,7 +2463,7 @@ mod tests {
 			}
 			fs::write(file_path, content).expect("write generated project runtime file");
 		}
-		fs::write(directory.join("runtime-smoke.ts"), RUNTIME_SMOKE_SOURCE)
+		fs::write(directory.join("runtime-smoke.ts"), smoke_source)
 			.expect("write generated project runtime smoke source");
 		fs::write(directory.join("tsconfig.runtime.json"), RUNTIME_TSCONFIG)
 			.expect("write generated project runtime configuration");
@@ -2342,6 +2530,32 @@ mod tests {
 			if path == "src/generated.ts" {
 				// The module renderer appends a separator after its final function.
 				// Keep the fixture readable while preserving the exact generated bytes.
+				content.push('\n');
+			}
+			(path.to_string(), content)
+		});
+		GeneratedProject::try_new(files).expect("golden fixture should define a valid project")
+	}
+
+	fn subgraph_golden_project() -> GeneratedProject {
+		const PATHS: [&str; 11] = [
+			"README.md",
+			"package.json",
+			"src/app.controller.ts",
+			"src/app.module.ts",
+			"src/generated.ts",
+			"src/krunt-runtime.ts",
+			"src/main.ts",
+			"src/models/User.model.ts",
+			"src/repositories/UserRepositoryRepository.repository.ts",
+			"tsconfig.build.json",
+			"tsconfig.json",
+		];
+		let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden/subgraph");
+		let files = PATHS.into_iter().map(|path| {
+			let mut content = fs::read_to_string(directory.join(path))
+				.unwrap_or_else(|error| panic!("read golden fixture {path}: {error}"));
+			if path == "src/generated.ts" {
 				content.push('\n');
 			}
 			(path.to_string(), content)
@@ -2437,6 +2651,21 @@ void main().catch((error: unknown) => {
 });
 "#;
 
+	const SUBGRAPH_RUNTIME_SMOKE_SOURCE: &str = r#"import { execute_1 } from './src/generated';
+import { KruntRuntimeService } from './src/krunt-runtime';
+import { UserRepositoryRepository } from './src/repositories/UserRepositoryRepository.repository';
+
+async function main(): Promise<void> {
+  const runtime = new KruntRuntimeService(new UserRepositoryRepository());
+  await execute_1({ id: 1, tags: [] }, runtime);
+}
+
+void main().catch((error: unknown) => {
+  console.error(error);
+  throw error;
+});
+"#;
+
 	#[test]
 	fn generates_a_deterministic_nestjs_project() {
 		let first = NestJsBackend::generate_project(&program()).unwrap();
@@ -2481,6 +2710,30 @@ void main().catch((error: unknown) => {
 		let generated = NestJsBackend::generate_project(&persistence_program()).unwrap();
 		let regenerated = NestJsBackend::generate_project(&persistence_program()).unwrap();
 		let golden = persistence_golden_project();
+
+		for (path, content) in generated.files() {
+			let expected = golden
+				.file(path)
+				.unwrap_or_else(|| panic!("missing golden file {path}"));
+			assert_eq!(content, expected, "golden file mismatch: {path}");
+		}
+		assert_eq!(generated.files().len(), golden.files().len());
+		assert_eq!(generated, regenerated);
+		assert_eq!(
+			generated.zip_archive().unwrap(),
+			golden.zip_archive().unwrap()
+		);
+		assert_eq!(
+			generated.zip_archive().unwrap(),
+			regenerated.zip_archive().unwrap()
+		);
+	}
+
+	#[test]
+	fn matches_the_subgraph_golden_project_and_archive() {
+		let generated = NestJsBackend::generate_project(&backend_dsl_subgraph_program()).unwrap();
+		let regenerated = NestJsBackend::generate_project(&backend_dsl_subgraph_program()).unwrap();
+		let golden = subgraph_golden_project();
 
 		for (path, content) in generated.files() {
 			let expected = golden
@@ -2744,6 +2997,29 @@ void main().catch((error: unknown) => {
 		assert!(controller.contains("return await execute_1(validatedRequest, this.runtime);"));
 		assert!(controller.contains("BadRequestException"));
 		assert_generated_project_runtime_smokes(&project, "persistence");
+	}
+
+	#[test]
+	fn generates_non_recursive_subgraphs_as_traceable_functions() {
+		let program = backend_dsl_subgraph_program();
+		let project = NestJsBackend::generate_project(&program).unwrap();
+		let generated = project.file("src/generated.ts").unwrap();
+
+		assert!(generated.contains("// krunt:subgraph=40"));
+		assert!(generated.contains("await subgraph_40(runtime);"));
+		assert!(generated
+			.contains("export async function subgraph_40(runtime: KruntRuntime): Promise<void>"));
+		assert!(generated.contains("runtime.query<Array<User>>(\"ListUsers\", \"UserRepository\")"));
+		assert!(project
+			.file("src/app.controller.ts")
+			.unwrap()
+			.contains("constructor(private readonly runtime: KruntRuntimeService) {}"));
+		assert_generated_project_typechecks(&project, "subgraph");
+		assert_generated_project_runtime_smokes_with_source(
+			&project,
+			"subgraph",
+			SUBGRAPH_RUNTIME_SMOKE_SOURCE,
+		);
 	}
 
 	#[test]

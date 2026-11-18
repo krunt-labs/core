@@ -108,7 +108,11 @@ impl TypeScriptImport {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct TypeScriptFunction {
 	name: String,
+	kind: TypeScriptFunctionKind,
+	subgraph_id: Option<u64>,
+	entry: Option<TypeScriptOperationId>,
 	async_kind: AsyncKind,
+	requires_runtime: bool,
 	operations: Vec<TypeScriptOperation>,
 	control_edges: Vec<TypeScriptControlEdge>,
 	data_edges: Vec<TypeScriptDataEdge>,
@@ -119,8 +123,24 @@ impl TypeScriptFunction {
 		&self.name
 	}
 
+	pub fn kind(&self) -> TypeScriptFunctionKind {
+		self.kind
+	}
+
+	pub fn subgraph_id(&self) -> Option<u64> {
+		self.subgraph_id
+	}
+
+	pub fn entry(&self) -> Option<TypeScriptOperationId> {
+		self.entry
+	}
+
 	pub fn async_kind(&self) -> AsyncKind {
 		self.async_kind
+	}
+
+	pub fn requires_runtime(&self) -> bool {
+		self.requires_runtime
 	}
 
 	pub fn operations(&self) -> &[TypeScriptOperation] {
@@ -134,6 +154,14 @@ impl TypeScriptFunction {
 	pub fn data_edges(&self) -> &[TypeScriptDataEdge] {
 		&self.data_edges
 	}
+}
+
+/// The role of a generated TypeScript function.
+#[allow(non_camel_case_types)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub enum TypeScriptFunctionKind {
+	ENTRY,
+	SUBGRAPH,
 }
 
 /// A language-level operation that still retains universal source identity.
@@ -212,7 +240,7 @@ pub enum TypeScriptOperationKind {
 	BRANCH,
 	MERGE,
 	LOOP,
-	SUBGRAPH,
+	SUBGRAPH { id: u64 },
 	RETURN,
 }
 
@@ -335,6 +363,58 @@ impl LanguageBackend for TypeScriptBackend {
 			.iter()
 			.map(lower_operation)
 			.collect::<Result<Vec<_>, _>>()?;
+		let subgraph_node_ids: BTreeSet<_> = graph
+			.subgraphs()
+			.iter()
+			.flat_map(|subgraph| {
+				subgraph
+					.nodes()
+					.iter()
+					.map(|node| TypeScriptOperationId::new(node.0))
+			})
+			.collect();
+		let subgraph_operations: BTreeMap<_, Vec<_>> = graph
+			.subgraphs()
+			.iter()
+			.map(|subgraph| {
+				let members: BTreeSet<_> = subgraph
+					.nodes()
+					.iter()
+					.map(|node| TypeScriptOperationId::new(node.0))
+					.collect();
+				(
+					subgraph.id().0,
+					all_operations
+						.iter()
+						.filter(|operation| members.contains(&operation.id))
+						.cloned()
+						.collect(),
+				)
+			})
+			.collect();
+		let mut subgraph_requires_runtime: BTreeMap<_, bool> = subgraph_operations
+			.iter()
+			.map(|(id, operations)| {
+				(
+					*id,
+					operations.iter().any(TypeScriptOperation::requires_runtime),
+				)
+			})
+			.collect();
+		loop {
+			let mut changed = false;
+			for (id, operations) in &subgraph_operations {
+				let requires_runtime =
+					operations_require_runtime(operations, &subgraph_requires_runtime);
+				if subgraph_requires_runtime.get(id).copied() != Some(requires_runtime) {
+					subgraph_requires_runtime.insert(*id, requires_runtime);
+					changed = true;
+				}
+			}
+			if !changed {
+				break;
+			}
+		}
 		let declarations = all_operations
 			.iter()
 			.filter_map(|operation| match operation.kind() {
@@ -361,7 +441,22 @@ impl LanguageBackend for TypeScriptBackend {
 			.collect::<Vec<_>>();
 
 		let functions = if http_entries.is_empty() {
-			vec![lower_function("execute", graph, &all_operations)]
+			let operations = all_operations
+				.iter()
+				.filter(|operation| !subgraph_node_ids.contains(&operation.id))
+				.cloned()
+				.collect::<Vec<_>>();
+			let requires_runtime =
+				operations_require_runtime(&operations, &subgraph_requires_runtime);
+			vec![lower_function(
+				"execute",
+				graph,
+				&operations,
+				TypeScriptFunctionKind::ENTRY,
+				None,
+				None,
+				requires_runtime,
+			)]
 		} else {
 			http_entries
 				.into_iter()
@@ -369,13 +464,48 @@ impl LanguageBackend for TypeScriptBackend {
 					let reachable = reachable_operations(graph, entry);
 					let operations = all_operations
 						.iter()
-						.filter(|operation| reachable.contains(&operation.id))
+						.filter(|operation| {
+							reachable.contains(&operation.id)
+								&& !subgraph_node_ids.contains(&operation.id)
+						})
 						.cloned()
 						.collect::<Vec<_>>();
-					lower_function(&format!("execute_{}", entry.as_u32()), graph, &operations)
+					let requires_runtime =
+						operations_require_runtime(&operations, &subgraph_requires_runtime);
+					lower_function(
+						&format!("execute_{}", entry.as_u32()),
+						graph,
+						&operations,
+						TypeScriptFunctionKind::ENTRY,
+						None,
+						None,
+						requires_runtime,
+					)
 				})
 				.collect()
 		};
+		let mut functions = functions;
+		for subgraph in graph.subgraphs() {
+			let operations = subgraph_operations
+				.get(&subgraph.id().0)
+				.expect("subgraph operations were collected from the same IR graph");
+			let entry = subgraph
+				.inputs()
+				.first()
+				.map(|boundary| TypeScriptOperationId::new(boundary.target.node.0));
+			functions.push(lower_function(
+				&format!("subgraph_{}", subgraph.id().0),
+				graph,
+				operations,
+				TypeScriptFunctionKind::SUBGRAPH,
+				Some(subgraph.id().0),
+				entry,
+				subgraph_requires_runtime
+					.get(&subgraph.id().0)
+					.copied()
+					.unwrap_or(false),
+			));
+		}
 
 		Ok(TypeScriptProgram {
 			version: TypeScriptProgram::CURRENT_VERSION,
@@ -422,6 +552,10 @@ fn lower_function(
 	name: &str,
 	graph: &IRGraph,
 	operations: &[TypeScriptOperation],
+	kind: TypeScriptFunctionKind,
+	subgraph_id: Option<u64>,
+	entry: Option<TypeScriptOperationId>,
+	requires_runtime: bool,
 ) -> TypeScriptFunction {
 	let operation_ids: BTreeSet<_> = operations.iter().map(TypeScriptOperation::id).collect();
 	let async_kind = if operations
@@ -434,7 +568,16 @@ fn lower_function(
 	};
 	TypeScriptFunction {
 		name: name.to_string(),
+		kind,
+		subgraph_id,
+		entry: entry.or_else(|| {
+			operations
+				.iter()
+				.find(|operation| matches!(operation.kind(), TypeScriptOperationKind::ENTRY { .. }))
+				.map(TypeScriptOperation::id)
+		}),
 		async_kind,
+		requires_runtime,
 		operations: operations.to_vec(),
 		control_edges: graph
 			.control_edges()
@@ -475,27 +618,30 @@ fn lower_function(
 	}
 }
 
+fn operations_require_runtime(
+	operations: &[TypeScriptOperation],
+	subgraph_requires_runtime: &BTreeMap<u64, bool>,
+) -> bool {
+	operations.iter().any(|operation| {
+		operation.requires_runtime()
+			|| match operation.kind() {
+				TypeScriptOperationKind::SUBGRAPH { id } => {
+					subgraph_requires_runtime.get(id).copied().unwrap_or(false)
+				}
+				_ => false,
+			}
+	})
+}
+
 /// Errors raised while rendering TypeScript language IR into source files.
 #[allow(non_camel_case_types)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TypeScriptRenderError {
 	EMPTY_MODULE_PATH,
-	ABSOLUTE_MODULE_PATH {
-		path: String,
-	},
-	PATH_TRAVERSAL {
-		path: String,
-	},
-	BACKSLASH_MODULE_PATH {
-		path: String,
-	},
-	DUPLICATE_MODULE_PATH {
-		path: String,
-	},
-	UNSUPPORTED_SUBGRAPH {
-		operation_id: u32,
-		subgraph_id: String,
-	},
+	ABSOLUTE_MODULE_PATH { path: String },
+	PATH_TRAVERSAL { path: String },
+	BACKSLASH_MODULE_PATH { path: String },
+	DUPLICATE_MODULE_PATH { path: String },
 }
 
 impl fmt::Display for TypeScriptRenderError {
@@ -517,13 +663,6 @@ impl fmt::Display for TypeScriptRenderError {
 					"TypeScript program contains duplicate module path: {path}"
 				)
 			}
-			Self::UNSUPPORTED_SUBGRAPH {
-				operation_id,
-				subgraph_id,
-			} => write!(
-				f,
-				"TypeScript operation {operation_id} references unsupported subgraph {subgraph_id}; subgraph bodies are not present in the language IR."
-			),
 		}
 	}
 }
@@ -539,9 +678,6 @@ impl TypeScriptSourceRenderer {
 	pub fn render_program(
 		program: &TypeScriptProgram,
 	) -> Result<BTreeMap<String, String>, TypeScriptRenderError> {
-		if let Some(error) = unsupported_subgraph(program) {
-			return Err(error);
-		}
 		let mut files = BTreeMap::new();
 		for module in program.modules() {
 			validate_module_path(module.path())?;
@@ -556,27 +692,6 @@ impl TypeScriptSourceRenderer {
 		}
 		Ok(files)
 	}
-}
-
-fn unsupported_subgraph(program: &TypeScriptProgram) -> Option<TypeScriptRenderError> {
-	program
-		.modules()
-		.iter()
-		.flat_map(|module| module.functions())
-		.flat_map(|function| function.operations())
-		.find_map(|operation| {
-			if !matches!(operation.kind(), TypeScriptOperationKind::SUBGRAPH) {
-				return None;
-			}
-			Some(TypeScriptRenderError::UNSUPPORTED_SUBGRAPH {
-				operation_id: operation.id().as_u32(),
-				subgraph_id: operation
-					.attributes()
-					.get("backend.subgraph.id")
-					.cloned()
-					.unwrap_or_else(|| "<unknown>".to_string()),
-			})
-		})
 }
 
 fn render_module(module: &TypeScriptModule) -> String {
@@ -602,19 +717,35 @@ fn render_module(module: &TypeScriptModule) -> String {
 	if !module.imports().is_empty() {
 		source.push('\n');
 	}
-	if module.functions().iter().any(function_requires_runtime) {
+	let subgraph_runtime_requirements: BTreeMap<_, _> = module
+		.functions()
+		.iter()
+		.filter_map(|function| {
+			function
+				.subgraph_id()
+				.map(|id| (id, function.requires_runtime()))
+		})
+		.collect();
+	if module
+		.functions()
+		.iter()
+		.any(TypeScriptFunction::requires_runtime)
+	{
 		source.push_str(&runtime_interface());
 		source.push('\n');
 	}
 
 	for function in module.functions() {
-		source.push_str(&render_function(function));
+		source.push_str(&render_function(function, &subgraph_runtime_requirements));
 		source.push('\n');
 	}
 	source
 }
 
-fn render_function(function: &TypeScriptFunction) -> String {
+fn render_function(
+	function: &TypeScriptFunction,
+	subgraph_runtime_requirements: &BTreeMap<u64, bool>,
+) -> String {
 	let mut source = String::new();
 	let declarations = operation_declarations(function);
 	for declaration in declarations.values() {
@@ -628,13 +759,17 @@ fn render_function(function: &TypeScriptFunction) -> String {
 
 	let function_name = sanitize_identifier(&function.name, "execute");
 	let accepts_request = function.operations.iter().any(is_http_entry);
-	let requires_runtime = function_requires_runtime(function);
+	let requires_runtime = function.requires_runtime();
 	let async_prefix = if function.async_kind == AsyncKind::ASYNC {
 		"async "
 	} else {
 		""
 	};
-	let response_type = http_response_type(function);
+	let response_type = if function.kind() == TypeScriptFunctionKind::SUBGRAPH {
+		"void".to_string()
+	} else {
+		http_response_type(function)
+	};
 	let return_type = if function.async_kind == AsyncKind::ASYNC {
 		format!("Promise<{response_type}>")
 	} else {
@@ -655,7 +790,13 @@ fn render_function(function: &TypeScriptFunction) -> String {
 	let data_inputs = data_inputs(function);
 	let output_arities = output_arities(function);
 	if has_structured_control_flow(function) {
-		render_structured_function_body(&mut source, function, &data_inputs, &output_arities);
+		render_structured_function_body(
+			&mut source,
+			function,
+			&data_inputs,
+			&output_arities,
+			subgraph_runtime_requirements,
+		);
 	} else {
 		render_linear_function_body(&mut source, function, &data_inputs, &output_arities);
 	}
@@ -670,7 +811,7 @@ fn has_structured_control_flow(function: &TypeScriptFunction) -> bool {
 			TypeScriptOperationKind::BRANCH
 				| TypeScriptOperationKind::MERGE
 				| TypeScriptOperationKind::LOOP
-				| TypeScriptOperationKind::SUBGRAPH
+				| TypeScriptOperationKind::SUBGRAPH { .. }
 		)
 	})
 }
@@ -698,7 +839,7 @@ fn render_linear_function_body(
 			TypeScriptOperationKind::BRANCH
 			| TypeScriptOperationKind::MERGE
 			| TypeScriptOperationKind::LOOP
-			| TypeScriptOperationKind::SUBGRAPH => {
+			| TypeScriptOperationKind::SUBGRAPH { .. } => {
 				unreachable!("structured control flow is rendered by the structured body renderer")
 			}
 			TypeScriptOperationKind::RETURN => {
@@ -713,6 +854,7 @@ fn render_structured_function_body(
 	function: &TypeScriptFunction,
 	data_inputs: &BTreeMap<TypeScriptOperationId, Vec<Option<TypeScriptPortRef>>>,
 	output_arities: &BTreeMap<TypeScriptOperationId, usize>,
+	subgraph_runtime_requirements: &BTreeMap<u64, bool>,
 ) {
 	for operation in &function.operations {
 		if operation.output_types.is_empty() {
@@ -722,16 +864,12 @@ fn render_structured_function_body(
 		source.push_str(&operation_variable(operation.id));
 		source.push_str(": ");
 		source.push_str(&render_operation_output_type(operation));
-		source.push_str(" = undefined as ");
+		source.push_str(" = undefined as unknown as ");
 		source.push_str(&render_operation_output_type(operation));
 		source.push_str(";\n");
 	}
 
-	let start = function
-		.operations
-		.iter()
-		.find(|operation| matches!(operation.kind(), TypeScriptOperationKind::ENTRY { .. }))
-		.map(|operation| operation.id.as_u32());
+	let start = function.entry.map(|entry| entry.as_u32());
 	source.push_str("  let control: number | null = ");
 	source.push_str(
 		&start
@@ -800,14 +938,25 @@ fn render_structured_function_body(
 				source.push_str(";\n");
 				source.push_str("        break;\n");
 			}
-			TypeScriptOperationKind::MERGE | TypeScriptOperationKind::SUBGRAPH => {
-				if matches!(operation.kind(), TypeScriptOperationKind::SUBGRAPH) {
-					if let Some(subgraph_id) = operation.attributes().get("backend.subgraph.id") {
-						source.push_str("        // krunt:subgraph=");
-						source.push_str(subgraph_id);
-						source.push('\n');
-					}
+			TypeScriptOperationKind::MERGE => {
+				render_next_control(source, function, operation, 0, "        ");
+				source.push_str("        break;\n");
+			}
+			TypeScriptOperationKind::SUBGRAPH { id } => {
+				source.push_str("        // krunt:subgraph=");
+				source.push_str(&id.to_string());
+				source.push('\n');
+				source.push_str("        await subgraph_");
+				source.push_str(&id.to_string());
+				source.push('(');
+				if subgraph_runtime_requirements
+					.get(id)
+					.copied()
+					.unwrap_or(false)
+				{
+					source.push_str("runtime");
 				}
+				source.push_str(");\n");
 				render_next_control(source, function, operation, 0, "        ");
 				source.push_str("        break;\n");
 			}
@@ -825,7 +974,11 @@ fn render_structured_function_body(
 	source.push_str("      }\n");
 	source.push_str("    }\n");
 	source.push_str("  }\n");
-	source.push_str("  return undefined as never;\n");
+	if function.kind() == TypeScriptFunctionKind::SUBGRAPH {
+		source.push_str("  return;\n");
+	} else {
+		source.push_str("  return undefined as never;\n");
+	}
 }
 
 fn render_operation_comments(source: &mut String, operation: &TypeScriptOperation, indent: &str) {
@@ -983,13 +1136,6 @@ fn is_identity_transform(operation: &TypeScriptOperation) -> bool {
 		.attributes()
 		.get("backend.transform.kind")
 		.is_some_and(|kind| kind == "IDENTITY")
-}
-
-fn function_requires_runtime(function: &TypeScriptFunction) -> bool {
-	function
-		.operations
-		.iter()
-		.any(TypeScriptOperation::requires_runtime)
 }
 
 fn is_runtime_operation(operation: &TypeScriptOperation) -> bool {
@@ -1196,6 +1342,13 @@ fn render_type_annotation(type_value: Option<&TypeScriptType>) -> String {
 }
 
 fn render_operation_output_type(operation: &TypeScriptOperation) -> String {
+	if is_http_entry(operation) {
+		return operation
+			.attributes()
+			.get("backend.http.request_entity")
+			.cloned()
+			.unwrap_or_else(|| "unknown".to_string());
+	}
 	match operation.output_types().len() {
 		0 => "unknown".to_string(),
 		1 => render_type_annotation(operation.output_types().first()),
@@ -1319,7 +1472,7 @@ fn render_operation_kind(kind: &TypeScriptOperationKind) -> String {
 		TypeScriptOperationKind::BRANCH => "BRANCH".to_string(),
 		TypeScriptOperationKind::MERGE => "MERGE".to_string(),
 		TypeScriptOperationKind::LOOP => "LOOP".to_string(),
-		TypeScriptOperationKind::SUBGRAPH => "SUBGRAPH".to_string(),
+		TypeScriptOperationKind::SUBGRAPH { id } => format!("SUBGRAPH {id}"),
 		TypeScriptOperationKind::RETURN => "RETURN".to_string(),
 	}
 }
@@ -1430,7 +1583,7 @@ fn lower_operation(
 		IROp::BRANCH => TypeScriptOperationKind::BRANCH,
 		IROp::MERGE => TypeScriptOperationKind::MERGE,
 		IROp::LOOP => TypeScriptOperationKind::LOOP,
-		IROp::SUBGRAPH => TypeScriptOperationKind::SUBGRAPH,
+		IROp::SUBGRAPH { id } => TypeScriptOperationKind::SUBGRAPH { id: id.0 },
 		IROp::RETURN => TypeScriptOperationKind::RETURN,
 	};
 
@@ -2339,7 +2492,7 @@ mod tests {
 		.remove("generated.ts")
 		.unwrap();
 
-		assert!(source.contains("let operation_2: Boolean = undefined as Boolean;"));
+		assert!(source.contains("let operation_2: Boolean = undefined as unknown as Boolean;"));
 		assert!(source.contains("control = operation_2 ? 4 : 5;"));
 		assert!(source.contains("control = operation_2 ? 9 : 10;"));
 		assert!(source.contains("control = 8;"));
@@ -2347,7 +2500,7 @@ mod tests {
 	}
 
 	#[test]
-	fn rejects_subgraph_operations_until_the_ir_defines_subgraph_bodies() {
+	fn renders_non_recursive_subgraph_operations_as_functions() {
 		let mut builder = IRBuilder::new();
 		for (id, operation) in [
 			(
@@ -2356,7 +2509,18 @@ mod tests {
 					name: OperationId::new("start").unwrap(),
 				},
 			),
-			(2, IROp::SUBGRAPH),
+			(
+				2,
+				IROp::SUBGRAPH {
+					id: krunt_ir::GraphSubgraphId(9),
+				},
+			),
+			(
+				3,
+				IROp::OPERATION {
+					name: OperationId::new("body").unwrap(),
+				},
+			),
 		] {
 			builder
 				.add_node(IRNode {
@@ -2364,13 +2528,9 @@ mod tests {
 					op: operation,
 					input_types: Vec::new(),
 					output_types: Vec::new(),
-					async_kind: AsyncKind::SYNC,
+					async_kind: AsyncKind::ASYNC,
 					effects: Vec::new(),
-					attributes: if id == 2 {
-						BTreeMap::from([("backend.subgraph.id".to_string(), "9".to_string())])
-					} else {
-						BTreeMap::new()
-					},
+					attributes: BTreeMap::new(),
 					returns: false,
 					source: SourceMap::node(GraphNodeId(id as u64 * 10)),
 				})
@@ -2388,14 +2548,33 @@ mod tests {
 				},
 			})
 			.unwrap();
+		builder
+			.add_subgraph(krunt_ir::IRSubgraph {
+				id: krunt_ir::GraphSubgraphId(9),
+				nodes: vec![krunt_ir::IrNodeId(3)],
+				inputs: vec![krunt_ir::IRSubgraphBoundary {
+					port: krunt_ir::GraphPortId(91),
+					target: PortRef {
+						node: krunt_ir::IrNodeId(3),
+						index: 0,
+					},
+				}],
+				outputs: vec![krunt_ir::IRSubgraphBoundary {
+					port: krunt_ir::GraphPortId(92),
+					target: PortRef {
+						node: krunt_ir::IrNodeId(3),
+						index: 0,
+					},
+				}],
+			})
+			.unwrap();
 
 		let program = TypeScriptBackend::lower_graph(&builder.build().unwrap()).unwrap();
-		assert_eq!(
-			TypeScriptSourceRenderer::render_program(&program),
-			Err(TypeScriptRenderError::UNSUPPORTED_SUBGRAPH {
-				operation_id: 2,
-				subgraph_id: "9".to_string(),
-			})
-		);
+		let source = TypeScriptSourceRenderer::render_program(&program)
+			.unwrap()
+			.remove("generated.ts")
+			.unwrap();
+		assert!(source.contains("await subgraph_9();"));
+		assert!(source.contains("export async function subgraph_9(): Promise<void>"));
 	}
 }

@@ -20,6 +20,10 @@ pub struct GraphPortId(pub u64);
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct GraphEdgeId(pub u64);
 
+/// Stable identifier of a source subgraph.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+pub struct GraphSubgraphId(pub u64);
+
 /// Stable identifier of an IR node.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct IrNodeId(pub u32);
@@ -129,7 +133,7 @@ pub enum IROp {
 	BRANCH,
 	MERGE,
 	LOOP,
-	SUBGRAPH,
+	SUBGRAPH { id: GraphSubgraphId },
 	RETURN,
 }
 
@@ -168,6 +172,40 @@ pub struct DataEdge {
 	pub to: PortRef,
 }
 
+/// A source subgraph boundary connected to an operation inside its body.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+pub struct IRSubgraphBoundary {
+	pub port: GraphPortId,
+	pub target: PortRef,
+}
+
+/// A reusable, non-recursive executable subgraph definition.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct IRSubgraph {
+	pub id: GraphSubgraphId,
+	pub nodes: Vec<IrNodeId>,
+	pub inputs: Vec<IRSubgraphBoundary>,
+	pub outputs: Vec<IRSubgraphBoundary>,
+}
+
+impl IRSubgraph {
+	pub fn id(&self) -> GraphSubgraphId {
+		self.id
+	}
+
+	pub fn nodes(&self) -> &[IrNodeId] {
+		&self.nodes
+	}
+
+	pub fn inputs(&self) -> &[IRSubgraphBoundary] {
+		&self.inputs
+	}
+
+	pub fn outputs(&self) -> &[IRSubgraphBoundary] {
+		&self.outputs
+	}
+}
+
 /// The validated immutable IR consumed by compiler passes and generators.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct IRGraph {
@@ -175,10 +213,11 @@ pub struct IRGraph {
 	nodes: Vec<IRNode>,
 	control_edges: Vec<ControlEdge>,
 	data_edges: Vec<DataEdge>,
+	subgraphs: Vec<IRSubgraph>,
 }
 
 impl IRGraph {
-	pub const CURRENT_VERSION: u32 = 1;
+	pub const CURRENT_VERSION: u32 = 2;
 
 	pub fn node(&self, id: IrNodeId) -> Option<&IRNode> {
 		self.nodes
@@ -202,13 +241,22 @@ impl IRGraph {
 	pub fn data_edges(&self) -> &[DataEdge] {
 		&self.data_edges
 	}
+
+	pub fn subgraphs(&self) -> &[IRSubgraph] {
+		&self.subgraphs
+	}
 }
 
 /// Errors raised while constructing an IR graph.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum BuildError {
 	DuplicateNode(IrNodeId),
+	DuplicateSubgraph(GraphSubgraphId),
 	MissingNode(IrNodeId),
+	MissingSubgraphNode {
+		subgraph: GraphSubgraphId,
+		node: IrNodeId,
+	},
 	DuplicateControlEdge(ControlEdge),
 	DuplicateDataEdge(DataEdge),
 	InvalidOutputPort(PortRef),
@@ -240,6 +288,7 @@ pub struct IRBuilder {
 	nodes: BTreeMap<IrNodeId, IRNode>,
 	control_edges: Vec<ControlEdge>,
 	data_edges: Vec<DataEdge>,
+	subgraphs: BTreeMap<GraphSubgraphId, IRSubgraph>,
 }
 
 impl IRBuilder {
@@ -252,6 +301,17 @@ impl IRBuilder {
 			return Err(BuildError::DuplicateNode(node.id));
 		}
 		self.nodes.insert(node.id, node);
+		Ok(())
+	}
+
+	pub fn add_subgraph(&mut self, mut subgraph: IRSubgraph) -> Result<(), BuildError> {
+		if self.subgraphs.contains_key(&subgraph.id) {
+			return Err(BuildError::DuplicateSubgraph(subgraph.id));
+		}
+		subgraph.nodes.sort();
+		subgraph.inputs.sort_by_key(|boundary| boundary.port);
+		subgraph.outputs.sort_by_key(|boundary| boundary.port);
+		self.subgraphs.insert(subgraph.id, subgraph);
 		Ok(())
 	}
 
@@ -272,6 +332,16 @@ impl IRBuilder {
 	}
 
 	pub fn build(mut self) -> Result<IRGraph, BuildError> {
+		for subgraph in self.subgraphs.values() {
+			for node in &subgraph.nodes {
+				if !self.nodes.contains_key(node) {
+					return Err(BuildError::MissingSubgraphNode {
+						subgraph: subgraph.id,
+						node: *node,
+					});
+				}
+			}
+		}
 		for edge in &self.control_edges {
 			self.require_node(edge.from.node)?;
 			self.require_node(edge.to.node)?;
@@ -305,6 +375,7 @@ impl IRBuilder {
 			nodes: self.nodes.into_values().collect(),
 			control_edges: self.control_edges,
 			data_edges: self.data_edges,
+			subgraphs: self.subgraphs.into_values().collect(),
 		})
 	}
 
@@ -368,11 +439,18 @@ pub fn eliminate_unreachable_nodes(
 		}
 	}
 
+	let subgraph_nodes: BTreeMap<_, _> = graph
+		.subgraphs
+		.iter()
+		.flat_map(|subgraph| subgraph.nodes.iter().copied().map(|node| (node, ())))
+		.collect();
 	let removed_nodes: Vec<_> = graph
 		.nodes
 		.iter()
 		.filter(|node| {
-			!reachable.contains_key(&node.id) && !matches!(&node.op, IROp::DECLARATION { .. })
+			!reachable.contains_key(&node.id)
+				&& !subgraph_nodes.contains_key(&node.id)
+				&& !matches!(&node.op, IROp::DECLARATION { .. })
 		})
 		.map(|node| node.id)
 		.collect();
@@ -382,17 +460,24 @@ pub fn eliminate_unreachable_nodes(
 
 	let mut builder = IRBuilder::new();
 	for node in &graph.nodes {
-		if reachable.contains_key(&node.id) || matches!(&node.op, IROp::DECLARATION { .. }) {
+		if reachable.contains_key(&node.id)
+			|| subgraph_nodes.contains_key(&node.id)
+			|| matches!(&node.op, IROp::DECLARATION { .. })
+		{
 			builder.add_node(node.clone())?;
 		}
 	}
 	for edge in &graph.control_edges {
-		if reachable.contains_key(&edge.from.node) && reachable.contains_key(&edge.to.node) {
+		if (reachable.contains_key(&edge.from.node) || subgraph_nodes.contains_key(&edge.from.node))
+			&& (reachable.contains_key(&edge.to.node) || subgraph_nodes.contains_key(&edge.to.node))
+		{
 			builder.add_control_edge(*edge)?;
 		}
 	}
 	for edge in &graph.data_edges {
-		if reachable.contains_key(&edge.from.node) && reachable.contains_key(&edge.to.node) {
+		if (reachable.contains_key(&edge.from.node) || subgraph_nodes.contains_key(&edge.from.node))
+			&& (reachable.contains_key(&edge.to.node) || subgraph_nodes.contains_key(&edge.to.node))
+		{
 			builder.add_data_edge(*edge)?;
 		}
 	}
@@ -815,6 +900,63 @@ mod tests {
 
 		assert_eq!(optimized, graph);
 		assert!(report.removed_nodes().is_empty());
+	}
+
+	#[test]
+	fn builds_and_preserves_subgraph_definitions() {
+		let mut builder = IRBuilder::new();
+		builder
+			.add_node(operation("body", 1, 10, &[], &[]))
+			.unwrap();
+		builder
+			.add_subgraph(IRSubgraph {
+				id: GraphSubgraphId(40),
+				nodes: vec![IrNodeId(1)],
+				inputs: vec![IRSubgraphBoundary {
+					port: GraphPortId(41),
+					target: PortRef {
+						node: IrNodeId(1),
+						index: 0,
+					},
+				}],
+				outputs: vec![IRSubgraphBoundary {
+					port: GraphPortId(42),
+					target: PortRef {
+						node: IrNodeId(1),
+						index: 0,
+					},
+				}],
+			})
+			.unwrap();
+
+		let graph = builder.build().unwrap();
+		assert_eq!(graph.subgraphs().len(), 1);
+		assert_eq!(graph.subgraphs()[0].id(), GraphSubgraphId(40));
+		assert_eq!(graph.subgraphs()[0].nodes(), &[IrNodeId(1)]);
+		assert!(serde_json::to_string(&graph)
+			.unwrap()
+			.contains("\"subgraphs\""));
+	}
+
+	#[test]
+	fn rejects_subgraph_definitions_with_missing_members() {
+		let mut builder = IRBuilder::new();
+		builder
+			.add_subgraph(IRSubgraph {
+				id: GraphSubgraphId(40),
+				nodes: vec![IrNodeId(99)],
+				inputs: Vec::new(),
+				outputs: Vec::new(),
+			})
+			.unwrap();
+
+		assert_eq!(
+			builder.build(),
+			Err(BuildError::MissingSubgraphNode {
+				subgraph: GraphSubgraphId(40),
+				node: IrNodeId(99),
+			})
+		);
 	}
 
 	#[test]

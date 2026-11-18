@@ -71,6 +71,7 @@ pub struct LoweredOperation {
 	effects: Vec<EffectId>,
 	attributes: BTreeMap<String, String>,
 	returns: bool,
+	subgraph_id: Option<u64>,
 }
 
 impl LoweredOperation {
@@ -93,6 +94,7 @@ impl LoweredOperation {
 			effects,
 			attributes: BTreeMap::new(),
 			returns: false,
+			subgraph_id: None,
 		}
 	}
 
@@ -121,6 +123,12 @@ impl LoweredOperation {
 	/// Mark this operation as a target-neutral return/terminal operation.
 	pub fn with_return(mut self, returns: bool) -> Self {
 		self.returns = returns;
+		self
+	}
+
+	/// Attach the target identity for a reusable subgraph invocation.
+	pub fn with_subgraph_id(mut self, subgraph_id: u64) -> Self {
+		self.subgraph_id = Some(subgraph_id);
 		self
 	}
 
@@ -163,6 +171,10 @@ impl LoweredOperation {
 
 	pub fn returns(&self) -> bool {
 		self.returns
+	}
+
+	pub fn subgraph_id(&self) -> Option<u64> {
+		self.subgraph_id
 	}
 }
 
