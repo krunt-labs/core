@@ -962,9 +962,7 @@ export class AppController {{
 			}
 			if route.response_kind() == NestJsResponseKind::ERROR {
 				source.push_str("    const result = ");
-				if route.response_body_type().is_some() {
-					source.push_str("await ");
-				}
+				source.push_str("await ");
 				source.push_str(&invocation);
 				source.push_str(";\n    throw new HttpException(result ?? '");
 				source.push_str(&escape_single_quoted(
@@ -1720,6 +1718,17 @@ mod tests {
 	}
 
 	fn runtime_program() -> TypeScriptProgram {
+		runtime_program_with_response("SUCCESS", "200")
+	}
+
+	fn runtime_error_program() -> TypeScriptProgram {
+		runtime_program_with_response("ERROR", "503")
+	}
+
+	fn runtime_program_with_response(
+		response_kind: &str,
+		response_status_code: &str,
+	) -> TypeScriptProgram {
 		let mut builder = IRBuilder::new();
 		let mut route_attributes = std::collections::BTreeMap::new();
 		route_attributes.insert("backend.http.method".to_string(), "GET".to_string());
@@ -1776,8 +1785,11 @@ mod tests {
 				async_kind: AsyncKind::ASYNC,
 				effects: Vec::new(),
 				attributes: std::collections::BTreeMap::from([
-					("response.kind".to_string(), "SUCCESS".to_string()),
-					("response.status_code".to_string(), "200".to_string()),
+					("response.kind".to_string(), response_kind.to_string()),
+					(
+						"response.status_code".to_string(),
+						response_status_code.to_string(),
+					),
 				]),
 				returns: true,
 				source: SourceMap::node(GraphNodeId(30)),
@@ -2411,6 +2423,17 @@ declare const process: {
 			.file("src/krunt-runtime.ts")
 			.unwrap()
 			.contains("No repository provider configured"));
+	}
+
+	#[test]
+	fn awaits_async_execution_before_throwing_error_responses() {
+		let project = NestJsBackend::generate_project(&runtime_error_program()).unwrap();
+		let controller = project.file("src/app.controller.ts").unwrap();
+
+		assert!(controller.contains(
+			"const result = await execute_1(request, this.runtime);\n    throw new HttpException"
+		));
+		assert!(controller.contains("throw new HttpException(result ?? 'Request failed', 503);"));
 	}
 
 	#[test]
