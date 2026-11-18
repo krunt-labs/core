@@ -996,7 +996,10 @@ fn render_operation_comments(source: &mut String, operation: &TypeScriptOperatio
 		source.push_str(indent);
 		source.push_str("// krunt:types=");
 		source.push_str(&render_types(&operation.input_types));
-		source.push_str(" -> ");
+		source.push_str(" ->");
+		if !operation.output_types.is_empty() {
+			source.push(' ');
+		}
 		source.push_str(&render_types(&operation.output_types));
 		source.push('\n');
 	}

@@ -20,6 +20,6 @@ export async function execute_1(request: User, runtime: KruntRuntime): Promise<A
   const operation_2 = await runtime.query<Array<User>>("ListUsers", "UserRepository");
   // krunt:source=node:30
   // krunt:operation=3 RETURN
-  // krunt:types=Array<User> -> 
+  // krunt:types=Array<User> ->
   return operation_2;
 }

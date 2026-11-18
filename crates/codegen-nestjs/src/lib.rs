@@ -2205,6 +2205,198 @@ mod tests {
 		TypeScriptBackend::lower_graph(ir).unwrap()
 	}
 
+	fn backend_dsl_query_transform_program() -> TypeScriptProgram {
+		let metadata =
+			GraphMetadata::new(GraphId::new(3).unwrap(), "backend-v1", "krunt-test").unwrap();
+		let mut builder = GraphBuilder::new(metadata);
+
+		let mut route = Node::new(
+			NodeId::new(1).unwrap(),
+			NodeTypeId::new(HTTP_ROUTE_NODE_TYPE).unwrap(),
+		)
+		.with_property("method", Value::String("GET".to_string()))
+		.unwrap()
+		.with_property("path", Value::String("/users".to_string()))
+		.unwrap()
+		.with_property("request_entity", Value::String("User".to_string()))
+		.unwrap();
+		route
+			.add_port(Port::new(
+				PortId::new(11).unwrap(),
+				PortDirection::OUTPUT,
+				PortKind::EXECUTION,
+			))
+			.unwrap();
+		route
+			.add_port(
+				Port::new(
+					PortId::new(12).unwrap(),
+					PortDirection::OUTPUT,
+					PortKind::DATA,
+				)
+				.with_type_reference(TypeReference::new(HTTP_REQUEST_TYPE).unwrap()),
+			)
+			.unwrap();
+
+		let mut query = Node::new(
+			NodeId::new(2).unwrap(),
+			NodeTypeId::new(QUERY_NODE_TYPE).unwrap(),
+		)
+		.with_property("name", Value::String("ListUsers".to_string()))
+		.unwrap()
+		.with_property("repository", Value::String("UserRepository".to_string()))
+		.unwrap()
+		.with_property("cardinality", Value::String("many".to_string()))
+		.unwrap();
+		query
+			.add_port(Port::new(
+				PortId::new(21).unwrap(),
+				PortDirection::INPUT,
+				PortKind::EXECUTION,
+			))
+			.unwrap();
+		query
+			.add_port(Port::new(
+				PortId::new(22).unwrap(),
+				PortDirection::OUTPUT,
+				PortKind::EXECUTION,
+			))
+			.unwrap();
+		query
+			.add_port(
+				Port::new(
+					PortId::new(23).unwrap(),
+					PortDirection::OUTPUT,
+					PortKind::DATA,
+				)
+				.with_type_reference(TypeReference::new("Array<User>").unwrap()),
+			)
+			.unwrap();
+
+		let mut transform = Node::new(
+			NodeId::new(3).unwrap(),
+			NodeTypeId::new(TRANSFORM_NODE_TYPE).unwrap(),
+		);
+		transform
+			.add_port(Port::new(
+				PortId::new(31).unwrap(),
+				PortDirection::INPUT,
+				PortKind::EXECUTION,
+			))
+			.unwrap();
+		transform
+			.add_port(
+				Port::new(
+					PortId::new(32).unwrap(),
+					PortDirection::INPUT,
+					PortKind::DATA,
+				)
+				.with_type_reference(TypeReference::new("Array<User>").unwrap()),
+			)
+			.unwrap();
+		transform
+			.add_port(Port::new(
+				PortId::new(33).unwrap(),
+				PortDirection::OUTPUT,
+				PortKind::EXECUTION,
+			))
+			.unwrap();
+		transform
+			.add_port(
+				Port::new(
+					PortId::new(34).unwrap(),
+					PortDirection::OUTPUT,
+					PortKind::DATA,
+				)
+				.with_type_reference(TypeReference::new("Array<User>").unwrap()),
+			)
+			.unwrap();
+
+		let mut response = Node::new(
+			NodeId::new(4).unwrap(),
+			NodeTypeId::new(SUCCESS_RESPONSE_NODE_TYPE).unwrap(),
+		)
+		.with_property("status_code", Value::Number(serde_json::Number::from(200)))
+		.unwrap()
+		.with_property("body_type", Value::String("Array<User>".to_string()))
+		.unwrap();
+		response
+			.add_port(Port::new(
+				PortId::new(41).unwrap(),
+				PortDirection::INPUT,
+				PortKind::EXECUTION,
+			))
+			.unwrap();
+		response
+			.add_port(
+				Port::new(
+					PortId::new(42).unwrap(),
+					PortDirection::INPUT,
+					PortKind::DATA,
+				)
+				.with_type_reference(TypeReference::new("ANY").unwrap()),
+			)
+			.unwrap();
+
+		let entity = Node::new(
+			NodeId::new(5).unwrap(),
+			NodeTypeId::new(ENTITY_NODE_TYPE).unwrap(),
+		)
+		.with_property("name", Value::String("User".to_string()))
+		.unwrap()
+		.with_property(
+			"fields",
+			serde_json::json!({
+				"id": { "type": "Integer", "required": true },
+				"tags": { "type": { "kind": "array", "items": "String" }, "required": true }
+			}),
+		)
+		.unwrap();
+		let repository = Node::new(
+			NodeId::new(6).unwrap(),
+			NodeTypeId::new(REPOSITORY_NODE_TYPE).unwrap(),
+		)
+		.with_property("name", Value::String("UserRepository".to_string()))
+		.unwrap()
+		.with_property("entity", Value::String("User".to_string()))
+		.unwrap();
+
+		for node in [route, query, transform, response, entity, repository] {
+			builder.add_node(node).unwrap();
+		}
+		for (id, from, to) in [(101, 11, 21), (102, 22, 31), (103, 33, 41)] {
+			builder
+				.add_edge(Edge::new(
+					EdgeId::new(id).unwrap(),
+					PortId::new(from).unwrap(),
+					PortId::new(to).unwrap(),
+					EdgeKind::EXECUTION,
+				))
+				.unwrap();
+		}
+		for (id, from, to) in [(104, 23, 32), (105, 34, 42)] {
+			builder
+				.add_edge(Edge::new(
+					EdgeId::new(id).unwrap(),
+					PortId::new(from).unwrap(),
+					PortId::new(to).unwrap(),
+					EdgeKind::DATA,
+				))
+				.unwrap();
+		}
+
+		let document = builder.build().unwrap();
+		let mut registry = PluginRegistry::new();
+		BackendDslPlugin::register(&mut registry).unwrap();
+		let result = krunt_compiler::compile(&document, &registry);
+		assert!(
+			!result.has_errors(),
+			"compiler diagnostics: {:?}",
+			result.diagnostics()
+		);
+		TypeScriptBackend::lower_graph(result.ir().expect("valid graph should lower")).unwrap()
+	}
+
 	fn backend_dsl_program_with_response(
 		response_node_type: &str,
 		status_code: u16,
@@ -2563,6 +2755,33 @@ mod tests {
 		GeneratedProject::try_new(files).expect("golden fixture should define a valid project")
 	}
 
+	fn query_transform_golden_project() -> GeneratedProject {
+		const PATHS: [&str; 11] = [
+			"README.md",
+			"package.json",
+			"src/app.controller.ts",
+			"src/app.module.ts",
+			"src/generated.ts",
+			"src/krunt-runtime.ts",
+			"src/main.ts",
+			"src/models/User.model.ts",
+			"src/repositories/UserRepositoryRepository.repository.ts",
+			"tsconfig.build.json",
+			"tsconfig.json",
+		];
+		let directory =
+			Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden/query-transform-response");
+		let files = PATHS.into_iter().map(|path| {
+			let mut content = fs::read_to_string(directory.join(path))
+				.unwrap_or_else(|error| panic!("read golden file {path}: {error}"));
+			if path == "src/generated.ts" {
+				content.push('\n');
+			}
+			(path.to_string(), content)
+		});
+		GeneratedProject::try_new(files).expect("golden fixture should define a valid project")
+	}
+
 	const TYPECHECK_TSCONFIG: &str = r#"{
   "extends": "./tsconfig.json",
   "compilerOptions": {
@@ -2734,6 +2953,32 @@ void main().catch((error: unknown) => {
 		let generated = NestJsBackend::generate_project(&backend_dsl_subgraph_program()).unwrap();
 		let regenerated = NestJsBackend::generate_project(&backend_dsl_subgraph_program()).unwrap();
 		let golden = subgraph_golden_project();
+
+		for (path, content) in generated.files() {
+			let expected = golden
+				.file(path)
+				.unwrap_or_else(|| panic!("missing golden file {path}"));
+			assert_eq!(content, expected, "golden file mismatch: {path}");
+		}
+		assert_eq!(generated.files().len(), golden.files().len());
+		assert_eq!(generated, regenerated);
+		assert_eq!(
+			generated.zip_archive().unwrap(),
+			golden.zip_archive().unwrap()
+		);
+		assert_eq!(
+			generated.zip_archive().unwrap(),
+			regenerated.zip_archive().unwrap()
+		);
+	}
+
+	#[test]
+	fn matches_the_query_transform_golden_project_and_archive() {
+		let generated =
+			NestJsBackend::generate_project(&backend_dsl_query_transform_program()).unwrap();
+		let regenerated =
+			NestJsBackend::generate_project(&backend_dsl_query_transform_program()).unwrap();
+		let golden = query_transform_golden_project();
 
 		for (path, content) in generated.files() {
 			let expected = golden
@@ -2997,6 +3242,33 @@ void main().catch((error: unknown) => {
 		assert!(controller.contains("return await execute_1(validatedRequest, this.runtime);"));
 		assert!(controller.contains("BadRequestException"));
 		assert_generated_project_runtime_smokes(&project, "persistence");
+	}
+
+	#[test]
+	fn generates_the_backend_dsl_query_transform_response_path() {
+		let program = backend_dsl_query_transform_program();
+		let framework_program = NestJsBackend::lower_program(&program).unwrap();
+
+		assert_eq!(framework_program.routes().len(), 1);
+		assert_eq!(
+			framework_program.routes()[0].response_body_type(),
+			Some("Array<User>")
+		);
+		assert_eq!(framework_program.repositories().len(), 1);
+		assert_eq!(framework_program.repositories()[0].methods().len(), 1);
+
+		let project = NestJsBackend::generate_project(&program).unwrap();
+		let generated = project.file("src/generated.ts").unwrap();
+		assert!(generated.contains("runtime.query<Array<User>>(\"ListUsers\", \"UserRepository\")"));
+		assert!(generated.contains("const operation_3 = operation_2;"));
+		assert!(generated.contains("return operation_3;"));
+		assert!(generated.contains("// krunt:source=node:3"));
+
+		let controller = project.file("src/app.controller.ts").unwrap();
+		assert!(controller.contains("Promise<Array<User>>"));
+		assert!(controller.contains("return await execute_1(validatedRequest, this.runtime);"));
+		assert_generated_project_typechecks(&project, "query-transform-response");
+		assert_generated_project_runtime_smokes(&project, "query-transform-response");
 	}
 
 	#[test]
