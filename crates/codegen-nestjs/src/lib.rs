@@ -2414,6 +2414,7 @@ void main().catch((error: unknown) => {
 		let second = NestJsBackend::generate_project(&program()).unwrap();
 
 		assert_eq!(first, second);
+		assert_eq!(first.zip_archive().unwrap(), second.zip_archive().unwrap());
 		assert_eq!(
 			first.files().keys().cloned().collect::<Vec<_>>(),
 			vec![
