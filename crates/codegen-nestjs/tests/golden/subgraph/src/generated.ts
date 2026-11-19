@@ -17,7 +17,7 @@ export async function execute_1(request: User, runtime: KruntRuntime): Promise<U
       case 1: {
         // krunt:source=node:1
         // krunt:operation=1 ENTRY backend.http_route
-        // krunt:types= -> HttpRequest
+        // krunt:types= -> User
         operation_1 = request;
         control = 2;
         break;

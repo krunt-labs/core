@@ -12,7 +12,7 @@ export interface KruntRuntime {
 export async function execute_1(request: User, runtime: KruntRuntime): Promise<Array<User>> {
   // krunt:source=node:1
   // krunt:operation=1 ENTRY backend.http_route
-  // krunt:types= -> HttpRequest
+  // krunt:types= -> User
   const operation_1 = request;
   // krunt:source=node:2
   // krunt:operation=2 OPERATION backend.query

@@ -1716,8 +1716,9 @@ mod tests {
 	use super::*;
 	use krunt_backend_dsl::{
 		BackendDslPlugin, ENTITY_NODE_TYPE, ERROR_RESPONSE_NODE_TYPE, HTTP_REQUEST_TYPE,
-		HTTP_ROUTE_NODE_TYPE, QUERY_NODE_TYPE, REPOSITORY_NODE_TYPE, SUBGRAPH_NODE_TYPE,
-		SUCCESS_RESPONSE_NODE_TYPE, TRANSFORM_NODE_TYPE, VALIDATION_ERROR_NODE_TYPE,
+		HTTP_ROUTE_NODE_TYPE, MUTATION_NODE_TYPE, QUERY_NODE_TYPE, REPOSITORY_NODE_TYPE,
+		SUBGRAPH_NODE_TYPE, SUCCESS_RESPONSE_NODE_TYPE, TRANSFORM_NODE_TYPE,
+		VALIDATION_ERROR_NODE_TYPE,
 	};
 	use krunt_codegen_typescript::TypeScriptBackend;
 	use krunt_framework_backend::GeneratedProject;
@@ -2397,6 +2398,167 @@ mod tests {
 		TypeScriptBackend::lower_graph(result.ir().expect("valid graph should lower")).unwrap()
 	}
 
+	fn backend_dsl_mutation_program() -> TypeScriptProgram {
+		let metadata =
+			GraphMetadata::new(GraphId::new(4).unwrap(), "backend-v1", "krunt-test").unwrap();
+		let mut builder = GraphBuilder::new(metadata);
+
+		let mut route = Node::new(
+			NodeId::new(1).unwrap(),
+			NodeTypeId::new(HTTP_ROUTE_NODE_TYPE).unwrap(),
+		)
+		.with_property("method", Value::String("POST".to_string()))
+		.unwrap()
+		.with_property("path", Value::String("/users".to_string()))
+		.unwrap()
+		.with_property("request_entity", Value::String("User".to_string()))
+		.unwrap();
+		route
+			.add_port(Port::new(
+				PortId::new(11).unwrap(),
+				PortDirection::OUTPUT,
+				PortKind::EXECUTION,
+			))
+			.unwrap();
+		route
+			.add_port(
+				Port::new(
+					PortId::new(12).unwrap(),
+					PortDirection::OUTPUT,
+					PortKind::DATA,
+				)
+				.with_type_reference(TypeReference::new("User").unwrap()),
+			)
+			.unwrap();
+
+		let mut mutation = Node::new(
+			NodeId::new(2).unwrap(),
+			NodeTypeId::new(MUTATION_NODE_TYPE).unwrap(),
+		)
+		.with_property("name", Value::String("CreateUser".to_string()))
+		.unwrap()
+		.with_property("repository", Value::String("UserRepository".to_string()))
+		.unwrap();
+		mutation
+			.add_port(Port::new(
+				PortId::new(21).unwrap(),
+				PortDirection::INPUT,
+				PortKind::EXECUTION,
+			))
+			.unwrap();
+		mutation
+			.add_port(
+				Port::new(
+					PortId::new(22).unwrap(),
+					PortDirection::INPUT,
+					PortKind::DATA,
+				)
+				.with_type_reference(TypeReference::new("User").unwrap()),
+			)
+			.unwrap();
+		mutation
+			.add_port(Port::new(
+				PortId::new(23).unwrap(),
+				PortDirection::OUTPUT,
+				PortKind::EXECUTION,
+			))
+			.unwrap();
+		mutation
+			.add_port(
+				Port::new(
+					PortId::new(24).unwrap(),
+					PortDirection::OUTPUT,
+					PortKind::DATA,
+				)
+				.with_type_reference(TypeReference::new("User").unwrap()),
+			)
+			.unwrap();
+
+		let mut response = Node::new(
+			NodeId::new(3).unwrap(),
+			NodeTypeId::new(SUCCESS_RESPONSE_NODE_TYPE).unwrap(),
+		)
+		.with_property("status_code", Value::Number(serde_json::Number::from(201)))
+		.unwrap()
+		.with_property("body_type", Value::String("User".to_string()))
+		.unwrap();
+		response
+			.add_port(Port::new(
+				PortId::new(31).unwrap(),
+				PortDirection::INPUT,
+				PortKind::EXECUTION,
+			))
+			.unwrap();
+		response
+			.add_port(
+				Port::new(
+					PortId::new(32).unwrap(),
+					PortDirection::INPUT,
+					PortKind::DATA,
+				)
+				.with_type_reference(TypeReference::new("ANY").unwrap()),
+			)
+			.unwrap();
+
+		let entity = Node::new(
+			NodeId::new(4).unwrap(),
+			NodeTypeId::new(ENTITY_NODE_TYPE).unwrap(),
+		)
+		.with_property("name", Value::String("User".to_string()))
+		.unwrap()
+		.with_property(
+			"fields",
+			serde_json::json!({
+				"id": { "type": "Integer", "required": true },
+				"tags": { "type": { "kind": "array", "items": "String" }, "required": true }
+			}),
+		)
+		.unwrap();
+		let repository = Node::new(
+			NodeId::new(5).unwrap(),
+			NodeTypeId::new(REPOSITORY_NODE_TYPE).unwrap(),
+		)
+		.with_property("name", Value::String("UserRepository".to_string()))
+		.unwrap()
+		.with_property("entity", Value::String("User".to_string()))
+		.unwrap();
+
+		for node in [route, mutation, response, entity, repository] {
+			builder.add_node(node).unwrap();
+		}
+		for (id, from, to) in [(101, 11, 21), (102, 23, 31)] {
+			builder
+				.add_edge(Edge::new(
+					EdgeId::new(id).unwrap(),
+					PortId::new(from).unwrap(),
+					PortId::new(to).unwrap(),
+					EdgeKind::EXECUTION,
+				))
+				.unwrap();
+		}
+		for (id, from, to) in [(103, 12, 22), (104, 24, 32)] {
+			builder
+				.add_edge(Edge::new(
+					EdgeId::new(id).unwrap(),
+					PortId::new(from).unwrap(),
+					PortId::new(to).unwrap(),
+					EdgeKind::DATA,
+				))
+				.unwrap();
+		}
+
+		let document = builder.build().unwrap();
+		let mut registry = PluginRegistry::new();
+		BackendDslPlugin::register(&mut registry).unwrap();
+		let result = krunt_compiler::compile(&document, &registry);
+		assert!(
+			!result.has_errors(),
+			"compiler diagnostics: {:?}",
+			result.diagnostics()
+		);
+		TypeScriptBackend::lower_graph(result.ir().expect("valid graph should lower")).unwrap()
+	}
+
 	fn backend_dsl_program_with_response(
 		response_node_type: &str,
 		status_code: u16,
@@ -2782,6 +2944,32 @@ mod tests {
 		GeneratedProject::try_new(files).expect("golden fixture should define a valid project")
 	}
 
+	fn mutation_golden_project() -> GeneratedProject {
+		const PATHS: [&str; 11] = [
+			"README.md",
+			"package.json",
+			"src/app.controller.ts",
+			"src/app.module.ts",
+			"src/generated.ts",
+			"src/krunt-runtime.ts",
+			"src/main.ts",
+			"src/models/User.model.ts",
+			"src/repositories/UserRepositoryRepository.repository.ts",
+			"tsconfig.build.json",
+			"tsconfig.json",
+		];
+		let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden/mutation");
+		let files = PATHS.into_iter().map(|path| {
+			let mut content = fs::read_to_string(directory.join(path))
+				.unwrap_or_else(|error| panic!("read golden file {path}: {error}"));
+			if path == "src/generated.ts" {
+				content.push('\n');
+			}
+			(path.to_string(), content)
+		});
+		GeneratedProject::try_new(files).expect("golden fixture should define a valid project")
+	}
+
 	const TYPECHECK_TSCONFIG: &str = r#"{
   "extends": "./tsconfig.json",
   "compilerOptions": {
@@ -2885,6 +3073,31 @@ void main().catch((error: unknown) => {
 });
 "#;
 
+	const MUTATION_RUNTIME_SMOKE_SOURCE: &str = r#"import { execute_1 } from './src/generated';
+import { KruntRuntimeService } from './src/krunt-runtime';
+import { UserRepositoryRepository } from './src/repositories/UserRepositoryRepository.repository';
+import type { User } from './src/models/User.model';
+
+async function main(): Promise<void> {
+  const runtime = new KruntRuntimeService(new UserRepositoryRepository());
+  const user = { id: 7, tags: ['created'] } satisfies User;
+  const created = await execute_1(user, runtime);
+  if (created.id !== user.id || created.tags[0] !== 'created') {
+    throw new Error('expected the generated mutation to return the created record');
+  }
+  const second = { id: 8, tags: ['second'] } satisfies User;
+  const createdSecond = await execute_1(second, runtime);
+  if (createdSecond.id !== second.id || createdSecond.tags[0] !== 'second') {
+    throw new Error('expected the generated mutation to handle repeated writes');
+  }
+}
+
+void main().catch((error: unknown) => {
+  console.error(error);
+  throw error;
+});
+"#;
+
 	#[test]
 	fn generates_a_deterministic_nestjs_project() {
 		let first = NestJsBackend::generate_project(&program()).unwrap();
@@ -2979,6 +3192,30 @@ void main().catch((error: unknown) => {
 		let regenerated =
 			NestJsBackend::generate_project(&backend_dsl_query_transform_program()).unwrap();
 		let golden = query_transform_golden_project();
+
+		for (path, content) in generated.files() {
+			let expected = golden
+				.file(path)
+				.unwrap_or_else(|| panic!("missing golden file {path}"));
+			assert_eq!(content, expected, "golden file mismatch: {path}");
+		}
+		assert_eq!(generated.files().len(), golden.files().len());
+		assert_eq!(generated, regenerated);
+		assert_eq!(
+			generated.zip_archive().unwrap(),
+			golden.zip_archive().unwrap()
+		);
+		assert_eq!(
+			generated.zip_archive().unwrap(),
+			regenerated.zip_archive().unwrap()
+		);
+	}
+
+	#[test]
+	fn matches_the_mutation_golden_project_and_archive() {
+		let generated = NestJsBackend::generate_project(&backend_dsl_mutation_program()).unwrap();
+		let regenerated = NestJsBackend::generate_project(&backend_dsl_mutation_program()).unwrap();
+		let golden = mutation_golden_project();
 
 		for (path, content) in generated.files() {
 			let expected = golden
@@ -3269,6 +3506,54 @@ void main().catch((error: unknown) => {
 		assert!(controller.contains("return await execute_1(validatedRequest, this.runtime);"));
 		assert_generated_project_typechecks(&project, "query-transform-response");
 		assert_generated_project_runtime_smokes(&project, "query-transform-response");
+	}
+
+	#[test]
+	fn generates_the_backend_dsl_mutation_route() {
+		let program = backend_dsl_mutation_program();
+		let framework_program = NestJsBackend::lower_program(&program).unwrap();
+
+		assert_eq!(framework_program.routes().len(), 1);
+		assert_eq!(framework_program.routes()[0].method(), "POST");
+		assert_eq!(framework_program.routes()[0].status_code(), 201);
+		assert_eq!(framework_program.routes()[0].request_entity(), Some("User"));
+		assert_eq!(
+			framework_program.routes()[0].response_body_type(),
+			Some("User")
+		);
+		assert_eq!(framework_program.repositories().len(), 1);
+		assert_eq!(framework_program.repositories()[0].methods().len(), 1);
+		assert_eq!(
+			framework_program.repositories()[0].methods()[0].kind(),
+			NestJsRepositoryMethodKind::MUTATION
+		);
+
+		let project = NestJsBackend::generate_project(&program).unwrap();
+		let generated = project.file("src/generated.ts").unwrap();
+		assert!(generated.contains(
+			"runtime.mutation<User, User>(\"CreateUser\", \"UserRepository\", operation_1)"
+		));
+		assert!(generated.contains("return operation_2;"));
+		assert!(generated.contains("// krunt:source=node:2"));
+
+		let repository = project
+			.file("src/repositories/UserRepositoryRepository.repository.ts")
+			.unwrap();
+		assert!(repository
+			.contains("case 'MUTATION:CreateUser': return this.createUser(value as User);"));
+		assert!(repository.contains("async createUser(value: User): Promise<User>"));
+		assert!(repository.contains("this.records.push(record);"));
+
+		let controller = project.file("src/app.controller.ts").unwrap();
+		assert!(controller.contains("@Post('/users')"));
+		assert!(controller.contains("@Body() request: User"));
+		assert!(controller.contains("return await execute_1(validatedRequest, this.runtime);"));
+		assert_generated_project_typechecks(&project, "mutation");
+		assert_generated_project_runtime_smokes_with_source(
+			&project,
+			"mutation",
+			MUTATION_RUNTIME_SMOKE_SOURCE,
+		);
 	}
 
 	#[test]

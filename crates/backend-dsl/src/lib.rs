@@ -853,9 +853,15 @@ impl krunt_plugin_api::SemanticPlugin for BackendDslPlugin {
 
 	fn contract(&self, node: &Node) -> NodeContract {
 		match node.type_id().as_str() {
-			HTTP_ROUTE_NODE_TYPE => {
-				route_contract(TypeId::new(HTTP_REQUEST_TYPE).expect("static type is valid"))
-			}
+			HTTP_ROUTE_NODE_TYPE => route_contract(
+				route_properties(node)
+					.ok()
+					.and_then(|properties| properties.request_entity)
+					.map(|_| TypeId::new(RESPONSE_BODY_TYPE).expect("static type is valid"))
+					.unwrap_or_else(|| {
+						TypeId::new(HTTP_REQUEST_TYPE).expect("static type is valid")
+					}),
+			),
 			HTTP_REQUEST_NODE_TYPE => http_request_contract(),
 			CRON_NODE_TYPE => cron_contract(),
 			BRANCH_NODE_TYPE => branch_contract(),
@@ -1290,6 +1296,33 @@ impl krunt_plugin_api::SemanticPlugin for BackendDslPlugin {
 	) -> Result<LoweredOperation, Vec<Diagnostic>> {
 		let lowered = self.lower_node(node)?;
 		match node.type_id().as_str() {
+			HTTP_ROUTE_NODE_TYPE => {
+				let properties = route_properties(node).map_err(|error| vec![*error])?;
+				let Some(request_entity) = properties.request_entity else {
+					return Ok(lowered);
+				};
+				let entity = document
+					.nodes()
+					.iter()
+					.filter(|candidate| candidate.type_id().as_str() == ENTITY_NODE_TYPE)
+					.find_map(|candidate| {
+						entity_name(candidate)
+							.ok()
+							.filter(|name| name == &request_entity)
+					})
+					.ok_or_else(|| {
+						vec![*node_diagnostic(
+							node,
+							"BACKEND_DSL.HTTP_ROUTE_REQUEST_ENTITY_NOT_FOUND",
+							format!(
+								"HTTP Route references request entity '{request_entity}', but that entity is not declared."
+							),
+						)]
+					})?;
+				Ok(lowered.with_output_types([
+					TypeId::new(entity).expect("validated route request entity type is valid")
+				]))
+			}
 			QUERY_NODE_TYPE => {
 				let properties = query_properties(node).map_err(|error| vec![*error])?;
 				let entity = repository_entity(document, node, &properties.repository)?;
@@ -5008,6 +5041,43 @@ mod tests {
 		let lowered = plugin.lower_node(&node).unwrap();
 
 		assert_eq!(lowered.attributes()["backend.http.request_entity"], "User");
+	}
+
+	#[test]
+	fn lowers_a_request_bound_route_as_the_declared_entity_type() {
+		let plugin = BackendDslPlugin::new();
+		let route = route(&[
+			("method", Value::String("POST".to_string())),
+			("path", Value::String("/users".to_string())),
+			(
+				HTTP_ROUTE_REQUEST_ENTITY_PROPERTY,
+				Value::String("User".to_string()),
+			),
+		]);
+		let entity = Node::new(
+			NodeId::new(2).unwrap(),
+			NodeTypeId::new(ENTITY_NODE_TYPE).unwrap(),
+		)
+		.with_property(ENTITY_NAME_PROPERTY, Value::String("User".to_string()))
+		.unwrap();
+		let metadata = krunt_graph_model::GraphMetadata::new(
+			krunt_graph_model::GraphId::new(12).unwrap(),
+			"backend-v1",
+			"krunt-test",
+		)
+		.unwrap();
+		let mut builder = krunt_graph_model::GraphBuilder::new(metadata);
+		builder.add_node(route.clone()).unwrap();
+		builder.add_node(entity).unwrap();
+		let document = builder.build().unwrap();
+
+		let contract = plugin.contract(&route);
+		assert_eq!(
+			contract.outputs()[1].type_id().unwrap().as_str(),
+			RESPONSE_BODY_TYPE
+		);
+		let lowered = plugin.lower_node_in_document(&route, &document).unwrap();
+		assert_eq!(lowered.output_types()[0].as_str(), "User");
 	}
 
 	#[test]
