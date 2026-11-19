@@ -55,6 +55,7 @@ pub enum LoweredOperationKind {
 	DECLARATION,
 	OPERATION,
 	BRANCH,
+	TRY_CATCH,
 	MERGE,
 	LOOP,
 	SUBGRAPH,

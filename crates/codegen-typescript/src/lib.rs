@@ -238,6 +238,7 @@ pub enum TypeScriptOperationKind {
 	ENTRY { name: String },
 	OPERATION { name: String },
 	BRANCH,
+	TRY_CATCH,
 	MERGE,
 	LOOP,
 	SUBGRAPH { id: u64 },
@@ -734,6 +735,20 @@ fn render_module(module: &TypeScriptModule) -> String {
 		source.push_str(&runtime_interface());
 		source.push('\n');
 	}
+	if module
+		.functions()
+		.iter()
+		.flat_map(TypeScriptFunction::operations)
+		.any(|operation| {
+			operation
+				.attributes()
+				.get("response.kind")
+				.map(String::as_str)
+				== Some("ERROR")
+		}) {
+		source.push_str(&response_error_class());
+		source.push('\n');
+	}
 
 	for function in module.functions() {
 		source.push_str(&render_function(function, &subgraph_runtime_requirements));
@@ -809,6 +824,7 @@ fn has_structured_control_flow(function: &TypeScriptFunction) -> bool {
 		matches!(
 			operation.kind(),
 			TypeScriptOperationKind::BRANCH
+				| TypeScriptOperationKind::TRY_CATCH
 				| TypeScriptOperationKind::MERGE
 				| TypeScriptOperationKind::LOOP
 				| TypeScriptOperationKind::SUBGRAPH { .. }
@@ -837,6 +853,7 @@ fn render_linear_function_body(
 				}
 			}
 			TypeScriptOperationKind::BRANCH
+			| TypeScriptOperationKind::TRY_CATCH
 			| TypeScriptOperationKind::MERGE
 			| TypeScriptOperationKind::LOOP
 			| TypeScriptOperationKind::SUBGRAPH { .. } => {
@@ -870,6 +887,10 @@ fn render_structured_function_body(
 	}
 
 	let start = function.entry.map(|entry| entry.as_u32());
+	let has_try_catch = function
+		.operations
+		.iter()
+		.any(|operation| matches!(operation.kind(), TypeScriptOperationKind::TRY_CATCH));
 	source.push_str("  let control: number | null = ");
 	source.push_str(
 		&start
@@ -877,7 +898,13 @@ fn render_structured_function_body(
 			.unwrap_or_else(|| "null".to_string()),
 	);
 	source.push_str(";\n");
+	if has_try_catch {
+		source.push_str("  let errorControl: number | null = null;\n");
+	}
 	source.push_str("  while (control !== null) {\n");
+	if has_try_catch {
+		source.push_str("    try {\n");
+	}
 	source.push_str("    switch (control) {\n");
 
 	for operation in &function.operations {
@@ -922,6 +949,17 @@ fn render_structured_function_body(
 				source.push_str(&render_control_target(when_true));
 				source.push_str(" : ");
 				source.push_str(&render_control_target(when_false));
+				source.push_str(";\n");
+				source.push_str("        break;\n");
+			}
+			TypeScriptOperationKind::TRY_CATCH => {
+				let try_target = control_successor(function, operation.id, 0);
+				let catch_target = control_successor(function, operation.id, 1);
+				source.push_str("        errorControl = ");
+				source.push_str(&render_control_target(catch_target));
+				source.push_str(";\n");
+				source.push_str("        control = ");
+				source.push_str(&render_control_target(try_target));
 				source.push_str(";\n");
 				source.push_str("        break;\n");
 			}
@@ -973,6 +1011,15 @@ fn render_structured_function_body(
 	source.push_str("        break;\n");
 	source.push_str("      }\n");
 	source.push_str("    }\n");
+	if has_try_catch {
+		source.push_str("    } catch (error) {\n");
+		source.push_str("      if (errorControl === null) {\n");
+		source.push_str("        throw error;\n");
+		source.push_str("      }\n");
+		source.push_str("      control = errorControl;\n");
+		source.push_str("      errorControl = null;\n");
+		source.push_str("    }\n");
+	}
 	source.push_str("  }\n");
 	if function.kind() == TypeScriptFunctionKind::SUBGRAPH {
 		source.push_str("  return;\n");
@@ -1013,6 +1060,37 @@ fn render_return(
 	indent: &str,
 ) {
 	source.push_str(indent);
+	if operation
+		.attributes()
+		.get("response.kind")
+		.map(String::as_str)
+		== Some("ERROR")
+	{
+		source.push_str("throw new KruntResponseError(");
+		source.push_str(
+			operation
+				.attributes()
+				.get("response.status_code")
+				.map(String::as_str)
+				.unwrap_or("500"),
+		);
+		source.push_str(", ");
+		if let Some(value) = first_data_input(operation.id, data_inputs) {
+			source.push_str(&render_data_reference(value, output_arities));
+		} else {
+			source.push_str("undefined");
+		}
+		source.push_str(", ");
+		source.push_str(&string_literal(
+			operation
+				.attributes()
+				.get("error.message")
+				.map(String::as_str)
+				.unwrap_or("Request failed"),
+		));
+		source.push_str(");\n");
+		return;
+	}
 	source.push_str("return ");
 	if let Some(value) = first_data_input(operation.id, data_inputs) {
 		source.push_str(&render_data_reference(value, output_arities));
@@ -1165,6 +1243,20 @@ fn runtime_interface() -> &'static str {
   log(level: string, message: unknown): void;
   storageRead(key: string): Promise<unknown>;
   storageWrite(key: string, value: unknown): Promise<unknown>;
+}
+"#
+}
+
+fn response_error_class() -> &'static str {
+	r#"export class KruntResponseError extends Error {
+  constructor(
+    public readonly statusCode: number,
+    public readonly body: unknown,
+    message: string,
+  ) {
+    super(message);
+    this.name = 'KruntResponseError';
+  }
 }
 "#
 }
@@ -1473,6 +1565,7 @@ fn render_operation_kind(kind: &TypeScriptOperationKind) -> String {
 		TypeScriptOperationKind::ENTRY { name } => format!("ENTRY {name}"),
 		TypeScriptOperationKind::OPERATION { name } => format!("OPERATION {name}"),
 		TypeScriptOperationKind::BRANCH => "BRANCH".to_string(),
+		TypeScriptOperationKind::TRY_CATCH => "TRY_CATCH".to_string(),
 		TypeScriptOperationKind::MERGE => "MERGE".to_string(),
 		TypeScriptOperationKind::LOOP => "LOOP".to_string(),
 		TypeScriptOperationKind::SUBGRAPH { id } => format!("SUBGRAPH {id}"),
@@ -1584,6 +1677,7 @@ fn lower_operation(
 			}
 		}
 		IROp::BRANCH => TypeScriptOperationKind::BRANCH,
+		IROp::TRY_CATCH => TypeScriptOperationKind::TRY_CATCH,
 		IROp::MERGE => TypeScriptOperationKind::MERGE,
 		IROp::LOOP => TypeScriptOperationKind::LOOP,
 		IROp::SUBGRAPH { id } => TypeScriptOperationKind::SUBGRAPH { id: id.0 },
@@ -2579,5 +2673,148 @@ mod tests {
 			.unwrap();
 		assert!(source.contains("await subgraph_9();"));
 		assert!(source.contains("export async function subgraph_9(): Promise<void>"));
+	}
+
+	#[test]
+	fn renders_try_catch_as_an_exception_boundary_with_traceable_targets() {
+		let mut builder = IRBuilder::new();
+		let mut route_attributes = BTreeMap::new();
+		route_attributes.insert("backend.http.method".to_string(), "GET".to_string());
+		route_attributes.insert("backend.http.path".to_string(), "/ guarded".to_string());
+		let mut request_attributes = BTreeMap::new();
+		request_attributes.insert(
+			"backend.effect.kind".to_string(),
+			"HTTP_REQUEST".to_string(),
+		);
+		request_attributes.insert("backend.http_request.method".to_string(), "GET".to_string());
+		request_attributes.insert(
+			"backend.http_request.url".to_string(),
+			"https://example.test/guarded".to_string(),
+		);
+		let nodes = [
+			IRNode {
+				id: krunt_ir::IrNodeId(1),
+				op: IROp::ENTRY {
+					name: OperationId::new("backend.http_route").unwrap(),
+				},
+				input_types: Vec::new(),
+				output_types: vec![TypeId::new("Request").unwrap()],
+				async_kind: AsyncKind::ASYNC,
+				effects: Vec::new(),
+				attributes: route_attributes,
+				returns: false,
+				source: SourceMap::node(GraphNodeId(10)),
+			},
+			IRNode {
+				id: krunt_ir::IrNodeId(2),
+				op: IROp::TRY_CATCH,
+				input_types: Vec::new(),
+				output_types: Vec::new(),
+				async_kind: AsyncKind::SYNC,
+				effects: Vec::new(),
+				attributes: BTreeMap::from([(
+					"error.handling.kind".to_string(),
+					"TRY_CATCH".to_string(),
+				)]),
+				returns: false,
+				source: SourceMap::node(GraphNodeId(20)),
+			},
+			IRNode {
+				id: krunt_ir::IrNodeId(3),
+				op: IROp::OPERATION {
+					name: OperationId::new("backend.http_request").unwrap(),
+				},
+				input_types: vec![TypeId::new("Request").unwrap()],
+				output_types: vec![TypeId::new("Response").unwrap()],
+				async_kind: AsyncKind::ASYNC,
+				effects: Vec::new(),
+				attributes: request_attributes,
+				returns: false,
+				source: SourceMap::node(GraphNodeId(30)),
+			},
+			IRNode {
+				id: krunt_ir::IrNodeId(4),
+				op: IROp::RETURN,
+				input_types: vec![TypeId::new("Response").unwrap()],
+				output_types: Vec::new(),
+				async_kind: AsyncKind::ASYNC,
+				effects: Vec::new(),
+				attributes: BTreeMap::from([
+					("response.kind".to_string(), "SUCCESS".to_string()),
+					("response.status_code".to_string(), "200".to_string()),
+				]),
+				returns: true,
+				source: SourceMap::node(GraphNodeId(40)),
+			},
+			IRNode {
+				id: krunt_ir::IrNodeId(5),
+				op: IROp::RETURN,
+				input_types: Vec::new(),
+				output_types: Vec::new(),
+				async_kind: AsyncKind::SYNC,
+				effects: Vec::new(),
+				attributes: BTreeMap::from([
+					("response.kind".to_string(), "ERROR".to_string()),
+					("response.status_code".to_string(), "502".to_string()),
+				]),
+				returns: true,
+				source: SourceMap::node(GraphNodeId(50)),
+			},
+		];
+		for node in nodes {
+			builder.add_node(node).unwrap();
+		}
+		for (from, from_index, to) in [(1, 0, 2), (2, 0, 3), (3, 0, 4), (2, 1, 5)] {
+			builder
+				.add_control_edge(ControlEdge {
+					from: PortRef {
+						node: krunt_ir::IrNodeId(from),
+						index: from_index,
+					},
+					to: PortRef {
+						node: krunt_ir::IrNodeId(to),
+						index: 0,
+					},
+				})
+				.unwrap();
+		}
+		builder
+			.add_data_edge(DataEdge {
+				from: PortRef {
+					node: krunt_ir::IrNodeId(1),
+					index: 0,
+				},
+				to: PortRef {
+					node: krunt_ir::IrNodeId(3),
+					index: 0,
+				},
+			})
+			.unwrap();
+		builder
+			.add_data_edge(DataEdge {
+				from: PortRef {
+					node: krunt_ir::IrNodeId(3),
+					index: 0,
+				},
+				to: PortRef {
+					node: krunt_ir::IrNodeId(4),
+					index: 0,
+				},
+			})
+			.unwrap();
+
+		let program = TypeScriptBackend::lower_graph(&builder.build().unwrap()).unwrap();
+		let source = TypeScriptSourceRenderer::render_program(&program)
+			.unwrap()
+			.remove("generated.ts")
+			.unwrap();
+
+		assert!(source.contains("let errorControl: number | null = null;"));
+		assert!(source.contains("errorControl = 5;"));
+		assert!(source.contains(
+			"runtime.httpRequest(\"GET\", \"https://example.test/guarded\", operation_1)"
+		));
+		assert!(source.contains("} catch (error) {"));
+		assert!(source.contains("// krunt:source=node:20"));
 	}
 }

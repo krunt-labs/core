@@ -227,6 +227,7 @@ pub struct NestJsRoute {
 	execution_name: String,
 	status_code: u16,
 	response_kind: NestJsResponseKind,
+	has_error_response: bool,
 	response_body_type: Option<String>,
 	error_message: Option<String>,
 	request_entity: Option<String>,
@@ -260,6 +261,10 @@ impl NestJsRoute {
 
 	pub fn response_kind(&self) -> NestJsResponseKind {
 		self.response_kind
+	}
+
+	pub fn has_error_response(&self) -> bool {
+		self.has_error_response
 	}
 
 	pub fn response_body_type(&self) -> Option<&str> {
@@ -722,6 +727,13 @@ fn lower_routes(
 				.and_then(|value| value.parse().ok())
 				.unwrap_or(200);
 			let response_kind = response_kind(function)?;
+			let has_error_response = function.operations().iter().any(|operation| {
+				operation
+					.attributes()
+					.get("response.kind")
+					.map(String::as_str)
+					== Some("ERROR")
+			});
 			let response_body_type = return_operation
 				.and_then(|operation| operation.attributes().get("response.body_type"))
 				.filter(|type_name| type_name.as_str() != "ANY")
@@ -757,6 +769,7 @@ fn lower_routes(
 					.flatten()
 					.and_then(|operation| operation.attributes().get("error.message").cloned()),
 				response_kind,
+				has_error_response,
 				response_body_type,
 				request_entity,
 				requires_runtime: function.requires_runtime(),
@@ -848,6 +861,8 @@ fn app_controller(program: &NestJsProgram) -> String {
 		.routes()
 		.iter()
 		.any(|route| route.response_kind() == NestJsResponseKind::ERROR);
+	let has_generated_error_responses =
+		program.routes().iter().any(NestJsRoute::has_error_response);
 	let has_request_validation = program
 		.routes()
 		.iter()
@@ -868,10 +883,10 @@ fn app_controller(program: &NestJsProgram) -> String {
 		decorators.push("Body");
 	}
 	decorators.push("Req");
-	if has_error_routes {
+	if has_error_routes || has_generated_error_responses {
 		decorators.push("HttpException");
 	}
-	let execution_imports = if program.routes().is_empty() {
+	let mut execution_imports = if program.routes().is_empty() {
 		program.fallback_execution_name().to_string()
 	} else {
 		program
@@ -881,6 +896,9 @@ fn app_controller(program: &NestJsProgram) -> String {
 			.collect::<Vec<_>>()
 			.join(", ")
 	};
+	if has_generated_error_responses {
+		execution_imports.push_str(", KruntResponseError");
+	}
 	let runtime_import = if program.requires_runtime() {
 		"import { KruntRuntimeService } from './krunt-runtime';\n"
 	} else {
@@ -974,6 +992,9 @@ export class AppController {{
 				invocation.push(')');
 			}
 			if route.response_kind() == NestJsResponseKind::ERROR {
+				if has_generated_error_responses {
+					source.push_str("    try {\n");
+				}
 				source.push_str("    const result = ");
 				source.push_str("await ");
 				source.push_str(&invocation);
@@ -983,7 +1004,15 @@ export class AppController {{
 				));
 				source.push_str("', ");
 				source.push_str(&route.status_code().to_string());
-				source.push_str(");\n  }\n");
+				source.push_str(");\n");
+				if has_generated_error_responses {
+					source.push_str("    } catch (error) {\n      if (error instanceof KruntResponseError) {\n        throw new HttpException(error.body ?? error.message, error.statusCode);\n      }\n      throw error;\n    }\n");
+				}
+				source.push_str("  }\n");
+			} else if has_generated_error_responses {
+				source.push_str("    try {\n      return await ");
+				source.push_str(&invocation);
+				source.push_str(";\n    } catch (error) {\n      if (error instanceof KruntResponseError) {\n        throw new HttpException(error.body ?? error.message, error.statusCode);\n      }\n      throw error;\n    }\n  }\n");
 			} else {
 				source.push_str("    return ");
 				if route.response_body_type().is_some() {
@@ -1715,9 +1744,10 @@ fn tsconfig_build() -> String {
 mod tests {
 	use super::*;
 	use krunt_backend_dsl::{
-		BackendDslPlugin, ENTITY_NODE_TYPE, ERROR_RESPONSE_NODE_TYPE, HTTP_REQUEST_TYPE,
-		HTTP_ROUTE_NODE_TYPE, MUTATION_NODE_TYPE, QUERY_NODE_TYPE, REPOSITORY_NODE_TYPE,
-		SUBGRAPH_NODE_TYPE, SUCCESS_RESPONSE_NODE_TYPE, TRANSFORM_NODE_TYPE,
+		BackendDslPlugin, ENTITY_NODE_TYPE, ERROR_RESPONSE_NODE_TYPE, HTTP_REQUEST_METHOD_PROPERTY,
+		HTTP_REQUEST_NODE_TYPE, HTTP_REQUEST_TYPE, HTTP_REQUEST_URL_PROPERTY, HTTP_ROUTE_NODE_TYPE,
+		MUTATION_NODE_TYPE, QUERY_NODE_TYPE, REPOSITORY_NODE_TYPE, SUBGRAPH_NODE_TYPE,
+		SUCCESS_RESPONSE_NODE_TYPE, TRANSFORM_NODE_TYPE, TRY_CATCH_NODE_TYPE,
 		VALIDATION_ERROR_NODE_TYPE,
 	};
 	use krunt_codegen_typescript::TypeScriptBackend;
@@ -2017,6 +2047,215 @@ mod tests {
 
 	fn backend_dsl_validation_error_program() -> TypeScriptProgram {
 		backend_dsl_program_with_response(VALIDATION_ERROR_NODE_TYPE, 422)
+	}
+
+	fn backend_dsl_try_catch_program() -> TypeScriptProgram {
+		let metadata =
+			GraphMetadata::new(GraphId::new(6).unwrap(), "backend-v1", "krunt-test").unwrap();
+		let mut builder = GraphBuilder::new(metadata);
+
+		let mut route = Node::new(
+			NodeId::new(1).unwrap(),
+			NodeTypeId::new(HTTP_ROUTE_NODE_TYPE).unwrap(),
+		)
+		.with_property("method", Value::String("GET".to_string()))
+		.unwrap()
+		.with_property("path", Value::String("/guarded".to_string()))
+		.unwrap();
+		route
+			.add_port(Port::new(
+				PortId::new(11).unwrap(),
+				PortDirection::OUTPUT,
+				PortKind::EXECUTION,
+			))
+			.unwrap();
+		route
+			.add_port(
+				Port::new(
+					PortId::new(12).unwrap(),
+					PortDirection::OUTPUT,
+					PortKind::DATA,
+				)
+				.with_type_reference(TypeReference::new(HTTP_REQUEST_TYPE).unwrap()),
+			)
+			.unwrap();
+
+		let mut try_catch = Node::new(
+			NodeId::new(2).unwrap(),
+			NodeTypeId::new(TRY_CATCH_NODE_TYPE).unwrap(),
+		);
+		try_catch
+			.add_port(Port::new(
+				PortId::new(21).unwrap(),
+				PortDirection::INPUT,
+				PortKind::EXECUTION,
+			))
+			.unwrap();
+		try_catch
+			.add_port(Port::new(
+				PortId::new(22).unwrap(),
+				PortDirection::OUTPUT,
+				PortKind::EXECUTION,
+			))
+			.unwrap();
+		try_catch
+			.add_port(Port::new(
+				PortId::new(23).unwrap(),
+				PortDirection::OUTPUT,
+				PortKind::EXECUTION,
+			))
+			.unwrap();
+
+		let mut request = Node::new(
+			NodeId::new(3).unwrap(),
+			NodeTypeId::new(HTTP_REQUEST_NODE_TYPE).unwrap(),
+		)
+		.with_property(
+			HTTP_REQUEST_METHOD_PROPERTY,
+			Value::String("GET".to_string()),
+		)
+		.unwrap()
+		.with_property(
+			HTTP_REQUEST_URL_PROPERTY,
+			Value::String("https://example.test/guarded".to_string()),
+		)
+		.unwrap();
+		request
+			.add_port(Port::new(
+				PortId::new(31).unwrap(),
+				PortDirection::INPUT,
+				PortKind::EXECUTION,
+			))
+			.unwrap();
+		request
+			.add_port(
+				Port::new(
+					PortId::new(32).unwrap(),
+					PortDirection::INPUT,
+					PortKind::DATA,
+				)
+				.with_type_reference(TypeReference::new("ANY").unwrap()),
+			)
+			.unwrap();
+		request
+			.add_port(Port::new(
+				PortId::new(33).unwrap(),
+				PortDirection::OUTPUT,
+				PortKind::EXECUTION,
+			))
+			.unwrap();
+		request
+			.add_port(
+				Port::new(
+					PortId::new(34).unwrap(),
+					PortDirection::OUTPUT,
+					PortKind::DATA,
+				)
+				.with_type_reference(TypeReference::new("ANY").unwrap()),
+			)
+			.unwrap();
+
+		let mut success = Node::new(
+			NodeId::new(4).unwrap(),
+			NodeTypeId::new(SUCCESS_RESPONSE_NODE_TYPE).unwrap(),
+		)
+		.with_property("status_code", Value::Number(200.into()))
+		.unwrap();
+		success
+			.add_port(Port::new(
+				PortId::new(41).unwrap(),
+				PortDirection::INPUT,
+				PortKind::EXECUTION,
+			))
+			.unwrap();
+		success
+			.add_port(
+				Port::new(
+					PortId::new(42).unwrap(),
+					PortDirection::INPUT,
+					PortKind::DATA,
+				)
+				.with_type_reference(TypeReference::new("ANY").unwrap()),
+			)
+			.unwrap();
+
+		let mut error = Node::new(
+			NodeId::new(5).unwrap(),
+			NodeTypeId::new(ERROR_RESPONSE_NODE_TYPE).unwrap(),
+		)
+		.with_property("status_code", Value::Number(502.into()))
+		.unwrap();
+		error
+			.add_port(Port::new(
+				PortId::new(51).unwrap(),
+				PortDirection::INPUT,
+				PortKind::EXECUTION,
+			))
+			.unwrap();
+		error
+			.add_port(
+				Port::new(
+					PortId::new(52).unwrap(),
+					PortDirection::INPUT,
+					PortKind::DATA,
+				)
+				.with_type_reference(TypeReference::new("ANY").unwrap()),
+			)
+			.unwrap();
+
+		for node in [route, try_catch, request, success, error] {
+			builder.add_node(node).unwrap();
+		}
+		for edge in [
+			Edge::new(
+				EdgeId::new(61).unwrap(),
+				PortId::new(11).unwrap(),
+				PortId::new(21).unwrap(),
+				EdgeKind::EXECUTION,
+			),
+			Edge::new(
+				EdgeId::new(62).unwrap(),
+				PortId::new(22).unwrap(),
+				PortId::new(31).unwrap(),
+				EdgeKind::EXECUTION,
+			),
+			Edge::new(
+				EdgeId::new(63).unwrap(),
+				PortId::new(33).unwrap(),
+				PortId::new(41).unwrap(),
+				EdgeKind::EXECUTION,
+			),
+			Edge::new(
+				EdgeId::new(64).unwrap(),
+				PortId::new(23).unwrap(),
+				PortId::new(51).unwrap(),
+				EdgeKind::EXECUTION,
+			),
+			Edge::new(
+				EdgeId::new(65).unwrap(),
+				PortId::new(12).unwrap(),
+				PortId::new(32).unwrap(),
+				EdgeKind::DATA,
+			),
+			Edge::new(
+				EdgeId::new(66).unwrap(),
+				PortId::new(34).unwrap(),
+				PortId::new(42).unwrap(),
+				EdgeKind::DATA,
+			),
+		] {
+			builder.add_edge(edge).unwrap();
+		}
+
+		let mut registry = PluginRegistry::new();
+		BackendDslPlugin::register(&mut registry).unwrap();
+		let result = krunt_compiler::compile(&builder.build().unwrap(), &registry);
+		assert!(
+			!result.has_errors(),
+			"compiler diagnostics: {:?}",
+			result.diagnostics()
+		);
+		TypeScriptBackend::lower_graph(result.ir().expect("valid graph should lower")).unwrap()
 	}
 
 	fn backend_dsl_subgraph_program() -> TypeScriptProgram {
@@ -3330,6 +3569,28 @@ void main().catch((error: unknown) => {
 			.file("src/app.controller.ts")
 			.unwrap()
 			.contains("throw new HttpException(result ?? 'Validation failed', 400);"));
+	}
+
+	#[test]
+	fn maps_try_catch_error_paths_to_nestjs_http_exceptions() {
+		let program = backend_dsl_try_catch_program();
+		let framework_program = NestJsBackend::lower_program(&program).unwrap();
+
+		assert_eq!(framework_program.routes().len(), 1);
+		assert_eq!(
+			framework_program.routes()[0].response_kind(),
+			NestJsResponseKind::SUCCESS
+		);
+		assert!(framework_program.routes()[0].has_error_response());
+
+		let project = NestJsBackend::generate_project(&program).unwrap();
+		let generated = project.file("src/generated.ts").unwrap();
+		assert!(generated.contains("export class KruntResponseError"));
+		assert!(generated.contains("throw new KruntResponseError(502"));
+		let controller = project.file("src/app.controller.ts").unwrap();
+		assert!(controller.contains("KruntResponseError"));
+		assert!(controller
+			.contains("throw new HttpException(error.body ?? error.message, error.statusCode);"));
 	}
 
 	#[test]

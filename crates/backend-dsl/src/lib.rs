@@ -1264,7 +1264,7 @@ impl krunt_plugin_api::SemanticPlugin for BackendDslPlugin {
 				AsyncKind::SYNC,
 				[],
 			)
-			.with_kind(LoweredOperationKind::BRANCH)
+			.with_kind(LoweredOperationKind::TRY_CATCH)
 			.with_attribute("error.handling.kind", "TRY_CATCH")),
 			VALIDATION_ERROR_NODE_TYPE => {
 				let message = validation_error_message(node).map_err(|error| vec![*error])?;
@@ -4932,7 +4932,7 @@ mod tests {
 		let lowered = BackendDslPlugin::new().lower_node(&node).unwrap();
 
 		assert_eq!(lowered.operation().as_str(), TRY_CATCH_NODE_TYPE);
-		assert_eq!(lowered.kind(), LoweredOperationKind::BRANCH);
+		assert_eq!(lowered.kind(), LoweredOperationKind::TRY_CATCH);
 		assert_eq!(lowered.attributes()["error.handling.kind"], "TRY_CATCH");
 		assert!(!lowered.returns());
 	}

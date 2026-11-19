@@ -931,6 +931,7 @@ fn ir_node(
 					name: lowered.operation().clone(),
 				},
 				LoweredOperationKind::BRANCH => IROp::BRANCH,
+				LoweredOperationKind::TRY_CATCH => IROp::TRY_CATCH,
 				LoweredOperationKind::MERGE => IROp::MERGE,
 				LoweredOperationKind::LOOP => IROp::LOOP,
 				LoweredOperationKind::SUBGRAPH => IROp::SUBGRAPH {

@@ -131,6 +131,7 @@ pub enum IROp {
 	ENTRY { name: OperationId },
 	OPERATION { name: OperationId },
 	BRANCH,
+	TRY_CATCH,
 	MERGE,
 	LOOP,
 	SUBGRAPH { id: GraphSubgraphId },
@@ -217,7 +218,7 @@ pub struct IRGraph {
 }
 
 impl IRGraph {
-	pub const CURRENT_VERSION: u32 = 2;
+	pub const CURRENT_VERSION: u32 = 3;
 
 	pub fn node(&self, id: IrNodeId) -> Option<&IRNode> {
 		self.nodes
