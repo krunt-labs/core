@@ -1649,7 +1649,23 @@ fn krunt_runtime(program: &NestJsProgram) -> String {
     }
   }
 
-  async query<TOutput>(name: string, repository: string): Promise<TOutput> {
+"#,
+	);
+	if program.repositories().is_empty() {
+		source.push_str(
+			r#"  async query<TOutput>(name: string, repository: string): Promise<TOutput> {
+    throw new Error(`No repository provider configured for query ${repository}.${name}`);
+  }
+
+  async mutation<TInput, TOutput>(name: string, repository: string, value: TInput): Promise<TOutput> {
+    throw new Error(`No repository provider configured for mutation ${repository}.${name}`);
+  }
+
+"#,
+		);
+	} else {
+		source.push_str(
+			r#"  async query<TOutput>(name: string, repository: string): Promise<TOutput> {
     const adapter = this.repository(repository);
     if (adapter === undefined) {
       throw new Error(`No repository provider configured for query ${repository}.${name}`);
@@ -1665,7 +1681,11 @@ fn krunt_runtime(program: &NestJsProgram) -> String {
     return adapter.execute('MUTATION', name, value) as Promise<TOutput>;
   }
 
-  log(level: string, message: unknown): void {
+"#,
+		);
+	}
+	source.push_str(
+		r#"  log(level: string, message: unknown): void {
     switch (level) {
       case 'ERROR':
         console.error(message);
@@ -3312,6 +3332,34 @@ void main().catch((error: unknown) => {
 });
 "#;
 
+	const TRY_CATCH_RUNTIME_SMOKE_SOURCE: &str = r#"import { execute_1, KruntResponseError } from './src/generated';
+import { KruntRuntimeService } from './src/krunt-runtime';
+
+async function main(): Promise<void> {
+  const runtime = new KruntRuntimeService();
+  runtime.httpRequest = async () => {
+    throw new Error('upstream unavailable');
+  };
+
+  try {
+    await execute_1(undefined, runtime);
+    throw new Error('expected the generated Try/Catch path to throw');
+  } catch (error) {
+    if (!(error instanceof KruntResponseError)) {
+      throw error;
+    }
+    if (error.statusCode !== 502) {
+      throw new Error(`expected status 502, received ${error.statusCode}`);
+    }
+  }
+}
+
+void main().catch((error: unknown) => {
+  console.error(error);
+  throw error;
+});
+"#;
+
 	const MUTATION_RUNTIME_SMOKE_SOURCE: &str = r#"import { execute_1 } from './src/generated';
 import { KruntRuntimeService } from './src/krunt-runtime';
 import { UserRepositoryRepository } from './src/repositories/UserRepositoryRepository.repository';
@@ -3591,6 +3639,12 @@ void main().catch((error: unknown) => {
 		assert!(controller.contains("KruntResponseError"));
 		assert!(controller
 			.contains("throw new HttpException(error.body ?? error.message, error.statusCode);"));
+		assert_generated_project_typechecks(&project, "try-catch");
+		assert_generated_project_runtime_smokes_with_source(
+			&project,
+			"try-catch",
+			TRY_CATCH_RUNTIME_SMOKE_SOURCE,
+		);
 	}
 
 	#[test]
