@@ -48,6 +48,7 @@ impl CompilationResult {
 pub fn compile(document: &GraphDocument, plugins: &PluginRegistry) -> CompilationResult {
 	let mut diagnostics = Diagnostics::new();
 	let mut contracts = BTreeMap::new();
+	let mut ambiguous_ports = BTreeSet::new();
 
 	for node in document.nodes() {
 		let Some(plugin) = plugins.resolve(node.type_id()) else {
@@ -62,7 +63,7 @@ pub fn compile(document: &GraphDocument, plugins: &PluginRegistry) -> Compilatio
 	diagnostics.extend(plugins.analyze_graph(document));
 
 	let inferred_types = if !diagnostics.has_errors() {
-		infer_data_types(document, &contracts, &mut diagnostics)
+		infer_data_types(document, &contracts, &mut ambiguous_ports, &mut diagnostics)
 	} else {
 		BTreeMap::new()
 	};
@@ -82,6 +83,7 @@ pub fn compile(document: &GraphDocument, plugins: &PluginRegistry) -> Compilatio
 
 	let mut builder = IRBuilder::new();
 	let mut port_bindings = BTreeMap::new();
+	let mut resolved_ambiguous_ports = BTreeSet::new();
 
 	for (index, node) in document.nodes().iter().enumerate() {
 		let ir_id = krunt_ir::IrNodeId((index + 1) as u32);
@@ -94,6 +96,12 @@ pub fn compile(document: &GraphDocument, plugins: &PluginRegistry) -> Compilatio
 
 		match plugin.lower_node_in_document(node, document) {
 			Ok(lowered) => {
+				resolve_ambiguous_ports_from_lowering(
+					node,
+					&lowered,
+					&ambiguous_ports,
+					&mut resolved_ambiguous_ports,
+				);
 				let lowered = specialize_lowered_operation(node, lowered, &inferred_types);
 				if !validate_lowered_operation(node, contract, &lowered, &mut diagnostics) {
 					continue;
@@ -111,6 +119,16 @@ pub fn compile(document: &GraphDocument, plugins: &PluginRegistry) -> Compilatio
 			}
 			Err(plugin_diagnostics) => diagnostics.extend(plugin_diagnostics),
 		}
+	}
+	for port in ambiguous_ports.difference(&resolved_ambiguous_ports) {
+		let related = document
+			.edges()
+			.iter()
+			.filter(|edge| {
+				edge.kind() == EdgeKind::DATA && (edge.from() == *port || edge.to() == *port)
+			})
+			.map(|edge| RelatedElement::new(GraphElementId::EDGE(edge.id())));
+		diagnostics.push(ambiguous_type_diagnostic(*port, related));
 	}
 
 	if !diagnostics.has_errors() {
@@ -349,6 +367,7 @@ fn validate_lowered_operation(
 struct GraphPortType {
 	kind: PortKind,
 	type_reference: Option<Type>,
+	explicit_any: bool,
 }
 
 struct InferredDataConstraint {
@@ -375,6 +394,7 @@ enum InferenceConstraintSource {
 fn infer_data_types(
 	document: &GraphDocument,
 	contracts: &BTreeMap<NodeId, NodeContract>,
+	ambiguous_ports: &mut BTreeSet<PortId>,
 	diagnostics: &mut Diagnostics,
 ) -> BTreeMap<PortId, Type> {
 	let mut port_types = BTreeMap::new();
@@ -386,17 +406,23 @@ fn infer_data_types(
 				});
 				replace_open_types(parsed, TypeVariable::new(port.id().as_u64()))
 			});
+			let explicit_any = port
+				.type_reference()
+				.map(|reference| reference.as_str().eq_ignore_ascii_case("ANY"))
+				.unwrap_or(false);
 			port_types.insert(
 				port.id(),
 				GraphPortType {
 					kind: port.kind(),
 					type_reference,
+					explicit_any,
 				},
 			);
 		}
 	}
 
 	let mut constraints = Vec::new();
+	let mut active_ports = BTreeSet::new();
 	for node in document.nodes() {
 		let Some(contract) = contracts.get(&node.id()) else {
 			continue;
@@ -425,6 +451,7 @@ fn infer_data_types(
 				.collect::<Vec<_>>(),
 			&port_types,
 			&mut constraints,
+			&mut active_ports,
 			diagnostics,
 		);
 		add_contract_constraints(
@@ -437,6 +464,7 @@ fn infer_data_types(
 				.collect::<Vec<_>>(),
 			&port_types,
 			&mut constraints,
+			&mut active_ports,
 			diagnostics,
 		);
 	}
@@ -474,6 +502,8 @@ fn infer_data_types(
 				to_port: edge.to(),
 			},
 		});
+		active_ports.insert(edge.from());
+		active_ports.insert(edge.to());
 	}
 
 	constraints.sort_by_key(|constraint| constraint.source.clone());
@@ -506,6 +536,7 @@ fn infer_data_types(
 
 	let substitution =
 		solve_constraints(accepted.iter().map(|item| item.constraint.clone())).unwrap_or_default();
+	*ambiguous_ports = ambiguous_type_ports(&port_types, &active_ports, &substitution);
 	port_types
 		.into_iter()
 		.filter_map(|(port, graph_type)| {
@@ -522,6 +553,7 @@ fn add_contract_constraints(
 	contracts: &[&PortContract],
 	port_types: &BTreeMap<PortId, GraphPortType>,
 	constraints: &mut Vec<InferredDataConstraint>,
+	active_ports: &mut BTreeSet<PortId>,
 	diagnostics: &mut Diagnostics,
 ) {
 	for (port, contract) in ports.iter().zip(contracts) {
@@ -539,6 +571,7 @@ fn add_contract_constraints(
 		else {
 			continue;
 		};
+		active_ports.insert(port.id());
 		constraints.push(InferredDataConstraint {
 			from_type: port_type.clone(),
 			to_type: contract_type.clone(),
@@ -549,6 +582,40 @@ fn add_contract_constraints(
 			},
 		});
 	}
+}
+
+fn ambiguous_type_ports(
+	port_types: &BTreeMap<PortId, GraphPortType>,
+	active_ports: &BTreeSet<PortId>,
+	substitution: &TypeSubstitution,
+) -> BTreeSet<PortId> {
+	let mut unresolved_ports = BTreeMap::new();
+	for port in active_ports {
+		let Some(graph_type) = port_types.get(port) else {
+			continue;
+		};
+		// A top-level ANY is an intentional dynamic boundary. Composite open
+		// types, however, still contain an inference variable that must not be
+		// silently materialized as ANY.
+		if graph_type.explicit_any {
+			continue;
+		}
+		let Some(type_value) = graph_type.type_reference.as_ref() else {
+			continue;
+		};
+		for variable in substitution.unresolved_variables(type_value) {
+			unresolved_ports
+				.entry(variable)
+				.and_modify(|existing| {
+					if *port < *existing {
+						*existing = *port;
+					}
+				})
+				.or_insert(*port);
+		}
+	}
+
+	unresolved_ports.into_values().collect()
 }
 
 fn replace_open_types(type_value: Type, variable: TypeVariable) -> Type {
@@ -663,6 +730,40 @@ fn specialize_lowered_operation(
 	lowered
 		.with_input_types(input_types)
 		.with_output_types(output_types)
+}
+
+fn resolve_ambiguous_ports_from_lowering(
+	node: &Node,
+	lowered: &LoweredOperation,
+	ambiguous_ports: &BTreeSet<PortId>,
+	resolved_ports: &mut BTreeSet<PortId>,
+) {
+	let data_inputs: Vec<_> = node
+		.ports()
+		.iter()
+		.filter(|port| port.direction() == PortDirection::INPUT && port.kind() == PortKind::DATA)
+		.collect();
+	let data_outputs: Vec<_> = node
+		.ports()
+		.iter()
+		.filter(|port| port.direction() == PortDirection::OUTPUT && port.kind() == PortKind::DATA)
+		.collect();
+	for (type_id, port) in lowered.input_types().iter().zip(data_inputs) {
+		if ambiguous_ports.contains(&port.id()) && lowered_type_is_concrete(type_id) {
+			resolved_ports.insert(port.id());
+		}
+	}
+	for (type_id, port) in lowered.output_types().iter().zip(data_outputs) {
+		if ambiguous_ports.contains(&port.id()) && lowered_type_is_concrete(type_id) {
+			resolved_ports.insert(port.id());
+		}
+	}
+}
+
+fn lowered_type_is_concrete(type_id: &TypeId) -> bool {
+	Type::from_reference(type_id.as_str())
+		.map(|type_value| !type_value.contains_open_type())
+		.unwrap_or(false)
 }
 
 fn specialize_type_ids(
@@ -1289,6 +1390,21 @@ fn missing_type_reference_diagnostic(port: PortId, edge: krunt_graph_model::Edge
 	.with_related([RelatedElement::new(GraphElementId::EDGE(edge))])
 }
 
+fn ambiguous_type_diagnostic(
+	port: PortId,
+	related: impl IntoIterator<Item = RelatedElement>,
+) -> Diagnostic {
+	Diagnostic::new(
+		DiagnosticCode::new("TYPE.AMBIGUOUS").unwrap(),
+		Severity::ERROR,
+		CompilerStage::TYPE_ANALYSIS,
+		"Could not infer a concrete data type for this connected port.",
+		GraphElementId::PORT(port),
+	)
+	.unwrap()
+	.with_related(related)
+}
+
 fn invalid_contract_type_diagnostic(node: &Node, port: PortId, type_id: &TypeId) -> Diagnostic {
 	Diagnostic::new(
 		DiagnosticCode::new("TYPE.CONTRACT_REFERENCE").unwrap(),
@@ -1399,6 +1515,7 @@ mod tests {
 		capability_provider: bool,
 		capability_requirement: bool,
 		route_entry: bool,
+		open_data_contract: bool,
 	}
 
 	impl SemanticPlugin for BackendTestPlugin {
@@ -1411,7 +1528,14 @@ mod tests {
 			let data = || {
 				PortContract::new(
 					PortKind::DATA,
-					Some(krunt_ir::TypeId::new("Request").unwrap()),
+					Some(
+						krunt_ir::TypeId::new(if self.open_data_contract {
+							"ANY"
+						} else {
+							"Request"
+						})
+						.unwrap(),
+					),
 					true,
 				)
 			};
@@ -1465,14 +1589,21 @@ mod tests {
 
 		fn lower_node(&self, node: &Node) -> Result<LoweredOperation, Vec<Diagnostic>> {
 			let (inputs, outputs) = if node.type_id().as_str() == "test.route" {
-				let output_type = if self.lowered_type_mismatch {
+				let output_type = if self.open_data_contract {
+					"ANY"
+				} else if self.lowered_type_mismatch {
 					"Response"
 				} else {
 					"Request"
 				};
 				(vec![], vec![krunt_ir::TypeId::new(output_type).unwrap()])
 			} else {
-				(vec![krunt_ir::TypeId::new("Request").unwrap()], vec![])
+				let input_type = if self.open_data_contract {
+					"ANY"
+				} else {
+					"Request"
+				};
+				(vec![krunt_ir::TypeId::new(input_type).unwrap()], vec![])
 			};
 			Ok(LoweredOperation::new(
 				krunt_ir::OperationId::new(node.type_id().as_str()).unwrap(),
@@ -1902,6 +2033,10 @@ mod tests {
 		document_with_route_type(Some("ANY"), Some("ANY"), true)
 	}
 
+	fn document_with_composite_open_data_types() -> GraphDocument {
+		document_with_route_type(Some("Array<ANY>"), Some("Array<ANY>"), true)
+	}
+
 	fn document_without_data_dependency() -> GraphDocument {
 		document_with_options(Some("Request"), false)
 	}
@@ -2052,15 +2187,19 @@ mod tests {
 	}
 
 	fn registry() -> PluginRegistry {
-		registry_with_options(false, false, false, false, false, true)
+		registry_with_options(false, false, false, false, false, true, false)
 	}
 
 	fn registry_with_semantic_error(semantic_error: bool) -> PluginRegistry {
-		registry_with_options(semantic_error, false, false, false, false, true)
+		registry_with_options(semantic_error, false, false, false, false, true, false)
 	}
 
 	fn registry_with_capabilities(provider: bool, requirement: bool) -> PluginRegistry {
-		registry_with_options(false, false, false, provider, requirement, true)
+		registry_with_options(false, false, false, provider, requirement, true, false)
+	}
+
+	fn registry_with_open_data_contracts() -> PluginRegistry {
+		registry_with_options(false, false, false, false, false, true, true)
 	}
 
 	fn registry_with_options(
@@ -2070,6 +2209,7 @@ mod tests {
 		capability_provider: bool,
 		capability_requirement: bool,
 		route_entry: bool,
+		open_data_contract: bool,
 	) -> PluginRegistry {
 		let manifest = PluginManifest::new(
 			PluginReference::new("test-backend", "0.1.0").unwrap(),
@@ -2089,6 +2229,7 @@ mod tests {
 				capability_provider,
 				capability_requirement,
 				route_entry,
+				open_data_contract,
 			}))
 			.unwrap();
 		registry
@@ -2293,7 +2434,7 @@ mod tests {
 	fn graph_contract_violations_block_ir_generation() {
 		let result = compile(
 			&document(),
-			&registry_with_options(false, true, false, false, false, true),
+			&registry_with_options(false, true, false, false, false, true, false),
 		);
 
 		assert!(result.has_errors());
@@ -2309,10 +2450,37 @@ mod tests {
 	}
 
 	#[test]
+	fn unresolved_connected_types_block_ir_generation_deterministically() {
+		let document = document_with_composite_open_data_types();
+		let first = compile(&document, &registry_with_open_data_contracts());
+		let second = compile(&document, &registry_with_open_data_contracts());
+
+		assert!(first.has_errors());
+		assert!(first.ir().is_none());
+		assert_eq!(first.diagnostics(), second.diagnostics());
+		let diagnostic = first
+			.diagnostics()
+			.as_slice()
+			.iter()
+			.find(|diagnostic| diagnostic.code().as_str() == "TYPE.AMBIGUOUS")
+			.expect("an unresolved connected type should be diagnosed");
+		assert_eq!(diagnostic.stage(), CompilerStage::TYPE_ANALYSIS);
+		assert_eq!(
+			diagnostic.primary(),
+			GraphElementId::PORT(PortId::new(12).unwrap())
+		);
+		assert_eq!(diagnostic.related().len(), 1);
+		assert_eq!(
+			diagnostic.related()[0].element(),
+			GraphElementId::EDGE(EdgeId::new(32).unwrap())
+		);
+	}
+
+	#[test]
 	fn lowered_operation_contract_violations_block_ir_generation() {
 		let result = compile(
 			&document(),
-			&registry_with_options(false, false, true, false, false, true),
+			&registry_with_options(false, false, true, false, false, true, false),
 		);
 
 		assert!(result.has_errors());
@@ -2351,7 +2519,7 @@ mod tests {
 	fn graphs_without_entry_points_block_ir_generation() {
 		let result = compile(
 			&document(),
-			&registry_with_options(false, false, false, false, false, false),
+			&registry_with_options(false, false, false, false, false, false, false),
 		);
 
 		assert!(result.has_errors());
@@ -2462,10 +2630,12 @@ mod tests {
 	fn contract_types_seed_inference_for_open_ports() {
 		let document = document_with_open_data_types();
 		let registry = registry();
+		let mut ambiguous_ports = BTreeSet::new();
 		let mut diagnostics = Diagnostics::new();
 		let inferred = infer_data_types(
 			&document,
 			&contracts_for(&document, &registry),
+			&mut ambiguous_ports,
 			&mut diagnostics,
 		);
 
@@ -2508,10 +2678,12 @@ mod tests {
 	fn open_data_ports_are_inferred_from_connected_concrete_ports() {
 		let document = document_with_response_type(Some("ANY"));
 		let registry = registry();
+		let mut ambiguous_ports = BTreeSet::new();
 		let mut diagnostics = Diagnostics::new();
 		let inferred = infer_data_types(
 			&document,
 			&contracts_for(&document, &registry),
+			&mut ambiguous_ports,
 			&mut diagnostics,
 		);
 
@@ -2530,10 +2702,12 @@ mod tests {
 	fn inferred_types_specialize_open_lowered_operation_slots() {
 		let document = document_with_response_type(Some("ANY"));
 		let registry = registry();
+		let mut ambiguous_ports = BTreeSet::new();
 		let mut diagnostics = Diagnostics::new();
 		let inferred = infer_data_types(
 			&document,
 			&contracts_for(&document, &registry),
+			&mut ambiguous_ports,
 			&mut diagnostics,
 		);
 		let response = &document.nodes()[1];

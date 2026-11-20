@@ -156,6 +156,27 @@ impl Type {
 		}
 	}
 
+	pub fn contains_open_type(&self) -> bool {
+		match self {
+			Self::ANY | Self::VARIABLE(_) => true,
+			Self::ARRAY(element)
+			| Self::SET(element)
+			| Self::OPTION(element)
+			| Self::FUTURE(element)
+			| Self::STREAM(element) => element.contains_open_type(),
+			Self::MAP(key, value) | Self::RESULT(key, value) => {
+				key.contains_open_type() || value.contains_open_type()
+			}
+			Self::RECORD(fields) => fields
+				.values()
+				.any(|field| field.type_value().contains_open_type()),
+			Self::UNION(members) | Self::INTERSECTION(members) => {
+				members.iter().any(Type::contains_open_type)
+			}
+			_ => false,
+		}
+	}
+
 	/// Return the canonical graph-facing spelling used by IR type identities.
 	pub fn to_reference(&self) -> String {
 		match self {
@@ -947,6 +968,19 @@ mod tests {
 
 		assert_eq!(substitution.resolve(&first), Type::array(Type::INTEGER));
 		assert_eq!(substitution.resolve(&second), Type::array(Type::INTEGER));
+	}
+
+	#[test]
+	fn substitutions_expose_unresolved_variables_after_partial_inference() {
+		let first = Type::variable(TypeVariable::new(1));
+		let second = Type::variable(TypeVariable::new(2));
+		let substitution =
+			solve_constraints([TypeConstraint::assignable(first.clone(), second.clone())]).unwrap();
+
+		assert_eq!(
+			substitution.unresolved_variables(&second),
+			vec![TypeVariable::new(1)]
+		);
 	}
 
 	#[test]
