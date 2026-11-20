@@ -7,13 +7,14 @@ use krunt_diagnostics::{
 	CompilerStage, Diagnostic, DiagnosticCode, Diagnostics, GraphElementId, RelatedElement,
 	Severity,
 };
-use krunt_graph_model::{EdgeKind, GraphDocument, Node, PortDirection, PortId, PortKind};
+use krunt_graph_model::{EdgeKind, GraphDocument, Node, NodeId, PortDirection, PortId, PortKind};
 use krunt_ir::{
 	eliminate_unreachable_nodes, BuildError, ControlEdge, DataEdge, GraphNodeId, GraphSubgraphId,
 	IRBuilder, IRGraph, IRNode, IROp, IRSubgraph, IRSubgraphBoundary, PortRef, SourceMap, TypeId,
 };
 use krunt_plugin_api::{
 	CapabilityId, LoweredOperation, LoweredOperationKind, NodeContract, PluginRegistry,
+	PortContract,
 };
 use krunt_type_system::{solve_constraints, Type, TypeConstraint, TypeSubstitution, TypeVariable};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -61,7 +62,7 @@ pub fn compile(document: &GraphDocument, plugins: &PluginRegistry) -> Compilatio
 	diagnostics.extend(plugins.analyze_graph(document));
 
 	let inferred_types = if !diagnostics.has_errors() {
-		infer_data_types(document, &mut diagnostics)
+		infer_data_types(document, &contracts, &mut diagnostics)
 	} else {
 		BTreeMap::new()
 	};
@@ -351,16 +352,29 @@ struct GraphPortType {
 }
 
 struct InferredDataConstraint {
-	edge: krunt_graph_model::EdgeId,
-	from_port: PortId,
-	to_port: PortId,
 	from_type: Type,
 	to_type: Type,
 	constraint: TypeConstraint,
+	source: InferenceConstraintSource,
+}
+
+#[allow(non_camel_case_types, clippy::upper_case_acronyms)]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum InferenceConstraintSource {
+	CONTRACT {
+		node: NodeId,
+		port: PortId,
+	},
+	EDGE {
+		edge: krunt_graph_model::EdgeId,
+		from_port: PortId,
+		to_port: PortId,
+	},
 }
 
 fn infer_data_types(
 	document: &GraphDocument,
+	contracts: &BTreeMap<NodeId, NodeContract>,
 	diagnostics: &mut Diagnostics,
 ) -> BTreeMap<PortId, Type> {
 	let mut port_types = BTreeMap::new();
@@ -382,13 +396,57 @@ fn infer_data_types(
 		}
 	}
 
+	let mut constraints = Vec::new();
+	for node in document.nodes() {
+		let Some(contract) = contracts.get(&node.id()) else {
+			continue;
+		};
+		let data_inputs: Vec<_> = node
+			.ports()
+			.iter()
+			.filter(|port| {
+				port.direction() == PortDirection::INPUT && port.kind() == PortKind::DATA
+			})
+			.collect();
+		let data_outputs: Vec<_> = node
+			.ports()
+			.iter()
+			.filter(|port| {
+				port.direction() == PortDirection::OUTPUT && port.kind() == PortKind::DATA
+			})
+			.collect();
+		add_contract_constraints(
+			node,
+			&data_inputs,
+			&contract
+				.inputs()
+				.iter()
+				.filter(|port| port.kind() == PortKind::DATA)
+				.collect::<Vec<_>>(),
+			&port_types,
+			&mut constraints,
+			diagnostics,
+		);
+		add_contract_constraints(
+			node,
+			&data_outputs,
+			&contract
+				.outputs()
+				.iter()
+				.filter(|port| port.kind() == PortKind::DATA)
+				.collect::<Vec<_>>(),
+			&port_types,
+			&mut constraints,
+			diagnostics,
+		);
+	}
+
 	let mut data_edges: Vec<_> = document
 		.edges()
 		.iter()
 		.filter(|edge| edge.kind() == EdgeKind::DATA)
 		.collect();
 	data_edges.sort_by_key(|edge| edge.id());
-	let mut constraints = Vec::new();
 	for edge in data_edges {
 		let (Some(from), Some(to)) = (port_types.get(&edge.from()), port_types.get(&edge.to()))
 		else {
@@ -407,15 +465,18 @@ fn infer_data_types(
 			continue;
 		};
 		constraints.push(InferredDataConstraint {
-			edge: edge.id(),
-			from_port: edge.from(),
-			to_port: edge.to(),
 			from_type: from_type.clone(),
 			to_type: to_type.clone(),
 			constraint: TypeConstraint::assignable(from_type.clone(), to_type.clone()),
+			source: InferenceConstraintSource::EDGE {
+				edge: edge.id(),
+				from_port: edge.from(),
+				to_port: edge.to(),
+			},
 		});
 	}
 
+	constraints.sort_by_key(|constraint| constraint.source.clone());
 	let mut accepted = Vec::new();
 	for candidate in constraints {
 		accepted.push(candidate);
@@ -428,13 +489,18 @@ fn infer_data_types(
 					.unwrap_or_default();
 			let from_type = substitution.resolve(&failed.from_type);
 			let to_type = substitution.resolve(&failed.to_type);
-			diagnostics.push(type_mismatch_diagnostic(
-				failed.from_port,
-				failed.to_port,
-				failed.edge,
-				&from_type,
-				&to_type,
-			));
+			match failed.source {
+				InferenceConstraintSource::EDGE {
+					edge,
+					from_port,
+					to_port,
+				} => diagnostics.push(type_mismatch_diagnostic(
+					from_port, to_port, edge, &from_type, &to_type,
+				)),
+				InferenceConstraintSource::CONTRACT { node, port } => diagnostics.push(
+					contract_type_mismatch_diagnostic(node, port, &from_type, &to_type),
+				),
+			}
 		}
 	}
 
@@ -448,6 +514,41 @@ fn infer_data_types(
 				.map(|type_value| (port, materialize_inferred_type(&substitution, &type_value)))
 		})
 		.collect()
+}
+
+fn add_contract_constraints(
+	node: &Node,
+	ports: &[&krunt_graph_model::Port],
+	contracts: &[&PortContract],
+	port_types: &BTreeMap<PortId, GraphPortType>,
+	constraints: &mut Vec<InferredDataConstraint>,
+	diagnostics: &mut Diagnostics,
+) {
+	for (port, contract) in ports.iter().zip(contracts) {
+		let Some(type_id) = contract.type_id() else {
+			continue;
+		};
+		let Ok(contract_type) = Type::from_reference(type_id.as_str()) else {
+			diagnostics.push(invalid_contract_type_diagnostic(node, port.id(), type_id));
+			continue;
+		};
+		if contract_type == Type::ANY {
+			continue;
+		}
+		let Some(Some(port_type)) = port_types.get(&port.id()).map(|port| &port.type_reference)
+		else {
+			continue;
+		};
+		constraints.push(InferredDataConstraint {
+			from_type: port_type.clone(),
+			to_type: contract_type.clone(),
+			constraint: TypeConstraint::assignable(port_type.clone(), contract_type),
+			source: InferenceConstraintSource::CONTRACT {
+				node: node.id(),
+				port: port.id(),
+			},
+		});
+	}
 }
 
 fn replace_open_types(type_value: Type, variable: TypeVariable) -> Type {
@@ -1140,6 +1241,22 @@ fn missing_type_reference_diagnostic(port: PortId, edge: krunt_graph_model::Edge
 	.with_related([RelatedElement::new(GraphElementId::EDGE(edge))])
 }
 
+fn invalid_contract_type_diagnostic(node: &Node, port: PortId, type_id: &TypeId) -> Diagnostic {
+	Diagnostic::new(
+		DiagnosticCode::new("TYPE.CONTRACT_REFERENCE").unwrap(),
+		Severity::ERROR,
+		CompilerStage::TYPE_ANALYSIS,
+		format!(
+			"Node contract '{}' declares invalid data type '{}'.",
+			node.type_id().as_str(),
+			type_id.as_str(),
+		),
+		GraphElementId::PORT(port),
+	)
+	.unwrap()
+	.with_related([RelatedElement::new(GraphElementId::NODE(node.id()))])
+}
+
 fn type_mismatch_diagnostic(
 	from_port: PortId,
 	to_port: PortId,
@@ -1161,6 +1278,25 @@ fn type_mismatch_diagnostic(
 		RelatedElement::new(GraphElementId::PORT(from_port)),
 		RelatedElement::new(GraphElementId::EDGE(edge)),
 	])
+}
+
+fn contract_type_mismatch_diagnostic(
+	node: NodeId,
+	port: PortId,
+	from_type: &Type,
+	to_type: &Type,
+) -> Diagnostic {
+	let from_name = from_type.to_reference();
+	let to_name = to_type.to_reference();
+	Diagnostic::new(
+		DiagnosticCode::new("TYPE.CONTRACT_MISMATCH").unwrap(),
+		Severity::ERROR,
+		CompilerStage::TYPE_ANALYSIS,
+		format!("Data type '{from_name}' does not satisfy the node contract type '{to_name}'."),
+		GraphElementId::PORT(port),
+	)
+	.unwrap()
+	.with_related([RelatedElement::new(GraphElementId::NODE(node))])
 }
 
 fn ir_build_diagnostic(primary: GraphElementId, error: BuildError) -> Diagnostic {
@@ -1714,11 +1850,23 @@ mod tests {
 		document_with_options(response_type, true)
 	}
 
+	fn document_with_open_data_types() -> GraphDocument {
+		document_with_route_type(Some("ANY"), Some("ANY"), true)
+	}
+
 	fn document_without_data_dependency() -> GraphDocument {
 		document_with_options(Some("Request"), false)
 	}
 
 	fn document_with_options(
+		response_type: Option<&str>,
+		include_data_edge: bool,
+	) -> GraphDocument {
+		document_with_route_type(Some("Request"), response_type, include_data_edge)
+	}
+
+	fn document_with_route_type(
+		route_type: Option<&str>,
 		response_type: Option<&str>,
 		include_data_edge: bool,
 	) -> GraphDocument {
@@ -1735,16 +1883,18 @@ mod tests {
 				PortKind::EXECUTION,
 			))
 			.unwrap();
-		route
-			.add_port(
-				Port::new(
-					PortId::new(12).unwrap(),
-					PortDirection::OUTPUT,
-					PortKind::DATA,
-				)
-				.with_type_reference(TypeReference::new("Request").unwrap()),
-			)
-			.unwrap();
+		let route_port = Port::new(
+			PortId::new(12).unwrap(),
+			PortDirection::OUTPUT,
+			PortKind::DATA,
+		);
+		let route_port = match route_type {
+			Some(type_name) => {
+				route_port.with_type_reference(TypeReference::new(type_name).unwrap())
+			}
+			None => route_port,
+		};
+		route.add_port(route_port).unwrap();
 		let mut response = Node::new(
 			NodeId::new(2).unwrap(),
 			NodeTypeId::new("test.response").unwrap(),
@@ -1894,6 +2044,25 @@ mod tests {
 			}))
 			.unwrap();
 		registry
+	}
+
+	fn contracts_for(
+		document: &GraphDocument,
+		registry: &PluginRegistry,
+	) -> BTreeMap<NodeId, NodeContract> {
+		document
+			.nodes()
+			.iter()
+			.map(|node| {
+				(
+					node.id(),
+					registry
+						.resolve(node.type_id())
+						.expect("test nodes must have registered plugins")
+						.contract(node),
+				)
+			})
+			.collect()
 	}
 
 	#[test]
@@ -2226,7 +2395,12 @@ mod tests {
 
 		assert!(result.has_errors());
 		assert!(result.ir().is_none());
-		let diagnostic = &result.diagnostics().as_slice()[0];
+		let diagnostic = result
+			.diagnostics()
+			.as_slice()
+			.iter()
+			.find(|diagnostic| diagnostic.code().as_str() == "TYPE.MISMATCH")
+			.expect("the incompatible edge should have a type mismatch diagnostic");
 		assert_eq!(diagnostic.code().as_str(), "TYPE.MISMATCH");
 		assert_eq!(diagnostic.stage(), CompilerStage::TYPE_ANALYSIS);
 		assert_eq!(
@@ -2237,10 +2411,61 @@ mod tests {
 	}
 
 	#[test]
+	fn contract_types_seed_inference_for_open_ports() {
+		let document = document_with_open_data_types();
+		let registry = registry();
+		let mut diagnostics = Diagnostics::new();
+		let inferred = infer_data_types(
+			&document,
+			&contracts_for(&document, &registry),
+			&mut diagnostics,
+		);
+
+		assert!(diagnostics.is_empty());
+		assert_eq!(
+			inferred.get(&PortId::new(12).unwrap()),
+			Some(&Type::named("Request").unwrap())
+		);
+		assert_eq!(
+			inferred.get(&PortId::new(22).unwrap()),
+			Some(&Type::named("Request").unwrap())
+		);
+	}
+
+	#[test]
+	fn contract_type_mismatches_block_ir_generation_with_source_links() {
+		let document = document_with_route_type(Some("Response"), Some("ANY"), true);
+		let result = compile(&document, &registry());
+
+		assert!(result.has_errors());
+		assert!(result.ir().is_none());
+		let diagnostic = result
+			.diagnostics()
+			.as_slice()
+			.iter()
+			.find(|diagnostic| diagnostic.code().as_str() == "TYPE.CONTRACT_MISMATCH")
+			.expect("the contract mismatch should be reported");
+		assert_eq!(
+			diagnostic.primary(),
+			GraphElementId::PORT(PortId::new(12).unwrap())
+		);
+		assert_eq!(diagnostic.related().len(), 1);
+		assert_eq!(
+			diagnostic.related()[0].element(),
+			GraphElementId::NODE(NodeId::new(1).unwrap())
+		);
+	}
+
+	#[test]
 	fn open_data_ports_are_inferred_from_connected_concrete_ports() {
 		let document = document_with_response_type(Some("ANY"));
+		let registry = registry();
 		let mut diagnostics = Diagnostics::new();
-		let inferred = infer_data_types(&document, &mut diagnostics);
+		let inferred = infer_data_types(
+			&document,
+			&contracts_for(&document, &registry),
+			&mut diagnostics,
+		);
 
 		assert!(diagnostics.is_empty());
 		assert_eq!(
@@ -2256,8 +2481,13 @@ mod tests {
 	#[test]
 	fn inferred_types_specialize_open_lowered_operation_slots() {
 		let document = document_with_response_type(Some("ANY"));
+		let registry = registry();
 		let mut diagnostics = Diagnostics::new();
-		let inferred = infer_data_types(&document, &mut diagnostics);
+		let inferred = infer_data_types(
+			&document,
+			&contracts_for(&document, &registry),
+			&mut diagnostics,
+		);
 		let response = &document.nodes()[1];
 		let lowered = LoweredOperation::new(
 			krunt_ir::OperationId::new("test.response").unwrap(),
