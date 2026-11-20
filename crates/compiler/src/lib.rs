@@ -10,12 +10,12 @@ use krunt_diagnostics::{
 use krunt_graph_model::{EdgeKind, GraphDocument, Node, PortDirection, PortId, PortKind};
 use krunt_ir::{
 	eliminate_unreachable_nodes, BuildError, ControlEdge, DataEdge, GraphNodeId, GraphSubgraphId,
-	IRBuilder, IRGraph, IRNode, IROp, IRSubgraph, IRSubgraphBoundary, PortRef, SourceMap,
+	IRBuilder, IRGraph, IRNode, IROp, IRSubgraph, IRSubgraphBoundary, PortRef, SourceMap, TypeId,
 };
 use krunt_plugin_api::{
 	CapabilityId, LoweredOperation, LoweredOperationKind, NodeContract, PluginRegistry,
 };
-use krunt_type_system::{check_assignable, Type};
+use krunt_type_system::{solve_constraints, Type, TypeConstraint, TypeSubstitution, TypeVariable};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 /// Result of compiling a graph document.
@@ -60,9 +60,11 @@ pub fn compile(document: &GraphDocument, plugins: &PluginRegistry) -> Compilatio
 	}
 	diagnostics.extend(plugins.analyze_graph(document));
 
-	if !diagnostics.has_errors() {
-		analyze_data_types(document, &mut diagnostics);
-	}
+	let inferred_types = if !diagnostics.has_errors() {
+		infer_data_types(document, &mut diagnostics)
+	} else {
+		BTreeMap::new()
+	};
 	if !diagnostics.has_errors() {
 		resolve_capabilities(document, &contracts, &mut diagnostics);
 	}
@@ -91,6 +93,7 @@ pub fn compile(document: &GraphDocument, plugins: &PluginRegistry) -> Compilatio
 
 		match plugin.lower_node_in_document(node, document) {
 			Ok(lowered) => {
+				let lowered = specialize_lowered_operation(node, lowered, &inferred_types);
 				if !validate_lowered_operation(node, contract, &lowered, &mut diagnostics) {
 					continue;
 				}
@@ -347,14 +350,27 @@ struct GraphPortType {
 	type_reference: Option<Type>,
 }
 
-fn analyze_data_types(document: &GraphDocument, diagnostics: &mut Diagnostics) {
+struct InferredDataConstraint {
+	edge: krunt_graph_model::EdgeId,
+	from_port: PortId,
+	to_port: PortId,
+	from_type: Type,
+	to_type: Type,
+	constraint: TypeConstraint,
+}
+
+fn infer_data_types(
+	document: &GraphDocument,
+	diagnostics: &mut Diagnostics,
+) -> BTreeMap<PortId, Type> {
 	let mut port_types = BTreeMap::new();
 	for node in document.nodes() {
 		for port in node.ports() {
 			let type_reference = port.type_reference().map(|reference| {
-				Type::from_reference(reference.as_str()).unwrap_or_else(|_| {
+				let parsed = Type::from_reference(reference.as_str()).unwrap_or_else(|_| {
 					unreachable!("validated graph type references cannot be empty")
-				})
+				});
+				replace_open_types(parsed, TypeVariable::new(port.id().as_u64()))
 			});
 			port_types.insert(
 				port.id(),
@@ -366,11 +382,14 @@ fn analyze_data_types(document: &GraphDocument, diagnostics: &mut Diagnostics) {
 		}
 	}
 
-	for edge in document
+	let mut data_edges: Vec<_> = document
 		.edges()
 		.iter()
 		.filter(|edge| edge.kind() == EdgeKind::DATA)
-	{
+		.collect();
+	data_edges.sort_by_key(|edge| edge.id());
+	let mut constraints = Vec::new();
+	for edge in data_edges {
 		let (Some(from), Some(to)) = (port_types.get(&edge.from()), port_types.get(&edge.to()))
 		else {
 			continue;
@@ -387,17 +406,137 @@ fn analyze_data_types(document: &GraphDocument, diagnostics: &mut Diagnostics) {
 			diagnostics.push(missing_type_reference_diagnostic(edge.to(), edge.id()));
 			continue;
 		};
+		constraints.push(InferredDataConstraint {
+			edge: edge.id(),
+			from_port: edge.from(),
+			to_port: edge.to(),
+			from_type: from_type.clone(),
+			to_type: to_type.clone(),
+			constraint: TypeConstraint::assignable(from_type.clone(), to_type.clone()),
+		});
+	}
 
-		if check_assignable(from_type, to_type).is_err() {
+	let mut accepted = Vec::new();
+	for candidate in constraints {
+		accepted.push(candidate);
+		if solve_constraints(accepted.iter().map(|item| item.constraint.clone())).is_err() {
+			let failed = accepted
+				.pop()
+				.expect("a failed constraint was just appended");
+			let substitution =
+				solve_constraints(accepted.iter().map(|item| item.constraint.clone()))
+					.unwrap_or_default();
+			let from_type = substitution.resolve(&failed.from_type);
+			let to_type = substitution.resolve(&failed.to_type);
 			diagnostics.push(type_mismatch_diagnostic(
-				edge.from(),
-				edge.to(),
-				edge.id(),
-				from_type,
-				to_type,
+				failed.from_port,
+				failed.to_port,
+				failed.edge,
+				&from_type,
+				&to_type,
 			));
 		}
 	}
+
+	let substitution =
+		solve_constraints(accepted.iter().map(|item| item.constraint.clone())).unwrap_or_default();
+	port_types
+		.into_iter()
+		.filter_map(|(port, graph_type)| {
+			graph_type
+				.type_reference
+				.map(|type_value| (port, materialize_inferred_type(&substitution, &type_value)))
+		})
+		.collect()
+}
+
+fn replace_open_types(type_value: Type, variable: TypeVariable) -> Type {
+	match type_value {
+		Type::ANY => Type::variable(variable),
+		Type::ARRAY(element) => Type::array(replace_open_types(*element, variable)),
+		Type::RECORD(fields) => Type::record(
+			fields
+				.into_iter()
+				.map(|(name, field)| {
+					(
+						name,
+						krunt_type_system::RecordField::new(
+							replace_open_types(field.type_value().clone(), variable),
+							field.required(),
+						),
+					)
+				})
+				.collect(),
+		),
+		other => other,
+	}
+}
+
+fn materialize_inferred_type(substitution: &TypeSubstitution, type_value: &Type) -> Type {
+	match substitution.resolve(type_value) {
+		Type::VARIABLE(_) => Type::ANY,
+		Type::ARRAY(element) => Type::array(materialize_inferred_type(substitution, &element)),
+		Type::RECORD(fields) => Type::record(
+			fields
+				.into_iter()
+				.map(|(name, field)| {
+					(
+						name,
+						krunt_type_system::RecordField::new(
+							materialize_inferred_type(substitution, field.type_value()),
+							field.required(),
+						),
+					)
+				})
+				.collect(),
+		),
+		resolved => resolved,
+	}
+}
+
+fn specialize_lowered_operation(
+	node: &Node,
+	lowered: LoweredOperation,
+	inferred_types: &BTreeMap<PortId, Type>,
+) -> LoweredOperation {
+	let data_inputs: Vec<_> = node
+		.ports()
+		.iter()
+		.filter(|port| port.direction() == PortDirection::INPUT && port.kind() == PortKind::DATA)
+		.collect();
+	let data_outputs: Vec<_> = node
+		.ports()
+		.iter()
+		.filter(|port| port.direction() == PortDirection::OUTPUT && port.kind() == PortKind::DATA)
+		.collect();
+	let input_types = specialize_type_ids(lowered.input_types(), &data_inputs, inferred_types);
+	let output_types = specialize_type_ids(lowered.output_types(), &data_outputs, inferred_types);
+	lowered
+		.with_input_types(input_types)
+		.with_output_types(output_types)
+}
+
+fn specialize_type_ids(
+	type_ids: &[TypeId],
+	ports: &[&krunt_graph_model::Port],
+	inferred_types: &BTreeMap<PortId, Type>,
+) -> Vec<TypeId> {
+	type_ids
+		.iter()
+		.enumerate()
+		.map(|(index, type_id)| {
+			if type_id.as_str() != "ANY" {
+				return type_id.clone();
+			}
+			let Some(port) = ports.get(index) else {
+				return type_id.clone();
+			};
+			let Some(type_value) = inferred_types.get(&port.id()) else {
+				return type_id.clone();
+			};
+			TypeId::new(type_value.to_reference()).expect("canonical type references are non-empty")
+		})
+		.collect()
 }
 
 fn resolve_capabilities(
@@ -1008,8 +1147,8 @@ fn type_mismatch_diagnostic(
 	from_type: &Type,
 	to_type: &Type,
 ) -> Diagnostic {
-	let from_name = from_type.as_name().unwrap_or("any");
-	let to_name = to_type.as_name().unwrap_or("any");
+	let from_name = from_type.to_reference();
+	let to_name = to_type.to_reference();
 	Diagnostic::new(
 		DiagnosticCode::new("TYPE.MISMATCH").unwrap(),
 		Severity::ERROR,
@@ -2095,6 +2234,42 @@ mod tests {
 			GraphElementId::PORT(PortId::new(22).unwrap())
 		);
 		assert_eq!(diagnostic.related().len(), 2);
+	}
+
+	#[test]
+	fn open_data_ports_are_inferred_from_connected_concrete_ports() {
+		let document = document_with_response_type(Some("ANY"));
+		let mut diagnostics = Diagnostics::new();
+		let inferred = infer_data_types(&document, &mut diagnostics);
+
+		assert!(diagnostics.is_empty());
+		assert_eq!(
+			inferred.get(&PortId::new(12).unwrap()),
+			Some(&Type::named("Request").unwrap())
+		);
+		assert_eq!(
+			inferred.get(&PortId::new(22).unwrap()),
+			Some(&Type::named("Request").unwrap())
+		);
+	}
+
+	#[test]
+	fn inferred_types_specialize_open_lowered_operation_slots() {
+		let document = document_with_response_type(Some("ANY"));
+		let mut diagnostics = Diagnostics::new();
+		let inferred = infer_data_types(&document, &mut diagnostics);
+		let response = &document.nodes()[1];
+		let lowered = LoweredOperation::new(
+			krunt_ir::OperationId::new("test.response").unwrap(),
+			[TypeId::new("ANY").unwrap()],
+			[],
+			AsyncKind::SYNC,
+			[],
+		);
+
+		let specialized = specialize_lowered_operation(response, lowered, &inferred);
+
+		assert_eq!(specialized.input_types()[0].as_str(), "Request");
 	}
 
 	#[test]
