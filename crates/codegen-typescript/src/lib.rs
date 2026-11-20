@@ -5,7 +5,7 @@
 //! filenames beyond its language module boundary, or render source text yet.
 //! Those concerns belong to the framework backend and source renderer layers.
 
-use krunt_ir::{AsyncKind, EffectId, GraphElementId, IRGraph, IROp, SourceMap};
+use krunt_ir::{AsyncKind, ConstantValue, EffectId, GraphElementId, IRGraph, IROp, SourceMap};
 use krunt_language_backend::LanguageBackend;
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
@@ -234,6 +234,7 @@ impl TypeScriptOperationId {
 #[allow(non_camel_case_types)]
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub enum TypeScriptOperationKind {
+	CONSTANT { value: TypeScriptConstantValue },
 	DECLARATION { name: String },
 	ENTRY { name: String },
 	OPERATION { name: String },
@@ -243,6 +244,16 @@ pub enum TypeScriptOperationKind {
 	LOOP,
 	SUBGRAPH { id: u64 },
 	RETURN,
+}
+
+/// A TypeScript rendering of a target-neutral compile-time value.
+#[allow(non_camel_case_types)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub enum TypeScriptConstantValue {
+	BOOLEAN(bool),
+	INTEGER(i64),
+	STRING(String),
+	NULL,
 }
 
 /// A TypeScript type identity produced from universal IR type identity.
@@ -732,7 +743,7 @@ fn render_module(module: &TypeScriptModule) -> String {
 		.iter()
 		.any(TypeScriptFunction::requires_runtime)
 	{
-		source.push_str(&runtime_interface());
+		source.push_str(runtime_interface());
 		source.push('\n');
 	}
 	if module
@@ -746,7 +757,7 @@ fn render_module(module: &TypeScriptModule) -> String {
 				.map(String::as_str)
 				== Some("ERROR")
 		}) {
-		source.push_str(&response_error_class());
+		source.push_str(response_error_class());
 		source.push('\n');
 	}
 
@@ -841,6 +852,9 @@ fn render_linear_function_body(
 	for operation in &function.operations {
 		render_operation_comments(source, operation, "  ");
 		match operation.kind() {
+			TypeScriptOperationKind::CONSTANT { value } => {
+				render_constant_assignment(source, operation, value, "  ", false);
+			}
 			TypeScriptOperationKind::DECLARATION { .. } => {}
 			TypeScriptOperationKind::ENTRY { name }
 			| TypeScriptOperationKind::OPERATION { name } => {
@@ -920,6 +934,11 @@ fn render_structured_function_body(
 		render_operation_comments(source, operation, "        ");
 
 		match operation.kind() {
+			TypeScriptOperationKind::CONSTANT { value } => {
+				render_constant_assignment(source, operation, value, "        ", true);
+				render_next_control(source, function, operation, 0, "        ");
+				source.push_str("        break;\n");
+			}
 			TypeScriptOperationKind::ENTRY { name }
 			| TypeScriptOperationKind::OPERATION { name } => {
 				if is_http_entry(operation) {
@@ -1278,6 +1297,32 @@ fn render_named_operation(
 	);
 }
 
+fn render_constant_assignment(
+	source: &mut String,
+	operation: &TypeScriptOperation,
+	value: &TypeScriptConstantValue,
+	indent: &str,
+	mutable_assignment: bool,
+) {
+	source.push_str(indent);
+	if !mutable_assignment {
+		source.push_str("const ");
+	}
+	source.push_str(&operation_variable(operation.id));
+	source.push_str(" = ");
+	source.push_str(&render_constant(value));
+	source.push_str(";\n");
+}
+
+fn render_constant(value: &TypeScriptConstantValue) -> String {
+	match value {
+		TypeScriptConstantValue::BOOLEAN(value) => value.to_string(),
+		TypeScriptConstantValue::INTEGER(value) => value.to_string(),
+		TypeScriptConstantValue::STRING(value) => string_literal(value),
+		TypeScriptConstantValue::NULL => "null".to_string(),
+	}
+}
+
 fn render_named_operation_with_assignment(
 	source: &mut String,
 	operation: &TypeScriptOperation,
@@ -1561,6 +1606,9 @@ fn operation_callee(id: TypeScriptOperationId, name: &str) -> String {
 
 fn render_operation_kind(kind: &TypeScriptOperationKind) -> String {
 	match kind {
+		TypeScriptOperationKind::CONSTANT { value } => {
+			format!("CONSTANT {}", render_constant(value))
+		}
 		TypeScriptOperationKind::DECLARATION { name } => format!("DECLARATION {name}"),
 		TypeScriptOperationKind::ENTRY { name } => format!("ENTRY {name}"),
 		TypeScriptOperationKind::OPERATION { name } => format!("OPERATION {name}"),
@@ -1657,6 +1705,9 @@ fn lower_operation(
 ) -> Result<TypeScriptOperation, TypeScriptLoweringError> {
 	let id = TypeScriptOperationId::new(node.id.0);
 	let kind = match &node.op {
+		IROp::CONSTANT { value } => TypeScriptOperationKind::CONSTANT {
+			value: lower_constant(value),
+		},
 		IROp::DECLARATION { name } => TypeScriptOperationKind::DECLARATION {
 			name: name.as_str().to_string(),
 		},
@@ -1696,6 +1747,15 @@ fn lower_operation(
 	})
 }
 
+fn lower_constant(value: &ConstantValue) -> TypeScriptConstantValue {
+	match value {
+		ConstantValue::BOOLEAN(value) => TypeScriptConstantValue::BOOLEAN(*value),
+		ConstantValue::INTEGER(value) => TypeScriptConstantValue::INTEGER(*value),
+		ConstantValue::STRING(value) => TypeScriptConstantValue::STRING(value.clone()),
+		ConstantValue::NULL => TypeScriptConstantValue::NULL,
+	}
+}
+
 fn lower_type(type_id: &krunt_ir::TypeId) -> TypeScriptType {
 	match type_id.as_str() {
 		"ANY" | "any" => TypeScriptType::ANY,
@@ -1709,8 +1769,8 @@ fn lower_type(type_id: &krunt_ir::TypeId) -> TypeScriptType {
 mod tests {
 	use super::*;
 	use krunt_ir::{
-		ControlEdge, DataEdge, GraphElementId, GraphNodeId, IRBuilder, IRNode, IROp, OperationId,
-		PortRef, TypeId,
+		ConstantValue, ControlEdge, DataEdge, GraphElementId, GraphNodeId, IRBuilder, IRNode, IROp,
+		OperationId, PortRef, TypeId,
 	};
 
 	fn graph() -> IRGraph {
@@ -2816,5 +2876,97 @@ mod tests {
 		));
 		assert!(source.contains("} catch (error) {"));
 		assert!(source.contains("// krunt:source=node:20"));
+	}
+
+	#[test]
+	fn lowers_and_renders_target_neutral_constants() {
+		let mut builder = IRBuilder::new();
+		builder
+			.add_node(IRNode {
+				id: krunt_ir::IrNodeId(1),
+				op: IROp::ENTRY {
+					name: OperationId::new("route").unwrap(),
+				},
+				input_types: Vec::new(),
+				output_types: Vec::new(),
+				async_kind: AsyncKind::SYNC,
+				effects: Vec::new(),
+				attributes: BTreeMap::new(),
+				returns: false,
+				source: SourceMap::node(GraphNodeId(10)),
+			})
+			.unwrap();
+		builder
+			.add_node(IRNode {
+				id: krunt_ir::IrNodeId(2),
+				op: IROp::CONSTANT {
+					value: ConstantValue::BOOLEAN(true),
+				},
+				input_types: Vec::new(),
+				output_types: vec![TypeId::new("Boolean").unwrap()],
+				async_kind: AsyncKind::SYNC,
+				effects: Vec::new(),
+				attributes: BTreeMap::new(),
+				returns: false,
+				source: SourceMap::node(GraphNodeId(20)),
+			})
+			.unwrap();
+		builder
+			.add_node(IRNode {
+				id: krunt_ir::IrNodeId(3),
+				op: IROp::OPERATION {
+					name: OperationId::new("consume").unwrap(),
+				},
+				input_types: vec![TypeId::new("Boolean").unwrap()],
+				output_types: Vec::new(),
+				async_kind: AsyncKind::SYNC,
+				effects: Vec::new(),
+				attributes: BTreeMap::new(),
+				returns: false,
+				source: SourceMap::node(GraphNodeId(30)),
+			})
+			.unwrap();
+		builder
+			.add_control_edge(ControlEdge {
+				from: PortRef {
+					node: krunt_ir::IrNodeId(1),
+					index: 0,
+				},
+				to: PortRef {
+					node: krunt_ir::IrNodeId(3),
+					index: 0,
+				},
+			})
+			.unwrap();
+		builder
+			.add_data_edge(DataEdge {
+				from: PortRef {
+					node: krunt_ir::IrNodeId(2),
+					index: 0,
+				},
+				to: PortRef {
+					node: krunt_ir::IrNodeId(3),
+					index: 0,
+				},
+			})
+			.unwrap();
+
+		let program = TypeScriptBackend::lower_graph(&builder.build().unwrap()).unwrap();
+		let operation = program.modules()[0].functions()[0]
+			.operations()
+			.iter()
+			.find(|operation| operation.id().as_u32() == 2)
+			.expect("constant should be lowered");
+		assert_eq!(
+			operation.kind(),
+			&TypeScriptOperationKind::CONSTANT {
+				value: TypeScriptConstantValue::BOOLEAN(true)
+			}
+		);
+		let source = TypeScriptSourceRenderer::render_program(&program)
+			.unwrap()
+			.remove("generated.ts")
+			.unwrap();
+		assert!(source.contains("const operation_2 = true;"));
 	}
 }

@@ -9,8 +9,9 @@ use krunt_diagnostics::{
 };
 use krunt_graph_model::{EdgeKind, GraphDocument, Node, NodeId, PortDirection, PortId, PortKind};
 use krunt_ir::{
-	eliminate_unreachable_nodes, BuildError, ControlEdge, DataEdge, GraphNodeId, GraphSubgraphId,
-	IRBuilder, IRGraph, IRNode, IROp, IRSubgraph, IRSubgraphBoundary, PortRef, SourceMap, TypeId,
+	eliminate_unreachable_nodes, fold_constant_control_flow, BuildError, ControlEdge, DataEdge,
+	GraphNodeId, GraphSubgraphId, IRBuilder, IRGraph, IRNode, IROp, IRSubgraph, IRSubgraphBoundary,
+	PortRef, SourceMap, TypeId,
 };
 use krunt_plugin_api::{
 	CapabilityId, LoweredOperation, LoweredOperationKind, NodeContract, PluginRegistry,
@@ -165,8 +166,8 @@ pub fn compile(document: &GraphDocument, plugins: &PluginRegistry) -> Compilatio
 		None
 	} else {
 		match builder.build() {
-			Ok(ir) => match eliminate_unreachable_nodes(ir) {
-				Ok((ir, _report)) => Some(ir),
+			Ok(ir) => match optimize_ir(ir) {
+				Ok(ir) => Some(ir),
 				Err(error) => {
 					diagnostics.push(optimization_diagnostic(
 						GraphElementId::GRAPH(
@@ -195,6 +196,12 @@ pub fn compile(document: &GraphDocument, plugins: &PluginRegistry) -> Compilatio
 
 	diagnostics.sort_canonical();
 	CompilationResult { ir, diagnostics }
+}
+
+fn optimize_ir(ir: IRGraph) -> Result<IRGraph, BuildError> {
+	let (ir, _constant_fold_report) = fold_constant_control_flow(ir)?;
+	let (ir, _reachability_report) = eliminate_unreachable_nodes(ir)?;
+	Ok(ir)
 }
 
 fn validate_node_contract(node: &Node, contract: &NodeContract, diagnostics: &mut Diagnostics) {

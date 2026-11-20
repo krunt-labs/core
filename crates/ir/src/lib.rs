@@ -109,6 +109,34 @@ pub enum AsyncKind {
 	ASYNC,
 }
 
+/// A target-neutral compile-time value.
+#[allow(non_camel_case_types)]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+pub enum ConstantValue {
+	BOOLEAN(bool),
+	INTEGER(i64),
+	STRING(String),
+	NULL,
+}
+
+impl ConstantValue {
+	pub fn type_reference(&self) -> &'static str {
+		match self {
+			Self::BOOLEAN(_) => "Boolean",
+			Self::INTEGER(_) => "Integer",
+			Self::STRING(_) => "String",
+			Self::NULL => "Null",
+		}
+	}
+
+	pub fn as_boolean(&self) -> Option<bool> {
+		match self {
+			Self::BOOLEAN(value) => Some(*value),
+			_ => None,
+		}
+	}
+}
+
 /// A resolved observable effect of an operation.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct EffectId(String);
@@ -127,6 +155,7 @@ impl EffectId {
 #[allow(non_camel_case_types)]
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub enum IROp {
+	CONSTANT { value: ConstantValue },
 	DECLARATION { name: OperationId },
 	ENTRY { name: OperationId },
 	OPERATION { name: OperationId },
@@ -249,8 +278,10 @@ impl IRGraph {
 }
 
 /// Errors raised while constructing an IR graph.
+#[allow(non_camel_case_types)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum BuildError {
+	INVALID_CONSTANT_NODE(IrNodeId),
 	DuplicateNode(IrNodeId),
 	DuplicateSubgraph(GraphSubgraphId),
 	MissingNode(IrNodeId),
@@ -333,6 +364,19 @@ impl IRBuilder {
 	}
 
 	pub fn build(mut self) -> Result<IRGraph, BuildError> {
+		for node in self.nodes.values() {
+			if let IROp::CONSTANT { value } = &node.op {
+				let valid_shape = node.input_types.is_empty()
+					&& node.output_types.len() == 1
+					&& node.output_types[0].as_str() == value.type_reference()
+					&& node.async_kind == AsyncKind::SYNC
+					&& node.effects.is_empty()
+					&& !node.returns;
+				if !valid_shape {
+					return Err(BuildError::INVALID_CONSTANT_NODE(node.id));
+				}
+			}
+		}
 		for subgraph in self.subgraphs.values() {
 			for node in &subgraph.nodes {
 				if !self.nodes.contains_key(node) {
@@ -389,6 +433,139 @@ impl IRBuilder {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct OptimizationReport {
 	removed_nodes: Vec<IrNodeId>,
+}
+
+/// Report from deterministic constant-control-flow folding.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ConstantFoldReport {
+	folded_nodes: Vec<IrNodeId>,
+}
+
+impl ConstantFoldReport {
+	pub fn folded_nodes(&self) -> &[IrNodeId] {
+		&self.folded_nodes
+	}
+}
+
+/// Fold branch and loop control flow whose boolean condition is a constant.
+///
+/// The pass only rewrites explicit `CONSTANT(Boolean)` data producers. It does
+/// not infer purity from arbitrary operation attributes, and it skips control
+/// nodes inside subgraphs until boundary-aware folding is implemented. The
+/// returned graph remains validated and deterministic; callers may run
+/// `eliminate_unreachable_nodes` afterward to remove unused constants and dead
+/// branches.
+pub fn fold_constant_control_flow(
+	mut graph: IRGraph,
+) -> Result<(IRGraph, ConstantFoldReport), BuildError> {
+	let mut folded_nodes = Vec::new();
+
+	while let Some((control_node, constant_node, condition)) = find_foldable_control_node(&graph) {
+		let selected_index = if condition { 0 } else { 1 };
+		let selected_targets: Vec<_> = graph
+			.control_edges
+			.iter()
+			.filter(|edge| edge.from.node == control_node && edge.from.index == selected_index)
+			.map(|edge| edge.to)
+			.collect();
+		if selected_targets
+			.iter()
+			.any(|target| target.node == control_node)
+		{
+			break;
+		}
+
+		let incoming_edges: Vec<_> = graph
+			.control_edges
+			.iter()
+			.filter(|edge| edge.to.node == control_node)
+			.map(|edge| edge.from)
+			.collect();
+		let folded_source = graph
+			.node(control_node)
+			.expect("foldable control node exists")
+			.source
+			.primary;
+		let constant_source = graph
+			.node(constant_node)
+			.expect("foldable constant node exists")
+			.source
+			.primary;
+
+		let mut builder = IRBuilder::new();
+		for node in &graph.nodes {
+			if node.id == control_node {
+				continue;
+			}
+			let mut node = node.clone();
+			if selected_targets.iter().any(|target| target.node == node.id) {
+				node.source = node
+					.source
+					.clone()
+					.with_related([folded_source, constant_source]);
+			}
+			builder.add_node(node)?;
+		}
+
+		for edge in &graph.control_edges {
+			if edge.from.node == control_node || edge.to.node == control_node {
+				continue;
+			}
+			builder.add_control_edge(*edge)?;
+		}
+		for incoming in incoming_edges {
+			for target in &selected_targets {
+				builder.add_control_edge(ControlEdge {
+					from: incoming,
+					to: *target,
+				})?;
+			}
+		}
+		for edge in &graph.data_edges {
+			if edge.from.node != control_node && edge.to.node != control_node {
+				builder.add_data_edge(*edge)?;
+			}
+		}
+		for subgraph in &graph.subgraphs {
+			builder.add_subgraph(subgraph.clone())?;
+		}
+
+		graph = builder.build()?;
+		folded_nodes.push(control_node);
+	}
+
+	Ok((graph, ConstantFoldReport { folded_nodes }))
+}
+
+fn find_foldable_control_node(graph: &IRGraph) -> Option<(IrNodeId, IrNodeId, bool)> {
+	let subgraph_nodes: BTreeMap<_, _> = graph
+		.subgraphs
+		.iter()
+		.flat_map(|subgraph| subgraph.nodes.iter().copied().map(|node| (node, ())))
+		.collect();
+	for node in &graph.nodes {
+		if subgraph_nodes.contains_key(&node.id) || !matches!(node.op, IROp::BRANCH | IROp::LOOP) {
+			continue;
+		}
+		let Some(edge) = graph
+			.data_edges
+			.iter()
+			.find(|edge| edge.to.node == node.id && edge.to.index == 0)
+		else {
+			continue;
+		};
+		let Some(constant) = graph.node(edge.from.node) else {
+			continue;
+		};
+		let IROp::CONSTANT { value } = &constant.op else {
+			continue;
+		};
+		let Some(condition) = value.as_boolean() else {
+			continue;
+		};
+		return Some((node.id, constant.id, condition));
+	}
+	None
 }
 
 impl OptimizationReport {
@@ -518,6 +695,22 @@ mod tests {
 			name: OperationId::new(name).unwrap(),
 		};
 		node
+	}
+
+	fn constant_operation(value: ConstantValue, id: u32, source: u64) -> IRNode {
+		IRNode {
+			id: IrNodeId(id),
+			op: IROp::CONSTANT {
+				value: value.clone(),
+			},
+			input_types: Vec::new(),
+			output_types: vec![TypeId::new(value.type_reference()).unwrap()],
+			async_kind: AsyncKind::SYNC,
+			effects: Vec::new(),
+			attributes: BTreeMap::new(),
+			returns: false,
+			source: SourceMap::node(GraphNodeId(source)),
+		}
 	}
 
 	#[test]
@@ -810,6 +1003,206 @@ mod tests {
 		assert_eq!(
 			optimized.node(IrNodeId(2)).unwrap().source.primary,
 			GraphElementId::NODE(GraphNodeId(20))
+		);
+	}
+
+	#[test]
+	fn folds_a_constant_true_branch_and_preserves_traceability() {
+		let mut builder = IRBuilder::new();
+		builder.add_node(entry_operation("route", 1, 10)).unwrap();
+		builder
+			.add_node(constant_operation(ConstantValue::BOOLEAN(true), 2, 20))
+			.unwrap();
+		builder
+			.add_node(IRNode {
+				id: IrNodeId(3),
+				op: IROp::BRANCH,
+				input_types: vec![TypeId::new("Boolean").unwrap()],
+				output_types: Vec::new(),
+				async_kind: AsyncKind::SYNC,
+				effects: Vec::new(),
+				attributes: BTreeMap::new(),
+				returns: false,
+				source: SourceMap::node(GraphNodeId(30)),
+			})
+			.unwrap();
+		builder
+			.add_node(operation("live", 4, 40, &[], &[]))
+			.unwrap();
+		builder
+			.add_node(operation("dead", 5, 50, &[], &[]))
+			.unwrap();
+		builder
+			.add_control_edge(ControlEdge {
+				from: PortRef {
+					node: IrNodeId(1),
+					index: 0,
+				},
+				to: PortRef {
+					node: IrNodeId(3),
+					index: 0,
+				},
+			})
+			.unwrap();
+		builder
+			.add_control_edge(ControlEdge {
+				from: PortRef {
+					node: IrNodeId(3),
+					index: 0,
+				},
+				to: PortRef {
+					node: IrNodeId(4),
+					index: 0,
+				},
+			})
+			.unwrap();
+		builder
+			.add_control_edge(ControlEdge {
+				from: PortRef {
+					node: IrNodeId(3),
+					index: 1,
+				},
+				to: PortRef {
+					node: IrNodeId(5),
+					index: 0,
+				},
+			})
+			.unwrap();
+		builder
+			.add_data_edge(DataEdge {
+				from: PortRef {
+					node: IrNodeId(2),
+					index: 0,
+				},
+				to: PortRef {
+					node: IrNodeId(3),
+					index: 0,
+				},
+			})
+			.unwrap();
+
+		let (folded, report) = fold_constant_control_flow(builder.build().unwrap()).unwrap();
+		assert_eq!(report.folded_nodes(), &[IrNodeId(3)]);
+		assert!(folded.node(IrNodeId(3)).is_none());
+		assert_eq!(folded.control_edges().len(), 1);
+		assert_eq!(folded.control_edges()[0].to.node, IrNodeId(4));
+		assert!(folded.data_edges().is_empty());
+		assert_eq!(
+			folded.node(IrNodeId(4)).unwrap().source.related,
+			vec![
+				GraphElementId::NODE(GraphNodeId(20)),
+				GraphElementId::NODE(GraphNodeId(30)),
+			]
+		);
+
+		let (optimized, reachability) = eliminate_unreachable_nodes(folded).unwrap();
+		assert_eq!(reachability.removed_nodes(), &[IrNodeId(2), IrNodeId(5)]);
+		assert_eq!(optimized.nodes().len(), 2);
+	}
+
+	#[test]
+	fn folds_a_constant_false_loop_to_its_done_edge() {
+		let mut builder = IRBuilder::new();
+		builder.add_node(entry_operation("route", 1, 10)).unwrap();
+		builder
+			.add_node(constant_operation(ConstantValue::BOOLEAN(false), 2, 20))
+			.unwrap();
+		builder
+			.add_node(IRNode {
+				id: IrNodeId(3),
+				op: IROp::LOOP,
+				input_types: vec![TypeId::new("Boolean").unwrap()],
+				output_types: Vec::new(),
+				async_kind: AsyncKind::SYNC,
+				effects: Vec::new(),
+				attributes: BTreeMap::new(),
+				returns: false,
+				source: SourceMap::node(GraphNodeId(30)),
+			})
+			.unwrap();
+		builder
+			.add_node(operation("body", 4, 40, &[], &[]))
+			.unwrap();
+		builder
+			.add_node(operation("done", 5, 50, &[], &[]))
+			.unwrap();
+		builder
+			.add_control_edge(ControlEdge {
+				from: PortRef {
+					node: IrNodeId(1),
+					index: 0,
+				},
+				to: PortRef {
+					node: IrNodeId(3),
+					index: 0,
+				},
+			})
+			.unwrap();
+		builder
+			.add_control_edge(ControlEdge {
+				from: PortRef {
+					node: IrNodeId(3),
+					index: 0,
+				},
+				to: PortRef {
+					node: IrNodeId(4),
+					index: 0,
+				},
+			})
+			.unwrap();
+		builder
+			.add_control_edge(ControlEdge {
+				from: PortRef {
+					node: IrNodeId(3),
+					index: 1,
+				},
+				to: PortRef {
+					node: IrNodeId(5),
+					index: 0,
+				},
+			})
+			.unwrap();
+		builder
+			.add_data_edge(DataEdge {
+				from: PortRef {
+					node: IrNodeId(2),
+					index: 0,
+				},
+				to: PortRef {
+					node: IrNodeId(3),
+					index: 0,
+				},
+			})
+			.unwrap();
+
+		let (folded, report) = fold_constant_control_flow(builder.build().unwrap()).unwrap();
+		assert_eq!(report.folded_nodes(), &[IrNodeId(3)]);
+		assert_eq!(folded.control_edges().len(), 1);
+		assert_eq!(folded.control_edges()[0].to.node, IrNodeId(5));
+	}
+
+	#[test]
+	fn rejects_malformed_constant_nodes() {
+		let mut builder = IRBuilder::new();
+		builder
+			.add_node(IRNode {
+				id: IrNodeId(1),
+				op: IROp::CONSTANT {
+					value: ConstantValue::BOOLEAN(true),
+				},
+				input_types: Vec::new(),
+				output_types: vec![TypeId::new("String").unwrap()],
+				async_kind: AsyncKind::SYNC,
+				effects: Vec::new(),
+				attributes: BTreeMap::new(),
+				returns: false,
+				source: SourceMap::node(GraphNodeId(10)),
+			})
+			.unwrap();
+
+		assert_eq!(
+			builder.build(),
+			Err(BuildError::INVALID_CONSTANT_NODE(IrNodeId(1)))
 		);
 	}
 
