@@ -1444,11 +1444,14 @@ fn runtime_invocation(
 	}
 
 	match attributes.get("backend.effect.kind").map(String::as_str) {
-		Some("HTTP_REQUEST") => Some(format!(
-			"runtime.httpRequest({}, {}, {})",
-			string_literal(attributes.get("backend.http_request.method")?),
-			string_literal(attributes.get("backend.http_request.url")?),
-			input(0),
+		Some("HTTP_REQUEST") => Some(runtime_result_assertion(
+			operation,
+			format!(
+				"runtime.httpRequest({}, {}, {})",
+				string_literal(attributes.get("backend.http_request.method")?),
+				string_literal(attributes.get("backend.http_request.url")?),
+				input(0),
+			),
 		)),
 		Some("LOGGING") => Some(format!(
 			"runtime.log({}, {})",
@@ -1459,19 +1462,33 @@ fn runtime_invocation(
 			.get("backend.storage.operation")
 			.map(String::as_str)
 		{
-			Some("READ") => Some(format!(
-				"runtime.storageRead({})",
-				string_literal(attributes.get("backend.storage.key")?),
+			Some("READ") => Some(runtime_result_assertion(
+				operation,
+				format!(
+					"runtime.storageRead({})",
+					string_literal(attributes.get("backend.storage.key")?),
+				),
 			)),
-			Some("WRITE") => Some(format!(
-				"runtime.storageWrite({}, {})",
-				string_literal(attributes.get("backend.storage.key")?),
-				input(0),
+			Some("WRITE") => Some(runtime_result_assertion(
+				operation,
+				format!(
+					"runtime.storageWrite({}, {})",
+					string_literal(attributes.get("backend.storage.key")?),
+					input(0),
+				),
 			)),
 			_ => None,
 		},
 		_ => None,
 	}
+}
+
+fn runtime_result_assertion(operation: &TypeScriptOperation, invocation: String) -> String {
+	let output_type = render_operation_output_type(operation);
+	if operation.output_types().is_empty() || output_type == "unknown" {
+		return invocation;
+	}
+	format!("{invocation} as {output_type}")
 }
 
 fn render_type_annotation(type_value: Option<&TypeScriptType>) -> String {

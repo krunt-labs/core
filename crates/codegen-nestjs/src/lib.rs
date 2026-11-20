@@ -1764,11 +1764,12 @@ fn tsconfig_build() -> String {
 mod tests {
 	use super::*;
 	use krunt_backend_dsl::{
-		BackendDslPlugin, ENTITY_NODE_TYPE, ERROR_RESPONSE_NODE_TYPE, HTTP_REQUEST_METHOD_PROPERTY,
-		HTTP_REQUEST_NODE_TYPE, HTTP_REQUEST_TYPE, HTTP_REQUEST_URL_PROPERTY, HTTP_ROUTE_NODE_TYPE,
-		LOGGING_LEVEL_PROPERTY, LOGGING_NODE_TYPE, MUTATION_NODE_TYPE, QUERY_NODE_TYPE,
-		REPOSITORY_NODE_TYPE, STORAGE_KEY_PROPERTY, STORAGE_NODE_TYPE, STORAGE_OPERATION_PROPERTY,
-		SUBGRAPH_NODE_TYPE, SUCCESS_RESPONSE_NODE_TYPE, TRANSFORM_NODE_TYPE, TRY_CATCH_NODE_TYPE,
+		BackendDslPlugin, BRANCH_NODE_TYPE, ENTITY_NODE_TYPE, ERROR_RESPONSE_NODE_TYPE,
+		HTTP_REQUEST_METHOD_PROPERTY, HTTP_REQUEST_NODE_TYPE, HTTP_REQUEST_TYPE,
+		HTTP_REQUEST_URL_PROPERTY, HTTP_ROUTE_NODE_TYPE, LOGGING_LEVEL_PROPERTY, LOGGING_NODE_TYPE,
+		LOOP_NODE_TYPE, MERGE_NODE_TYPE, MUTATION_NODE_TYPE, QUERY_NODE_TYPE, REPOSITORY_NODE_TYPE,
+		STORAGE_KEY_PROPERTY, STORAGE_NODE_TYPE, STORAGE_OPERATION_PROPERTY, SUBGRAPH_NODE_TYPE,
+		SUCCESS_RESPONSE_NODE_TYPE, TRANSFORM_NODE_TYPE, TRY_CATCH_NODE_TYPE,
 		VALIDATION_ERROR_NODE_TYPE,
 	};
 	use krunt_codegen_typescript::TypeScriptBackend;
@@ -1817,6 +1818,186 @@ mod tests {
 
 	fn runtime_error_program() -> TypeScriptProgram {
 		runtime_program_with_response("ERROR", "503")
+	}
+
+	fn execution_port(id: u64, direction: PortDirection) -> Port {
+		Port::new(PortId::new(id).unwrap(), direction, PortKind::EXECUTION)
+	}
+
+	fn data_port(id: u64, direction: PortDirection, type_name: &str) -> Port {
+		Port::new(PortId::new(id).unwrap(), direction, PortKind::DATA)
+			.with_type_reference(TypeReference::new(type_name).unwrap())
+	}
+
+	fn lower_backend_document(document: krunt_graph_model::GraphDocument) -> TypeScriptProgram {
+		let mut registry = PluginRegistry::new();
+		BackendDslPlugin::register(&mut registry).unwrap();
+		let result = krunt_compiler::compile(&document, &registry);
+		assert!(
+			!result.has_errors(),
+			"compiler diagnostics: {:?}",
+			result.diagnostics()
+		);
+		TypeScriptBackend::lower_graph(result.ir().expect("valid graph should lower")).unwrap()
+	}
+
+	fn logging_node(node_id: u64, input: u64, message: u64, output: u64) -> Node {
+		let mut node = Node::new(
+			NodeId::new(node_id).unwrap(),
+			NodeTypeId::new(LOGGING_NODE_TYPE).unwrap(),
+		)
+		.with_property(LOGGING_LEVEL_PROPERTY, Value::String("INFO".to_string()))
+		.unwrap();
+		for port in [
+			execution_port(input, PortDirection::INPUT),
+			data_port(message, PortDirection::INPUT, "ANY"),
+			execution_port(output, PortDirection::OUTPUT),
+		] {
+			node.add_port(port).unwrap();
+		}
+		node
+	}
+
+	fn backend_dsl_structured_control_program() -> TypeScriptProgram {
+		let metadata =
+			GraphMetadata::new(GraphId::new(8).unwrap(), "backend-v1", "krunt-test").unwrap();
+		let mut route = Node::new(
+			NodeId::new(1).unwrap(),
+			NodeTypeId::new(HTTP_ROUTE_NODE_TYPE).unwrap(),
+		)
+		.with_property("method", Value::String("GET".to_string()))
+		.unwrap()
+		.with_property("path", Value::String("/control".to_string()))
+		.unwrap();
+		route
+			.add_port(execution_port(11, PortDirection::OUTPUT))
+			.unwrap();
+		route
+			.add_port(data_port(12, PortDirection::OUTPUT, HTTP_REQUEST_TYPE))
+			.unwrap();
+
+		let mut http_request = Node::new(
+			NodeId::new(2).unwrap(),
+			NodeTypeId::new(HTTP_REQUEST_NODE_TYPE).unwrap(),
+		)
+		.with_property(
+			HTTP_REQUEST_METHOD_PROPERTY,
+			Value::String("GET".to_string()),
+		)
+		.unwrap()
+		.with_property(
+			HTTP_REQUEST_URL_PROPERTY,
+			Value::String("https://example.test/control".to_string()),
+		)
+		.unwrap();
+		for port in [
+			execution_port(21, PortDirection::INPUT),
+			data_port(22, PortDirection::INPUT, "ANY"),
+			execution_port(23, PortDirection::OUTPUT),
+			data_port(24, PortDirection::OUTPUT, "ANY"),
+		] {
+			http_request.add_port(port).unwrap();
+		}
+
+		let mut branch = Node::new(
+			NodeId::new(3).unwrap(),
+			NodeTypeId::new(BRANCH_NODE_TYPE).unwrap(),
+		);
+		for port in [
+			execution_port(31, PortDirection::INPUT),
+			data_port(32, PortDirection::INPUT, "Boolean"),
+			execution_port(33, PortDirection::OUTPUT),
+			execution_port(34, PortDirection::OUTPUT),
+		] {
+			branch.add_port(port).unwrap();
+		}
+
+		let mut merge = Node::new(
+			NodeId::new(6).unwrap(),
+			NodeTypeId::new(MERGE_NODE_TYPE).unwrap(),
+		);
+		for port in [
+			execution_port(61, PortDirection::INPUT),
+			execution_port(62, PortDirection::INPUT),
+			execution_port(63, PortDirection::OUTPUT),
+		] {
+			merge.add_port(port).unwrap();
+		}
+
+		let mut loop_node = Node::new(
+			NodeId::new(7).unwrap(),
+			NodeTypeId::new(LOOP_NODE_TYPE).unwrap(),
+		);
+		for port in [
+			execution_port(71, PortDirection::INPUT),
+			execution_port(72, PortDirection::INPUT),
+			data_port(73, PortDirection::INPUT, "Boolean"),
+			execution_port(74, PortDirection::OUTPUT),
+			execution_port(75, PortDirection::OUTPUT),
+		] {
+			loop_node.add_port(port).unwrap();
+		}
+
+		let mut response = Node::new(
+			NodeId::new(9).unwrap(),
+			NodeTypeId::new(SUCCESS_RESPONSE_NODE_TYPE).unwrap(),
+		)
+		.with_property("status_code", Value::Number(serde_json::Number::from(200)))
+		.unwrap();
+		response
+			.add_port(execution_port(91, PortDirection::INPUT))
+			.unwrap();
+		response
+			.add_port(data_port(92, PortDirection::INPUT, "ANY"))
+			.unwrap();
+
+		let mut builder = GraphBuilder::new(metadata);
+		for node in [
+			route,
+			http_request,
+			branch,
+			logging_node(4, 41, 42, 43),
+			logging_node(5, 51, 52, 53),
+			merge,
+			loop_node,
+			logging_node(8, 81, 82, 83),
+			response,
+		] {
+			builder.add_node(node).unwrap();
+		}
+		for (id, from, to) in [
+			(101, 11, 21),
+			(102, 23, 31),
+			(103, 33, 41),
+			(104, 34, 51),
+			(105, 43, 61),
+			(106, 53, 62),
+			(107, 63, 71),
+			(108, 74, 81),
+			(109, 83, 72),
+			(110, 75, 91),
+		] {
+			builder
+				.add_edge(Edge::new(
+					EdgeId::new(id).unwrap(),
+					PortId::new(from).unwrap(),
+					PortId::new(to).unwrap(),
+					EdgeKind::EXECUTION,
+				))
+				.unwrap();
+		}
+		for (id, to) in [(111, 32), (112, 42), (113, 52), (114, 73), (115, 82)] {
+			builder
+				.add_edge(Edge::new(
+					EdgeId::new(id).unwrap(),
+					PortId::new(24).unwrap(),
+					PortId::new(to).unwrap(),
+					EdgeKind::DATA,
+				))
+				.unwrap();
+		}
+
+		lower_backend_document(builder.build().unwrap())
 	}
 
 	fn backend_dsl_effect_program() -> TypeScriptProgram {
@@ -3534,6 +3715,47 @@ void main().catch((error: unknown) => {
 });
 "#;
 
+	const STRUCTURED_CONTROL_RUNTIME_SMOKE_SOURCE: &str = r#"import { execute_1 } from './src/generated';
+import { KruntRuntimeService } from './src/krunt-runtime';
+
+async function main(): Promise<void> {
+  globalThis.fetch = (async () => ({
+    text: async () => JSON.stringify(false),
+  })) as unknown as typeof fetch;
+  const messages: unknown[] = [];
+  const runtime = new KruntRuntimeService();
+  runtime.log = (_level: string, message: unknown): void => {
+    messages.push(message);
+  };
+  await execute_1(undefined, runtime);
+  if (messages.length !== 1 || messages[0] !== false) {
+    throw new Error('expected the false branch to run once and the loop to exit');
+  }
+
+  let bodyCalls = 0;
+  runtime.httpRequest = async (): Promise<unknown> => true;
+  runtime.log = (): void => {
+    bodyCalls += 1;
+    if (bodyCalls === 2) {
+      throw new Error('loop body reached');
+    }
+  };
+  try {
+    await execute_1(undefined, runtime);
+    throw new Error('expected the generated loop body to execute');
+  } catch (error) {
+    if (!(error instanceof Error) || error.message !== 'loop body reached') {
+      throw error;
+    }
+  }
+}
+
+void main().catch((error: unknown) => {
+  console.error(error);
+  throw error;
+});
+"#;
+
 	const SUBGRAPH_RUNTIME_SMOKE_SOURCE: &str = r#"import { execute_1 } from './src/generated';
 import { KruntRuntimeService } from './src/krunt-runtime';
 import { UserRepositoryRepository } from './src/repositories/UserRepositoryRepository.repository';
@@ -3926,6 +4148,34 @@ void main().catch((error: unknown) => {
 			&first,
 			"backend-dsl-effects",
 			EFFECTS_RUNTIME_SMOKE_SOURCE,
+		);
+	}
+
+	#[test]
+	fn lowers_backend_dsl_structured_control_into_a_smokable_nestjs_project() {
+		let program = backend_dsl_structured_control_program();
+		let first = NestJsBackend::generate_project(&program).unwrap();
+		let second = NestJsBackend::generate_project(&program).unwrap();
+
+		assert_eq!(first, second);
+		let generated = first.file("src/generated.ts").unwrap();
+		assert!(generated.contains("case 3: {"));
+		assert!(generated.contains("control = operation_2 ? 4 : 5;"));
+		assert!(generated.contains("case 6: {"));
+		assert!(generated.contains("case 7: {"));
+		assert!(generated.contains("control = operation_2 ? 8 : 9;"));
+		assert!(generated.contains("control = 7;"));
+		assert!(generated.contains("// krunt:source=node:3"));
+		assert!(generated.contains("// krunt:source=node:7"));
+		assert!(generated.contains("// krunt:source=node:8"));
+
+		let controller = first.file("src/app.controller.ts").unwrap();
+		assert!(controller.contains("return execute_1(request, this.runtime);"));
+		assert_generated_project_typechecks(&first, "backend-dsl-structured-control");
+		assert_generated_project_runtime_smokes_with_source(
+			&first,
+			"backend-dsl-structured-control",
+			STRUCTURED_CONTROL_RUNTIME_SMOKE_SOURCE,
 		);
 	}
 
