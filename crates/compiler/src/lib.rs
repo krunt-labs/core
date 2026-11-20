@@ -555,6 +555,30 @@ fn replace_open_types(type_value: Type, variable: TypeVariable) -> Type {
 	match type_value {
 		Type::ANY => Type::variable(variable),
 		Type::ARRAY(element) => Type::array(replace_open_types(*element, variable)),
+		Type::SET(element) => Type::set(replace_open_types(*element, variable)),
+		Type::MAP(key, value) => Type::map(
+			replace_open_types(*key, variable),
+			replace_open_types(*value, variable),
+		),
+		Type::OPTION(value) => Type::option(replace_open_types(*value, variable)),
+		Type::RESULT(value, error) => Type::result(
+			replace_open_types(*value, variable),
+			replace_open_types(*error, variable),
+		),
+		Type::FUTURE(value) => Type::future(replace_open_types(*value, variable)),
+		Type::STREAM(value) => Type::stream(replace_open_types(*value, variable)),
+		Type::UNION(members) => Type::union(
+			members
+				.into_iter()
+				.map(|member| replace_open_types(member, variable)),
+		)
+		.expect("a validated union cannot be empty"),
+		Type::INTERSECTION(members) => Type::intersection(
+			members
+				.into_iter()
+				.map(|member| replace_open_types(member, variable)),
+		)
+		.expect("a validated intersection cannot be empty"),
 		Type::RECORD(fields) => Type::record(
 			fields
 				.into_iter()
@@ -577,6 +601,30 @@ fn materialize_inferred_type(substitution: &TypeSubstitution, type_value: &Type)
 	match substitution.resolve(type_value) {
 		Type::VARIABLE(_) => Type::ANY,
 		Type::ARRAY(element) => Type::array(materialize_inferred_type(substitution, &element)),
+		Type::SET(element) => Type::set(materialize_inferred_type(substitution, &element)),
+		Type::MAP(key, value) => Type::map(
+			materialize_inferred_type(substitution, &key),
+			materialize_inferred_type(substitution, &value),
+		),
+		Type::OPTION(value) => Type::option(materialize_inferred_type(substitution, &value)),
+		Type::RESULT(value, error) => Type::result(
+			materialize_inferred_type(substitution, &value),
+			materialize_inferred_type(substitution, &error),
+		),
+		Type::FUTURE(value) => Type::future(materialize_inferred_type(substitution, &value)),
+		Type::STREAM(value) => Type::stream(materialize_inferred_type(substitution, &value)),
+		Type::UNION(members) => Type::union(
+			members
+				.into_iter()
+				.map(|member| materialize_inferred_type(substitution, &member)),
+		)
+		.expect("a resolved union cannot be empty"),
+		Type::INTERSECTION(members) => Type::intersection(
+			members
+				.into_iter()
+				.map(|member| materialize_inferred_type(substitution, &member)),
+		)
+		.expect("a resolved intersection cannot be empty"),
 		Type::RECORD(fields) => Type::record(
 			fields
 				.into_iter()

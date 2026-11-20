@@ -56,6 +56,14 @@ pub enum Type {
 	VOID,
 	ARRAY(Box<Type>),
 	RECORD(BTreeMap<String, RecordField>),
+	SET(Box<Type>),
+	MAP(Box<Type>, Box<Type>),
+	OPTION(Box<Type>),
+	RESULT(Box<Type>, Box<Type>),
+	FUTURE(Box<Type>),
+	STREAM(Box<Type>),
+	UNION(Vec<Type>),
+	INTERSECTION(Vec<Type>),
 	NAMED(TypeName),
 	VARIABLE(TypeVariable),
 	ANY,
@@ -98,30 +106,7 @@ impl Type {
 	/// type used by nodes whose payload is supplied by the graph.
 	pub fn from_reference(value: impl Into<String>) -> Result<Self, TypeError> {
 		let value = value.into();
-		if let Some(open) = value.find('<') {
-			if !value[..open].eq_ignore_ascii_case("Array") {
-				return Self::named(value);
-			}
-			let inner = &value[open + 1..];
-			let Some(inner) = inner.strip_suffix('>') else {
-				return Err(TypeError::INVALID_REFERENCE);
-			};
-			if inner.trim().is_empty() {
-				return Err(TypeError::INVALID_REFERENCE);
-			}
-			return Ok(Self::ARRAY(Box::new(Self::from_reference(inner.trim())?)));
-		}
-		match value.to_ascii_lowercase().as_str() {
-			"string" => Ok(Self::STRING),
-			"boolean" => Ok(Self::BOOLEAN),
-			"integer" => Ok(Self::INTEGER),
-			"float" => Ok(Self::FLOAT),
-			"number" => Ok(Self::NUMBER),
-			"null" => Ok(Self::NULL),
-			"void" => Ok(Self::VOID),
-			"any" => Ok(Self::ANY),
-			_ => Self::named(value),
-		}
+		parse_reference(&value)
 	}
 
 	pub fn array(element: Type) -> Self {
@@ -130,6 +115,38 @@ impl Type {
 
 	pub fn record(fields: BTreeMap<String, RecordField>) -> Self {
 		Self::RECORD(fields)
+	}
+
+	pub fn set(element: Type) -> Self {
+		Self::SET(Box::new(element))
+	}
+
+	pub fn map(key: Type, value: Type) -> Self {
+		Self::MAP(Box::new(key), Box::new(value))
+	}
+
+	pub fn option(value: Type) -> Self {
+		Self::OPTION(Box::new(value))
+	}
+
+	pub fn result(value: Type, error: Type) -> Self {
+		Self::RESULT(Box::new(value), Box::new(error))
+	}
+
+	pub fn future(value: Type) -> Self {
+		Self::FUTURE(Box::new(value))
+	}
+
+	pub fn stream(value: Type) -> Self {
+		Self::STREAM(Box::new(value))
+	}
+
+	pub fn union(types: impl IntoIterator<Item = Type>) -> Result<Self, TypeError> {
+		normalize_composite(types, false)
+	}
+
+	pub fn intersection(types: impl IntoIterator<Item = Type>) -> Result<Self, TypeError> {
+		normalize_composite(types, true)
 	}
 
 	pub fn variable_id(&self) -> Option<TypeVariable> {
@@ -151,6 +168,26 @@ impl Type {
 			Self::VOID => "Void".to_string(),
 			Self::ARRAY(element) => format!("Array<{}>", element.to_reference()),
 			Self::RECORD(_) => "Record".to_string(),
+			Self::SET(element) => format!("Set<{}>", element.to_reference()),
+			Self::MAP(key, value) => {
+				format!("Map<{},{}>", key.to_reference(), value.to_reference())
+			}
+			Self::OPTION(value) => format!("Option<{}>", value.to_reference()),
+			Self::RESULT(value, error) => {
+				format!("Result<{},{}>", value.to_reference(), error.to_reference())
+			}
+			Self::FUTURE(value) => format!("Future<{}>", value.to_reference()),
+			Self::STREAM(value) => format!("Stream<{}>", value.to_reference()),
+			Self::UNION(members) => members
+				.iter()
+				.map(Type::to_reference)
+				.collect::<Vec<_>>()
+				.join(" | "),
+			Self::INTERSECTION(members) => members
+				.iter()
+				.map(Type::to_reference)
+				.collect::<Vec<_>>()
+				.join(" & "),
 			Self::NAMED(name) => name.as_str().to_string(),
 			Self::VARIABLE(_) | Self::ANY => "ANY".to_string(),
 		}
@@ -159,6 +196,20 @@ impl Type {
 	pub fn array_element(&self) -> Option<&Type> {
 		match self {
 			Self::ARRAY(element) => Some(element),
+			_ => None,
+		}
+	}
+
+	pub fn set_element(&self) -> Option<&Type> {
+		match self {
+			Self::SET(element) => Some(element),
+			_ => None,
+		}
+	}
+
+	pub fn map_types(&self) -> Option<(&Type, &Type)> {
+		match self {
+			Self::MAP(key, value) => Some((key, value)),
 			_ => None,
 		}
 	}
@@ -183,9 +234,163 @@ impl Type {
 			| Self::VOID
 			| Self::ARRAY(_)
 			| Self::RECORD(_)
+			| Self::SET(_)
+			| Self::MAP(_, _)
+			| Self::OPTION(_)
+			| Self::RESULT(_, _)
+			| Self::FUTURE(_)
+			| Self::STREAM(_)
+			| Self::UNION(_)
+			| Self::INTERSECTION(_)
 			| Self::VARIABLE(_)
 			| Self::ANY => None,
 		}
+	}
+}
+
+fn parse_reference(value: &str) -> Result<Type, TypeError> {
+	let value = value.trim();
+	if value.is_empty() {
+		return Err(TypeError::INVALID_REFERENCE);
+	}
+	if let Some(parts) = split_top_level(value, '|')? {
+		return Type::union(
+			parts
+				.into_iter()
+				.map(parse_reference)
+				.collect::<Result<Vec<_>, _>>()?,
+		);
+	}
+	if let Some(parts) = split_top_level(value, '&')? {
+		return Type::intersection(
+			parts
+				.into_iter()
+				.map(parse_reference)
+				.collect::<Result<Vec<_>, _>>()?,
+		);
+	}
+
+	if let Some(open) = value.find('<') {
+		let base = value[..open].trim();
+		let inner = &value[open + 1..];
+		if !has_matching_outer_angle(inner) {
+			return Err(TypeError::INVALID_REFERENCE);
+		}
+		let inner = &inner[..inner.len() - 1];
+		let arguments = split_top_level(inner, ',')?
+			.unwrap_or_else(|| vec![inner])
+			.into_iter()
+			.map(parse_reference)
+			.collect::<Result<Vec<_>, _>>()?;
+		return match base.to_ascii_lowercase().as_str() {
+			"array" if arguments.len() == 1 => Ok(Type::array(arguments[0].clone())),
+			"set" if arguments.len() == 1 => Ok(Type::set(arguments[0].clone())),
+			"option" if arguments.len() == 1 => Ok(Type::option(arguments[0].clone())),
+			"future" if arguments.len() == 1 => Ok(Type::future(arguments[0].clone())),
+			"stream" if arguments.len() == 1 => Ok(Type::stream(arguments[0].clone())),
+			"map" if arguments.len() == 2 => {
+				Ok(Type::map(arguments[0].clone(), arguments[1].clone()))
+			}
+			"result" if arguments.len() == 2 => {
+				Ok(Type::result(arguments[0].clone(), arguments[1].clone()))
+			}
+			_ => Err(TypeError::INVALID_REFERENCE),
+		};
+	}
+
+	match value.to_ascii_lowercase().as_str() {
+		"string" => Ok(Type::STRING),
+		"boolean" => Ok(Type::BOOLEAN),
+		"integer" => Ok(Type::INTEGER),
+		"float" => Ok(Type::FLOAT),
+		"number" => Ok(Type::NUMBER),
+		"null" => Ok(Type::NULL),
+		"void" => Ok(Type::VOID),
+		"any" => Ok(Type::ANY),
+		_ => Type::named(value),
+	}
+}
+
+fn split_top_level(value: &str, delimiter: char) -> Result<Option<Vec<&str>>, TypeError> {
+	let mut depth = 0_u32;
+	let mut start = 0;
+	let mut parts = Vec::new();
+	for (index, character) in value.char_indices() {
+		match character {
+			'<' => depth = depth.saturating_add(1),
+			'>' => {
+				if depth == 0 {
+					return Err(TypeError::INVALID_REFERENCE);
+				}
+				depth -= 1;
+			}
+			character if character == delimiter && depth == 0 => {
+				let part = value[start..index].trim();
+				if part.is_empty() {
+					return Err(TypeError::INVALID_REFERENCE);
+				}
+				parts.push(part);
+				start = index + character.len_utf8();
+			}
+			_ => {}
+		}
+	}
+	if depth != 0 {
+		return Err(TypeError::INVALID_REFERENCE);
+	}
+	if parts.is_empty() {
+		Ok(None)
+	} else {
+		let part = value[start..].trim();
+		if part.is_empty() {
+			return Err(TypeError::INVALID_REFERENCE);
+		}
+		parts.push(part);
+		Ok(Some(parts))
+	}
+}
+
+fn has_matching_outer_angle(value: &str) -> bool {
+	let mut depth = 1_u32;
+	for (index, character) in value.char_indices() {
+		match character {
+			'<' => depth = depth.saturating_add(1),
+			'>' => {
+				if depth == 0 {
+					return false;
+				}
+				depth -= 1;
+				if depth == 0 {
+					return index == value.len() - 1;
+				}
+			}
+			_ => {}
+		}
+	}
+	false
+}
+
+fn normalize_composite(
+	types: impl IntoIterator<Item = Type>,
+	intersection: bool,
+) -> Result<Type, TypeError> {
+	let mut members = Vec::new();
+	for type_value in types {
+		match (intersection, type_value) {
+			(false, Type::UNION(nested)) | (true, Type::INTERSECTION(nested)) => {
+				members.extend(nested)
+			}
+			(_, other) => members.push(other),
+		}
+	}
+	members.sort();
+	members.dedup();
+	match members.as_slice() {
+		[] if intersection => Err(TypeError::EMPTY_INTERSECTION),
+		[] => Err(TypeError::EMPTY_UNION),
+		[type_value] => Ok(type_value.clone()),
+		_ if intersection => Ok(Type::INTERSECTION(members)),
+		_ => Ok(Type::UNION(members)),
 	}
 }
 
@@ -247,6 +452,18 @@ impl TypeSubstitution {
 					})
 					.collect(),
 			),
+			Type::SET(element) => Type::set(self.resolve(element)),
+			Type::MAP(key, value) => Type::map(self.resolve(key), self.resolve(value)),
+			Type::OPTION(value) => Type::option(self.resolve(value)),
+			Type::RESULT(value, error) => Type::result(self.resolve(value), self.resolve(error)),
+			Type::FUTURE(value) => Type::future(self.resolve(value)),
+			Type::STREAM(value) => Type::stream(self.resolve(value)),
+			Type::UNION(members) => Type::union(members.iter().map(|member| self.resolve(member)))
+				.expect("a resolved union cannot be empty"),
+			Type::INTERSECTION(members) => {
+				Type::intersection(members.iter().map(|member| self.resolve(member)))
+					.expect("a resolved intersection cannot be empty")
+			}
 			_ => type_value.clone(),
 		}
 	}
@@ -336,8 +553,34 @@ fn constrain_assignable(
 		},
 		(Type::VARIABLE(variable), _) => substitution.bind(*variable, to),
 		(_, Type::VARIABLE(variable)) => substitution.bind(*variable, from),
+		(Type::UNION(sources), _) => {
+			for source in sources {
+				constrain_assignable(substitution, source, &to)?;
+			}
+			Ok(())
+		}
+		(_, Type::UNION(_)) if is_assignable(&from, &to) => Ok(()),
+		(Type::INTERSECTION(_), _) if is_assignable(&from, &to) => Ok(()),
+		(_, Type::INTERSECTION(targets)) => {
+			for target in targets {
+				constrain_assignable(substitution, &from, target)?;
+			}
+			Ok(())
+		}
 		(Type::INTEGER, Type::NUMBER) | (Type::FLOAT, Type::NUMBER) => Ok(()),
 		(Type::ARRAY(left), Type::ARRAY(right)) => constrain_assignable(substitution, left, right),
+		(Type::SET(left), Type::SET(right)) => constrain_assignable(substitution, left, right),
+		(Type::MAP(left_key, left_value), Type::MAP(right_key, right_value)) => {
+			constrain_equal(substitution, left_key, right_key)?;
+			constrain_assignable(substitution, left_value, right_value)
+		}
+		(Type::OPTION(left), Type::OPTION(right))
+		| (Type::FUTURE(left), Type::FUTURE(right))
+		| (Type::STREAM(left), Type::STREAM(right)) => constrain_assignable(substitution, left, right),
+		(Type::RESULT(left_value, left_error), Type::RESULT(right_value, right_error)) => {
+			constrain_assignable(substitution, left_value, right_value)?;
+			constrain_assignable(substitution, left_error, right_error)
+		}
 		(Type::RECORD(left), Type::RECORD(right)) => {
 			for (name, target) in right {
 				let Some(source) = left.get(name) else {
@@ -358,15 +601,59 @@ fn constrain_assignable(
 	}
 }
 
+fn constrain_equal(
+	substitution: &mut TypeSubstitution,
+	left: &Type,
+	right: &Type,
+) -> Result<(), TypeInferenceError> {
+	let left = substitution.resolve(left);
+	let right = substitution.resolve(right);
+	match (&left, &right) {
+		(Type::VARIABLE(variable), _) => substitution.bind(*variable, right),
+		(_, Type::VARIABLE(variable)) => substitution.bind(*variable, left),
+		(Type::ARRAY(left), Type::ARRAY(right))
+		| (Type::SET(left), Type::SET(right))
+		| (Type::OPTION(left), Type::OPTION(right))
+		| (Type::FUTURE(left), Type::FUTURE(right))
+		| (Type::STREAM(left), Type::STREAM(right)) => constrain_equal(substitution, left, right),
+		(Type::MAP(left_key, left_value), Type::MAP(right_key, right_value)) => {
+			constrain_equal(substitution, left_key, right_key)?;
+			constrain_equal(substitution, left_value, right_value)
+		}
+		(Type::RESULT(left_value, left_error), Type::RESULT(right_value, right_error)) => {
+			constrain_equal(substitution, left_value, right_value)?;
+			constrain_equal(substitution, left_error, right_error)
+		}
+		(left, right) if left == right => Ok(()),
+		_ => Err(TypeInferenceError::CONFLICT {
+			from: left,
+			to: right,
+		}),
+	}
+}
+
 fn collect_variables(type_value: &Type, variables: &mut BTreeSet<TypeVariable>) {
 	match type_value {
 		Type::VARIABLE(variable) => {
 			variables.insert(*variable);
 		}
 		Type::ARRAY(element) => collect_variables(element, variables),
+		Type::SET(element)
+		| Type::OPTION(element)
+		| Type::FUTURE(element)
+		| Type::STREAM(element) => collect_variables(element, variables),
+		Type::MAP(key, value) | Type::RESULT(key, value) => {
+			collect_variables(key, variables);
+			collect_variables(value, variables);
+		}
 		Type::RECORD(fields) => {
 			for field in fields.values() {
 				collect_variables(field.type_value(), variables);
+			}
+		}
+		Type::UNION(members) | Type::INTERSECTION(members) => {
+			for member in members {
+				collect_variables(member, variables);
 			}
 		}
 		_ => {}
@@ -377,9 +664,19 @@ fn contains_variable(type_value: &Type, variable: TypeVariable) -> bool {
 	match type_value {
 		Type::VARIABLE(candidate) => *candidate == variable,
 		Type::ARRAY(element) => contains_variable(element, variable),
+		Type::SET(element)
+		| Type::OPTION(element)
+		| Type::FUTURE(element)
+		| Type::STREAM(element) => contains_variable(element, variable),
+		Type::MAP(key, value) | Type::RESULT(key, value) => {
+			contains_variable(key, variable) || contains_variable(value, variable)
+		}
 		Type::RECORD(fields) => fields
 			.values()
 			.any(|field| contains_variable(field.type_value(), variable)),
+		Type::UNION(members) | Type::INTERSECTION(members) => members
+			.iter()
+			.any(|member| contains_variable(member, variable)),
 		_ => false,
 	}
 }
@@ -388,8 +685,25 @@ fn contains_variable(type_value: &Type, variable: TypeVariable) -> bool {
 pub fn is_assignable(from: &Type, to: &Type) -> bool {
 	match (from, to) {
 		(_, Type::ANY) => true,
+		(Type::ANY, _) => false,
+		(_, Type::UNION(targets)) => targets.iter().any(|target| is_assignable(from, target)),
+		(Type::UNION(sources), _) => sources.iter().all(|source| is_assignable(source, to)),
+		(_, Type::INTERSECTION(targets)) => {
+			targets.iter().all(|target| is_assignable(from, target))
+		}
+		(Type::INTERSECTION(sources), _) => sources.iter().any(|source| is_assignable(source, to)),
 		(Type::INTEGER, Type::NUMBER) | (Type::FLOAT, Type::NUMBER) => true,
 		(Type::ARRAY(left), Type::ARRAY(right)) => is_assignable(left, right),
+		(Type::SET(left), Type::SET(right)) => is_assignable(left, right),
+		(Type::MAP(left_key, left_value), Type::MAP(right_key, right_value)) => {
+			left_key == right_key && is_assignable(left_value, right_value)
+		}
+		(Type::OPTION(left), Type::OPTION(right)) => is_assignable(left, right),
+		(Type::RESULT(left_value, left_error), Type::RESULT(right_value, right_error)) => {
+			is_assignable(left_value, right_value) && is_assignable(left_error, right_error)
+		}
+		(Type::FUTURE(left), Type::FUTURE(right)) => is_assignable(left, right),
+		(Type::STREAM(left), Type::STREAM(right)) => is_assignable(left, right),
 		(Type::RECORD(left), Type::RECORD(right)) => right.iter().all(|(name, target)| {
 			let Some(source) = left.get(name) else {
 				return !target.required();
@@ -399,8 +713,6 @@ pub fn is_assignable(from: &Type, to: &Type) -> bool {
 		}),
 		(left, right) if left == right => true,
 		(Type::NAMED(left), Type::NAMED(right)) => left == right,
-		(Type::ANY, Type::NAMED(_)) => false,
-		(Type::ANY, _) => false,
 		_ => false,
 	}
 }
@@ -439,6 +751,8 @@ pub fn check_assignable(from: &Type, to: &Type) -> Result<(), AssignabilityError
 pub enum TypeError {
 	EMPTY_NAME,
 	INVALID_REFERENCE,
+	EMPTY_UNION,
+	EMPTY_INTERSECTION,
 }
 
 impl fmt::Display for TypeError {
@@ -524,6 +838,69 @@ mod tests {
 	}
 
 	#[test]
+	fn graph_references_parse_nested_generics_and_normalize_composites() {
+		let parsed = Type::from_reference("Result<Option<User>, Error>").unwrap();
+		assert_eq!(parsed.to_reference(), "Result<Option<User>,Error>");
+
+		let union = Type::from_reference("String | Boolean | String").unwrap();
+		assert_eq!(union.to_reference(), "String | Boolean");
+		assert_eq!(
+			Type::from_reference("Array<String | Null>")
+				.unwrap()
+				.to_reference(),
+			"Array<String | Null>"
+		);
+		assert_eq!(
+			Type::from_reference("Map<String>").unwrap_err(),
+			TypeError::INVALID_REFERENCE
+		);
+	}
+
+	#[test]
+	fn unions_and_intersections_have_structural_assignability() {
+		let string_or_boolean = Type::union([Type::STRING, Type::BOOLEAN]).unwrap();
+		assert!(is_assignable(&Type::STRING, &string_or_boolean));
+		assert!(!is_assignable(&Type::INTEGER, &string_or_boolean));
+
+		let numeric_union = Type::union([Type::INTEGER, Type::FLOAT]).unwrap();
+		assert!(is_assignable(&numeric_union, &Type::NUMBER));
+
+		let request = Type::named("Request").unwrap();
+		let serializable = Type::named("Serializable").unwrap();
+		let intersection = Type::intersection([request.clone(), serializable]).unwrap();
+		assert!(is_assignable(&intersection, &request));
+		assert!(!is_assignable(&request, &intersection));
+	}
+
+	#[test]
+	fn generic_types_follow_declared_variance_rules() {
+		assert!(is_assignable(
+			&Type::option(Type::INTEGER),
+			&Type::option(Type::NUMBER)
+		));
+		assert!(is_assignable(
+			&Type::result(Type::INTEGER, Type::STRING),
+			&Type::result(Type::NUMBER, Type::STRING)
+		));
+		assert!(is_assignable(
+			&Type::future(Type::INTEGER),
+			&Type::future(Type::NUMBER)
+		));
+		assert!(is_assignable(
+			&Type::stream(Type::INTEGER),
+			&Type::stream(Type::NUMBER)
+		));
+		assert!(is_assignable(
+			&Type::map(Type::STRING, Type::INTEGER),
+			&Type::map(Type::STRING, Type::NUMBER)
+		));
+		assert!(!is_assignable(
+			&Type::map(Type::INTEGER, Type::STRING),
+			&Type::map(Type::NUMBER, Type::STRING)
+		));
+	}
+
+	#[test]
 	fn records_respect_required_fields_and_nested_assignability() {
 		let mut source_fields = BTreeMap::new();
 		source_fields.insert("id".to_string(), RecordField::new(Type::INTEGER, true));
@@ -570,6 +947,20 @@ mod tests {
 
 		assert_eq!(substitution.resolve(&first), Type::array(Type::INTEGER));
 		assert_eq!(substitution.resolve(&second), Type::array(Type::INTEGER));
+	}
+
+	#[test]
+	fn constraints_infer_nested_generic_arguments() {
+		let value = Type::variable(TypeVariable::new(1));
+		let error = Type::variable(TypeVariable::new(2));
+		let substitution = solve_constraints([TypeConstraint::assignable(
+			Type::result(Type::option(Type::STRING), Type::BOOLEAN),
+			Type::result(Type::option(value.clone()), error.clone()),
+		)])
+		.unwrap();
+
+		assert_eq!(substitution.resolve(&value), Type::STRING);
+		assert_eq!(substitution.resolve(&error), Type::BOOLEAN);
 	}
 
 	#[test]
