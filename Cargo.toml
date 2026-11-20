@@ -6,6 +6,7 @@ members = [
 	"crates/diagnostics",
 	"crates/plugin-api",
 	"crates/compiler",
+	"crates/compiler-pipeline",
 	"crates/type-system",
 	"crates/language-backend",
 	"crates/codegen-typescript",

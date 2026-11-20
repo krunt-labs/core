@@ -60,6 +60,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "krunt-compiler-pipeline"
+version = "0.1.0"
+dependencies = [
+ "krunt-backend-dsl",
+ "krunt-codegen-nestjs",
+ "krunt-codegen-typescript",
+ "krunt-compiler",
+ "krunt-diagnostics",
+ "krunt-framework-backend",
+ "krunt-graph-model",
+ "krunt-plugin-api",
+ "serde_json",
+]
+
+[[package]]
 name = "krunt-diagnostics"
 version = "0.1.0"
 dependencies = [

@@ -111,6 +111,7 @@ crates/
   diagnostics/          Stable source-linked diagnostics
   plugin-api/           Contracts, capabilities, and plugin interfaces
   compiler-core/        Pipeline orchestration and analysis
+  compiler-pipeline/    Public graph-to-project target orchestration
   krunt-ir/             Validated canonical IR
   compiler-passes/      Deterministic optimization passes
   backend-dsl/          Backend semantics and lowering

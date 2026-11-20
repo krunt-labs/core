@@ -1,0 +1,19 @@
+[package]
+name = "krunt-compiler-pipeline"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Public deterministic graph-to-project pipeline for Krunt"
+
+[dependencies]
+krunt-backend-dsl = { path = "../backend-dsl" }
+krunt-codegen-nestjs = { path = "../codegen-nestjs" }
+krunt-codegen-typescript = { path = "../codegen-typescript" }
+krunt-compiler = { path = "../compiler" }
+krunt-diagnostics = { path = "../diagnostics" }
+krunt-framework-backend = { path = "../framework-backend" }
+krunt-graph-model = { path = "../graph-model" }
+krunt-plugin-api = { path = "../plugin-api" }
+
+[dev-dependencies]
+serde_json = "1"
