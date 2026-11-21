@@ -2748,7 +2748,7 @@ fn entity_properties(node: &Node) -> Result<EntityProperties, Box<Diagnostic>> {
 			return Err(node_diagnostic(
 				node,
 				"BACKEND_DSL.ENTITY_FIELDS_TYPE",
-				"Entity property 'fields' must be an object mapping field names to type references.",
+				"Entity property 'fields' must be an object mapping field names to type references or example values.",
 			));
 		}
 	};
@@ -2761,8 +2761,13 @@ fn entity_field_properties(
 	value: &Value,
 ) -> Result<EntityFieldProperties, Box<Diagnostic>> {
 	let (type_value, required) = match value {
-		Value::String(type_name) => (Value::String(type_name.clone()), true),
-		Value::Object(schema) => {
+		Value::String(type_name) if is_entity_scalar_reference(type_name) => {
+			(Value::String(type_name.clone()), true)
+		}
+		Value::Object(schema)
+			if schema.contains_key("type")
+				&& schema.keys().all(|key| key == "type" || key == "required") =>
+		{
 			let Some(type_value) = schema.get("type") else {
 				return Err(node_diagnostic(
 					node,
@@ -2786,11 +2791,10 @@ fn entity_field_properties(
 			(type_value.clone(), required)
 		}
 		_ => {
-			return Err(node_diagnostic(
-				node,
-				"BACKEND_DSL.ENTITY_FIELD_TYPE",
-				format!("Entity field '{field_name}' must be a type string or a schema object."),
-			));
+			return Ok(EntityFieldProperties {
+				type_schema: inferred_entity_type_schema(node, field_name, value)?,
+				required: true,
+			});
 		}
 	};
 
@@ -2798,6 +2802,87 @@ fn entity_field_properties(
 		type_schema: entity_type_schema(node, field_name, &type_value)?,
 		required,
 	})
+}
+
+fn inferred_entity_type_schema(
+	node: &Node,
+	field_name: &str,
+	value: &Value,
+) -> Result<EntityTypeSchema, Box<Diagnostic>> {
+	match value {
+		Value::String(value) => {
+			let parsed = Type::from_reference(value.as_str()).ok();
+			if parsed
+				.as_ref()
+				.is_some_and(|type_value| type_value.is_scalar() || *type_value == Type::ANY)
+			{
+				return Ok(EntityTypeSchema::SCALAR(value.clone()));
+			}
+			Ok(EntityTypeSchema::SCALAR("String".to_string()))
+		}
+		Value::Bool(_) => Ok(EntityTypeSchema::SCALAR("Boolean".to_string())),
+		Value::Number(value) => Ok(EntityTypeSchema::SCALAR(
+			if value.is_i64() || value.is_u64() {
+				"Integer"
+			} else {
+				"Float"
+			}
+			.to_string(),
+		)),
+		Value::Null => Ok(EntityTypeSchema::SCALAR("Null".to_string())),
+		Value::Array(items) => {
+			let item_schema = if let Some(first) = items.first() {
+				let first_schema = inferred_entity_type_schema(node, field_name, first)?;
+				if items.iter().skip(1).all(|item| {
+					inferred_entity_type_schema(node, field_name, item)
+						.map(|schema| schema == first_schema)
+						.unwrap_or(false)
+				}) {
+					first_schema
+				} else {
+					EntityTypeSchema::SCALAR("ANY".to_string())
+				}
+			} else {
+				EntityTypeSchema::SCALAR("ANY".to_string())
+			};
+			Ok(EntityTypeSchema::ARRAY {
+				kind: "array".to_string(),
+				items: Box::new(item_schema),
+			})
+		}
+		Value::Object(fields) => {
+			let mut validated = BTreeMap::new();
+			for (nested_name, nested_value) in fields {
+				if !is_identifier(nested_name) {
+					return Err(node_diagnostic(
+						node,
+						"BACKEND_DSL.ENTITY_FIELD_NAME_INVALID",
+						format!(
+							"Entity field name '{field_name}.{nested_name}' must be a valid identifier."
+						),
+					));
+				}
+				validated.insert(
+					nested_name.clone(),
+					entity_field_properties(
+						node,
+						&format!("{field_name}.{nested_name}"),
+						nested_value,
+					)?,
+				);
+			}
+			Ok(EntityTypeSchema::RECORD {
+				kind: "record".to_string(),
+				fields: validated,
+			})
+		}
+	}
+}
+
+fn is_entity_scalar_reference(value: &str) -> bool {
+	Type::from_reference(value)
+		.map(|type_value| type_value.is_scalar() || type_value == Type::ANY)
+		.unwrap_or(false)
 }
 
 fn entity_type_schema(
@@ -3902,6 +3987,32 @@ mod tests {
 	}
 
 	#[test]
+	fn infers_entity_field_types_from_literal_values() {
+		let plugin = BackendDslPlugin::new();
+		let node = Node::new(
+			NodeId::new(2).unwrap(),
+			NodeTypeId::new(ENTITY_NODE_TYPE).unwrap(),
+		)
+		.with_property(ENTITY_NAME_PROPERTY, Value::String("User".to_string()))
+		.unwrap()
+		.with_property(
+			ENTITY_FIELDS_PROPERTY,
+			serde_json::json!({
+				"first": "this is the first",
+				"second": "this is the second"
+			}),
+		)
+		.unwrap();
+
+		assert!(plugin.analyze_node(&node).is_empty());
+		let lowered = plugin.lower_node(&node).unwrap();
+		assert_eq!(
+			lowered.attributes()["backend.entity.fields"],
+			"{\"first\":{\"type\":\"String\",\"required\":true},\"second\":{\"type\":\"String\",\"required\":true}}"
+		);
+	}
+
+	#[test]
 	fn rejects_invalid_entity_field_schemas() {
 		let plugin = BackendDslPlugin::new();
 		let base = Node::new(
@@ -3916,7 +4027,10 @@ mod tests {
 			.unwrap();
 		let wrong_type = base
 			.clone()
-			.with_property(ENTITY_FIELDS_PROPERTY, serde_json::json!({"id": 1}))
+			.with_property(
+				ENTITY_FIELDS_PROPERTY,
+				serde_json::json!({"id": {"type": 1}}),
+			)
 			.unwrap();
 		let wrong_required = base
 			.clone()
@@ -3929,7 +4043,9 @@ mod tests {
 			.clone()
 			.with_property(
 				ENTITY_FIELDS_PROPERTY,
-				serde_json::json!({"profile": "UserProfile"}),
+				serde_json::json!({
+					"profile": {"type": {"kind": "map", "items": "String"}}
+				}),
 			)
 			.unwrap();
 		let missing_array_items = base
