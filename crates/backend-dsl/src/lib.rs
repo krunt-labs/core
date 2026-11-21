@@ -14,8 +14,10 @@ use krunt_graph_model::{
 };
 use krunt_ir::{AsyncKind, EffectId, OperationId, TypeId};
 use krunt_plugin_api::{
-	LoweredOperation, LoweredOperationKind, NodeContract, PluginApiError, PluginManifest,
-	PluginRegistry, PortContract,
+	LoweredOperation, LoweredOperationKind, NodeContract, NodeDescriptor as CatalogNodeDescriptor,
+	PluginApiError, PluginCatalogEntry, PluginManifest, PluginRegistry, PortContract,
+	PortDescriptor as CatalogPortDescriptor, PropertyDescriptor as CatalogPropertyDescriptor,
+	PropertyKind as CatalogPropertyKind,
 };
 use krunt_type_system::Type;
 use serde::Serialize;
@@ -838,6 +840,44 @@ impl BackendDslPlugin {
 	pub fn descriptors(&self) -> &[BackendNodeDescriptor] {
 		&self.descriptors
 	}
+
+	fn catalog_entry(&self) -> PluginCatalogEntry {
+		let node_types = self.descriptors.iter().map(|descriptor| {
+			let property_descriptors = descriptor.properties.iter().map(|property| {
+				let kind = match &property.kind {
+					BackendPropertyKind::STRING => CatalogPropertyKind::STRING,
+					BackendPropertyKind::INTEGER => CatalogPropertyKind::INTEGER,
+					BackendPropertyKind::OBJECT => CatalogPropertyKind::OBJECT,
+					BackendPropertyKind::ENUM { values } => CatalogPropertyKind::ENUM {
+						values: values.clone(),
+					},
+				};
+				CatalogPropertyDescriptor::new(
+					property.key.clone(),
+					kind,
+					property.required,
+					property.default.clone(),
+				)
+			});
+			let port_descriptors = |ports: &[BackendPortDescriptor]| -> Vec<_> {
+				ports
+					.iter()
+					.map(|port| {
+						CatalogPortDescriptor::new(port.name.clone(), port.contract.clone())
+					})
+					.collect()
+			};
+			CatalogNodeDescriptor::new(
+				descriptor.type_id.clone(),
+				descriptor.label.clone(),
+				descriptor.category.clone(),
+				port_descriptors(&descriptor.inputs),
+				port_descriptors(&descriptor.outputs),
+				property_descriptors,
+			)
+		});
+		PluginCatalogEntry::new(self.manifest.identity(), node_types)
+	}
 }
 
 impl Default for BackendDslPlugin {
@@ -849,6 +889,10 @@ impl Default for BackendDslPlugin {
 impl krunt_plugin_api::SemanticPlugin for BackendDslPlugin {
 	fn manifest(&self) -> &PluginManifest {
 		&self.manifest
+	}
+
+	fn catalog_entry(&self) -> Option<PluginCatalogEntry> {
+		Some(self.catalog_entry())
 	}
 
 	fn contract(&self, node: &Node) -> NodeContract {

@@ -78,6 +78,7 @@ dependencies = [
  "krunt-compiler-pipeline",
  "krunt-diagnostics",
  "krunt-graph-model",
+ "krunt-plugin-api",
  "serde",
  "serde_json",
 ]
@@ -150,6 +151,7 @@ dependencies = [
  "krunt-graph-model",
  "krunt-ir",
  "serde",
+ "serde_json",
 ]
 
 [[package]]

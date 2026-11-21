@@ -36,6 +36,7 @@ impl Error for BridgeError {}
 #[allow(non_camel_case_types)]
 #[derive(Clone, Copy, Debug, Deserialize)]
 enum WireOperation {
+	CATALOG,
 	VALIDATE,
 	COMPILE,
 }
@@ -45,8 +46,8 @@ struct WireRequest {
 	protocol_version: u32,
 	request_id: String,
 	operation: WireOperation,
-	target: WireTarget,
-	document: Value,
+	target: Option<WireTarget>,
+	document: Option<Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -61,6 +62,19 @@ struct WireResponse {
 	request_id: String,
 	diagnostics: Vec<WireDiagnostic>,
 	artifact: Option<WireArtifact>,
+}
+
+#[derive(Serialize)]
+struct WireCatalogResponse {
+	protocol_version: u32,
+	request_id: String,
+	catalog: WireCatalog,
+}
+
+#[derive(Serialize)]
+struct WireCatalog {
+	protocol_version: u32,
+	plugins: Vec<krunt_plugin_api::PluginCatalogEntry>,
 }
 
 #[derive(Serialize)]
@@ -126,9 +140,18 @@ pub fn handle_json(input: &str) -> Result<String, BridgeError> {
 			"request_id must be a non-empty string".to_string(),
 		));
 	}
+	if matches!(request.operation, WireOperation::CATALOG) {
+		return catalog_response_json(request.request_id);
+	}
 
-	let graph_id = graph_id_from_value(&request.document);
-	let document_json = serde_json::to_string(&request.document)
+	let document_value = request.document.ok_or_else(|| {
+		BridgeError::INVALID_REQUEST("document is required for compiler operations".to_string())
+	})?;
+	let target = request.target.ok_or_else(|| {
+		BridgeError::INVALID_REQUEST("target is required for compiler operations".to_string())
+	})?;
+	let graph_id = graph_id_from_value(&document_value);
+	let document_json = serde_json::to_string(&document_value)
 		.map_err(|error| BridgeError::SERIALIZATION(error.to_string()))?;
 	let document = match GraphDocument::from_json(&document_json) {
 		Ok(document) => document,
@@ -148,7 +171,7 @@ pub fn handle_json(input: &str) -> Result<String, BridgeError> {
 		}
 	};
 
-	let Some(target) = target_from_wire(&request.target) else {
+	let Some(target) = target_from_wire(&target) else {
 		return response_json(WireResponse {
 			protocol_version: PROTOCOL_VERSION,
 			request_id: request.request_id,
@@ -158,7 +181,7 @@ pub fn handle_json(input: &str) -> Result<String, BridgeError> {
 				CompilerStage::PARSE,
 				format!(
 					"unsupported compilation target: {}/{}",
-					request.target.language, request.target.framework
+					target.language, target.framework
 				),
 				graph_id,
 			)],
@@ -168,6 +191,7 @@ pub fn handle_json(input: &str) -> Result<String, BridgeError> {
 
 	let pipeline = CompilerPipeline::new();
 	let response = match request.operation {
+		WireOperation::CATALOG => unreachable!("catalog requests return before graph parsing"),
 		WireOperation::VALIDATE => WireResponse {
 			protocol_version: PROTOCOL_VERSION,
 			request_id: request.request_id,
@@ -179,6 +203,18 @@ pub fn handle_json(input: &str) -> Result<String, BridgeError> {
 		}
 	};
 	response_json(response)
+}
+
+fn catalog_response_json(request_id: String) -> Result<String, BridgeError> {
+	let pipeline = CompilerPipeline::new();
+	response_json_catalog(WireCatalogResponse {
+		protocol_version: PROTOCOL_VERSION,
+		request_id,
+		catalog: WireCatalog {
+			protocol_version: PROTOCOL_VERSION,
+			plugins: pipeline.catalog(),
+		},
+	})
 }
 
 fn target_from_wire(target: &WireTarget) -> Option<CompilationTarget> {
@@ -263,6 +299,10 @@ fn compile_response(
 }
 
 fn response_json(response: WireResponse) -> Result<String, BridgeError> {
+	serde_json::to_string(&response).map_err(|error| BridgeError::SERIALIZATION(error.to_string()))
+}
+
+fn response_json_catalog(response: WireCatalogResponse) -> Result<String, BridgeError> {
 	serde_json::to_string(&response).map_err(|error| BridgeError::SERIALIZATION(error.to_string()))
 }
 
@@ -447,5 +487,30 @@ mod tests {
 		assert_eq!(response["diagnostics"][0]["code"], "GRAPH.INVALID_DOCUMENT");
 		assert_eq!(response["diagnostics"][0]["stage"], "STRUCTURAL_VALIDATION");
 		assert_eq!(response["artifact"], Value::Null);
+	}
+
+	#[test]
+	fn returns_the_deterministic_backend_catalog_without_a_graph_document() {
+		let input = serde_json::to_string(&json!({
+			"protocol_version": 1,
+			"request_id": "catalog-test-0001",
+			"operation": "CATALOG"
+		}))
+		.unwrap();
+		let first = handle_json(&input).unwrap();
+		let second = handle_json(&input).unwrap();
+		assert_eq!(first, second);
+		let response: Value = serde_json::from_str(&first).unwrap();
+		assert_eq!(response["request_id"], "catalog-test-0001");
+		assert_eq!(response["catalog"]["protocol_version"], 1);
+		assert_eq!(response["catalog"]["plugins"][0]["id"], "krunt.backend-dsl");
+		assert_eq!(response["catalog"]["plugins"][0]["version"], "0.5.0");
+		let node_types = response["catalog"]["plugins"][0]["node_types"]
+			.as_array()
+			.unwrap();
+		assert_eq!(node_types.len(), 18);
+		assert!(node_types
+			.iter()
+			.any(|node| node["type_id"] == "backend.http_route"));
 	}
 }

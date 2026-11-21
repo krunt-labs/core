@@ -11,7 +11,7 @@ use krunt_codegen_typescript::{TypeScriptBackend, TypeScriptLoweringError};
 use krunt_diagnostics::Diagnostics;
 use krunt_framework_backend::{ArchiveError, GeneratedProject};
 use krunt_graph_model::GraphDocument;
-use krunt_plugin_api::PluginRegistry;
+use krunt_plugin_api::{PluginCatalogEntry, PluginRegistry};
 use std::error::Error;
 use std::fmt;
 
@@ -177,6 +177,11 @@ impl CompilerPipeline {
 		let (_, mut diagnostics) = krunt_compiler::compile(document, &self.plugins).into_parts();
 		diagnostics.sort_canonical();
 		diagnostics
+	}
+
+	/// Return the serializable descriptor catalog for registered editor plugins.
+	pub fn catalog(&self) -> Vec<PluginCatalogEntry> {
+		self.plugins.catalog()
 	}
 }
 

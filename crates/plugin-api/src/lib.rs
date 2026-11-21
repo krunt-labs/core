@@ -8,6 +8,7 @@ use krunt_diagnostics::Diagnostic;
 use krunt_graph_model::{GraphDocument, Node, NodeTypeId, PluginReference, PortKind};
 use krunt_ir::{AsyncKind, EffectId, OperationId, TypeId};
 use serde::Serialize;
+use serde_json::Value;
 use std::collections::BTreeMap;
 use std::fmt;
 
@@ -45,6 +46,111 @@ impl PluginManifest {
 
 	pub fn supported_node_types(&self) -> &[NodeTypeId] {
 		&self.supported_node_types
+	}
+}
+
+/// Serializable property kind exposed to editor and AI clients.
+#[allow(non_camel_case_types)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub enum PropertyKind {
+	STRING,
+	INTEGER,
+	OBJECT,
+	ENUM { values: Vec<String> },
+}
+
+/// Serializable property schema exposed by a semantic plugin.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct PropertyDescriptor {
+	key: String,
+	kind: PropertyKind,
+	required: bool,
+	default: Option<Value>,
+}
+
+impl PropertyDescriptor {
+	pub fn new(
+		key: impl Into<String>,
+		kind: PropertyKind,
+		required: bool,
+		default: Option<Value>,
+	) -> Self {
+		Self {
+			key: key.into(),
+			kind,
+			required,
+			default,
+		}
+	}
+}
+
+/// Serializable semantic port descriptor exposed by a plugin.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct PortDescriptor {
+	name: String,
+	contract: PortContract,
+}
+
+impl PortDescriptor {
+	pub fn new(name: impl Into<String>, contract: PortContract) -> Self {
+		Self {
+			name: name.into(),
+			contract,
+		}
+	}
+}
+
+/// Serializable editor/AI descriptor for one semantic node type.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct NodeDescriptor {
+	type_id: NodeTypeId,
+	label: String,
+	category: String,
+	inputs: Vec<PortDescriptor>,
+	outputs: Vec<PortDescriptor>,
+	properties: Vec<PropertyDescriptor>,
+}
+
+impl NodeDescriptor {
+	pub fn new(
+		type_id: NodeTypeId,
+		label: impl Into<String>,
+		category: impl Into<String>,
+		inputs: impl IntoIterator<Item = PortDescriptor>,
+		outputs: impl IntoIterator<Item = PortDescriptor>,
+		properties: impl IntoIterator<Item = PropertyDescriptor>,
+	) -> Self {
+		Self {
+			type_id,
+			label: label.into(),
+			category: category.into(),
+			inputs: inputs.into_iter().collect(),
+			outputs: outputs.into_iter().collect(),
+			properties: properties.into_iter().collect(),
+		}
+	}
+}
+
+/// Serializable catalog entry for one semantic plugin.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct PluginCatalogEntry {
+	id: String,
+	version: String,
+	node_types: Vec<NodeDescriptor>,
+}
+
+impl PluginCatalogEntry {
+	pub fn new(
+		identity: &PluginReference,
+		node_types: impl IntoIterator<Item = NodeDescriptor>,
+	) -> Self {
+		let mut node_types: Vec<_> = node_types.into_iter().collect();
+		node_types.sort_by(|left, right| left.type_id.cmp(&right.type_id));
+		Self {
+			id: identity.id().to_string(),
+			version: identity.version().to_string(),
+			node_types,
+		}
 	}
 }
 
@@ -327,6 +433,11 @@ impl NodeContract {
 pub trait SemanticPlugin: Send + Sync {
 	fn manifest(&self) -> &PluginManifest;
 
+	/// Return generic descriptor data for editor and AI clients when supported.
+	fn catalog_entry(&self) -> Option<PluginCatalogEntry> {
+		None
+	}
+
 	fn contract(&self, node: &Node) -> NodeContract;
 
 	fn analyze_graph(&self, _document: &GraphDocument) -> Vec<Diagnostic> {
@@ -405,6 +516,13 @@ impl PluginRegistry {
 
 	pub fn node_type_count(&self) -> usize {
 		self.node_types.len()
+	}
+
+	pub fn catalog(&self) -> Vec<PluginCatalogEntry> {
+		self.plugins
+			.values()
+			.filter_map(|plugin| plugin.catalog_entry())
+			.collect()
 	}
 }
 

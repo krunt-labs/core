@@ -3,7 +3,7 @@
 use krunt_compiler_bridge::handle_json;
 use wasm_bindgen::prelude::*;
 
-/// Compile or validate one versioned JSON request.
+/// Load the catalog, compile, or validate one versioned JSON request.
 ///
 /// Successful calls return the versioned compiler response JSON. Envelope
 /// failures return a small JSON error object so JavaScript callers can surface
