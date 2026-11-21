@@ -111,6 +111,7 @@ crates/
   diagnostics/          Stable source-linked diagnostics
   plugin-api/           Contracts, capabilities, and plugin interfaces
   compiler-core/        Pipeline orchestration and analysis
+  compiler-bridge/      Versioned JSON request/response boundary
   compiler-pipeline/    Public graph-to-project target orchestration
   krunt-ir/             Validated canonical IR
   compiler-passes/      Deterministic optimization passes
@@ -120,7 +121,7 @@ crates/
   framework-backend/    Generated-project contract and file ownership
   codegen-nestjs/       NestJS project scaffold and framework adapter
   compiler-cli/         Command-line adapter
-  compiler-wasm/        Optional browser validation adapter
+  compiler-wasm/        Browser compiler adapter over the JSON bridge
 ```
 
 This is the intended dependency structure, not a description of currently implemented crates.

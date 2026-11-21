@@ -168,6 +168,16 @@ impl CompilerPipeline {
 			.map_err(CompilationError::NESTJS_GENERATION)?;
 		Ok(CompilationArtifact { target, project })
 	}
+
+	/// Run semantic validation without lowering or generating an artifact.
+	///
+	/// This is the public adapter boundary used by browser and service bridges
+	/// for live diagnostics. The compiler remains the semantic authority.
+	pub fn validate(&self, document: &GraphDocument) -> Diagnostics {
+		let (_, mut diagnostics) = krunt_compiler::compile(document, &self.plugins).into_parts();
+		diagnostics.sort_canonical();
+		diagnostics
+	}
 }
 
 impl Default for CompilerPipeline {
