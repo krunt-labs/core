@@ -116,6 +116,7 @@ struct WireDiagnostic {
 struct WireArtifact {
 	target: WireTarget,
 	files: Vec<WireFile>,
+	archive_base64: String,
 }
 
 #[derive(Serialize)]
@@ -233,26 +234,46 @@ fn compile_response(
 	graph_id: u64,
 ) -> WireResponse {
 	match pipeline.compile(document, target) {
-		Ok(artifact) => WireResponse {
-			protocol_version: PROTOCOL_VERSION,
-			request_id,
-			diagnostics: Vec::new(),
-			artifact: Some(WireArtifact {
-				target: WireTarget {
-					language: "TYPESCRIPT".to_string(),
-					framework: "NESTJS".to_string(),
-				},
-				files: artifact
-					.project()
-					.files()
-					.iter()
-					.map(|(path, content)| WireFile {
-						path: path.clone(),
-						content: content.clone(),
-					})
-					.collect(),
-			}),
-		},
+		Ok(artifact) => {
+			let archive = match artifact.zip_archive() {
+				Ok(archive) => archive,
+				Err(error) => {
+					return WireResponse {
+						protocol_version: PROTOCOL_VERSION,
+						request_id,
+						diagnostics: vec![bridge_diagnostic(
+							"COMPILER.ARCHIVE_EXPORT_FAILED",
+							Severity::ERROR,
+							CompilerStage::CODE_GENERATION,
+							format!("generated project archive could not be created: {error}"),
+							graph_id,
+						)],
+						artifact: None,
+					};
+				}
+			};
+			WireResponse {
+				protocol_version: PROTOCOL_VERSION,
+				request_id,
+				diagnostics: Vec::new(),
+				artifact: Some(WireArtifact {
+					target: WireTarget {
+						language: "TYPESCRIPT".to_string(),
+						framework: "NESTJS".to_string(),
+					},
+					files: artifact
+						.project()
+						.files()
+						.iter()
+						.map(|(path, content)| WireFile {
+							path: path.clone(),
+							content: content.clone(),
+						})
+						.collect(),
+					archive_base64: base64_encode(&archive),
+				}),
+			}
+		}
 		Err(CompilationError::DIAGNOSTICS(diagnostics)) => WireResponse {
 			protocol_version: PROTOCOL_VERSION,
 			request_id,
@@ -296,6 +317,29 @@ fn compile_response(
 			artifact: None,
 		},
 	}
+}
+
+fn base64_encode(bytes: &[u8]) -> String {
+	const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+	let mut encoded = String::with_capacity(bytes.len().div_ceil(3) * 4);
+	for chunk in bytes.chunks(3) {
+		let first = chunk[0] as usize;
+		let second = chunk.get(1).copied().unwrap_or(0) as usize;
+		let third = chunk.get(2).copied().unwrap_or(0) as usize;
+		encoded.push(ALPHABET[first >> 2] as char);
+		encoded.push(ALPHABET[((first & 0x03) << 4) | (second >> 4)] as char);
+		encoded.push(if chunk.len() > 1 {
+			ALPHABET[((second & 0x0f) << 2) | (third >> 6)] as char
+		} else {
+			'='
+		});
+		encoded.push(if chunk.len() > 2 {
+			ALPHABET[third & 0x3f] as char
+		} else {
+			'='
+		});
+	}
+	encoded
 }
 
 fn response_json(response: WireResponse) -> Result<String, BridgeError> {
@@ -465,6 +509,15 @@ mod tests {
 			.unwrap()
 			.iter()
 			.any(|file| { file["path"] == "src/app.controller.ts" }));
+		assert!(!response["artifact"]["archive_base64"]
+			.as_str()
+			.unwrap()
+			.is_empty());
+	}
+
+	#[test]
+	fn base64_encoding_is_stable_for_archive_bytes() {
+		assert_eq!(base64_encode(b"Krunt"), "S3J1bnQ=");
 	}
 
 	#[test]
