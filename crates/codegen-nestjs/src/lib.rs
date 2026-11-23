@@ -871,8 +871,10 @@ fn static_project_files(program: &NestJsProgram) -> Vec<(String, String)> {
 		("src/main.ts".to_string(), main_module()),
 		("package.json".to_string(), package_json(program)),
 		("README.md".to_string(), project_readme(program)),
+		("test/generated.spec.ts".to_string(), generated_test()),
 		("tsconfig.json".to_string(), tsconfig()),
 		("tsconfig.build.json".to_string(), tsconfig_build()),
+		("tsconfig.test.json".to_string(), tsconfig_test()),
 	];
 	for entity in program.entities() {
 		files.push((
@@ -1673,6 +1675,8 @@ fn package_json(program: &NestJsProgram) -> String {
   "private": true,
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
+    "test": "npm run test:build && node --test dist-test/test/generated.spec.js",
+    "test:build": "tsc -p tsconfig.test.json",
     "start": "node dist/main.js",
     "start:dev": "nest start --watch"
   },
@@ -1721,6 +1725,7 @@ Krunt editor.
 ```sh
 npm install
 npm run build
+npm test
 npm start
 ```
 
@@ -1896,6 +1901,33 @@ fn tsconfig_build() -> String {
   "extends": "./tsconfig.json",
   "exclude": ["node_modules", "test", "dist", "**/*spec.ts"]
 }
+"#
+	.to_string()
+}
+
+fn tsconfig_test() -> String {
+	r#"{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "outDir": "./dist-test",
+    "incremental": false
+  },
+  "include": ["src/**/*.ts", "test/**/*.ts"]
+}
+"#
+	.to_string()
+}
+
+fn generated_test() -> String {
+	r#"import assert from 'node:assert/strict';
+import { test } from 'node:test';
+import { AppController } from '../src/app.controller';
+import { AppModule } from '../src/app.module';
+
+test('generated NestJS application exports its root module', () => {
+  assert.equal(typeof AppModule, 'function');
+  assert.equal(typeof AppController, 'function');
+});
 "#
 	.to_string()
 }
@@ -3664,7 +3696,7 @@ mod tests {
 	}
 
 	fn persistence_golden_project() -> GeneratedProject {
-		const PATHS: [&str; 11] = [
+		const PATHS: [&str; 13] = [
 			"README.md",
 			"package.json",
 			"src/app.controller.ts",
@@ -3674,8 +3706,10 @@ mod tests {
 			"src/main.ts",
 			"src/models/User.model.ts",
 			"src/repositories/UserRepositoryRepository.repository.ts",
+			"test/generated.spec.ts",
 			"tsconfig.build.json",
 			"tsconfig.json",
+			"tsconfig.test.json",
 		];
 		let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden/persistence");
 		let files = PATHS.into_iter().map(|path| {
@@ -3692,7 +3726,7 @@ mod tests {
 	}
 
 	fn subgraph_golden_project() -> GeneratedProject {
-		const PATHS: [&str; 11] = [
+		const PATHS: [&str; 13] = [
 			"README.md",
 			"package.json",
 			"src/app.controller.ts",
@@ -3702,8 +3736,10 @@ mod tests {
 			"src/main.ts",
 			"src/models/User.model.ts",
 			"src/repositories/UserRepositoryRepository.repository.ts",
+			"test/generated.spec.ts",
 			"tsconfig.build.json",
 			"tsconfig.json",
+			"tsconfig.test.json",
 		];
 		let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden/subgraph");
 		let files = PATHS.into_iter().map(|path| {
@@ -3718,7 +3754,7 @@ mod tests {
 	}
 
 	fn query_transform_golden_project() -> GeneratedProject {
-		const PATHS: [&str; 11] = [
+		const PATHS: [&str; 13] = [
 			"README.md",
 			"package.json",
 			"src/app.controller.ts",
@@ -3728,8 +3764,10 @@ mod tests {
 			"src/main.ts",
 			"src/models/User.model.ts",
 			"src/repositories/UserRepositoryRepository.repository.ts",
+			"test/generated.spec.ts",
 			"tsconfig.build.json",
 			"tsconfig.json",
+			"tsconfig.test.json",
 		];
 		let directory =
 			Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden/query-transform-response");
@@ -3745,7 +3783,7 @@ mod tests {
 	}
 
 	fn mutation_golden_project() -> GeneratedProject {
-		const PATHS: [&str; 11] = [
+		const PATHS: [&str; 13] = [
 			"README.md",
 			"package.json",
 			"src/app.controller.ts",
@@ -3755,8 +3793,10 @@ mod tests {
 			"src/main.ts",
 			"src/models/User.model.ts",
 			"src/repositories/UserRepositoryRepository.repository.ts",
+			"test/generated.spec.ts",
 			"tsconfig.build.json",
 			"tsconfig.json",
+			"tsconfig.test.json",
 		];
 		let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden/mutation");
 		let files = PATHS.into_iter().map(|path| {
@@ -3778,7 +3818,7 @@ mod tests {
     "types": [],
     "lib": ["ES2021", "DOM"]
   },
-  "include": ["src/**/*.ts", "typecheck-stubs.d.ts"]
+  "include": ["src/**/*.ts", "test/**/*.ts", "typecheck-stubs.d.ts"]
 }
 "#;
 
@@ -3815,6 +3855,17 @@ declare module '@nestjs/core' {
   export const NestFactory: {
     create(module: unknown): Promise<{ listen(port: number): Promise<void> }>;
   };
+}
+
+declare module 'node:assert/strict' {
+  const assert: {
+    equal(actual: unknown, expected: unknown): void;
+  };
+  export default assert;
+}
+
+declare module 'node:test' {
+  export function test(name: string, callback: () => void): void;
 }
 
 declare const process: {
@@ -4011,8 +4062,10 @@ void main().catch((error: unknown) => {
 				"src/app.module.ts",
 				"src/generated.ts",
 				"src/main.ts",
+				"test/generated.spec.ts",
 				"tsconfig.build.json",
 				"tsconfig.json",
+				"tsconfig.test.json",
 			]
 		);
 		assert!(first
@@ -4669,8 +4722,10 @@ void main().catch((error: unknown) => {
 					"src/app.module.ts",
 					"src/generated.ts",
 					"src/main.ts",
+					"test/generated.spec.ts",
 					"tsconfig.build.json",
 					"tsconfig.json",
+					"tsconfig.test.json",
 				],
 				"golden file tree changed: {label}"
 			);
