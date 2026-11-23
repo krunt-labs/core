@@ -439,11 +439,11 @@ impl LanguageBackend for TypeScriptBackend {
 				_ => None,
 			})
 			.collect();
-		let http_entries = all_operations
+		let entry_operations = all_operations
 			.iter()
 			.filter_map(|operation| {
 				if matches!(operation.kind(), TypeScriptOperationKind::ENTRY { .. })
-					&& is_http_entry(operation)
+					&& is_generated_entry(operation)
 				{
 					Some(operation.id)
 				} else {
@@ -452,7 +452,7 @@ impl LanguageBackend for TypeScriptBackend {
 			})
 			.collect::<Vec<_>>();
 
-		let functions = if http_entries.is_empty() {
+		let functions = if entry_operations.is_empty() {
 			let operations = all_operations
 				.iter()
 				.filter(|operation| !subgraph_node_ids.contains(&operation.id))
@@ -470,7 +470,7 @@ impl LanguageBackend for TypeScriptBackend {
 				requires_runtime,
 			)]
 		} else {
-			http_entries
+			entry_operations
 				.into_iter()
 				.map(|entry| {
 					let reachable = reachable_operations(graph, entry);
@@ -534,6 +534,14 @@ impl LanguageBackend for TypeScriptBackend {
 fn is_http_entry(operation: &TypeScriptOperation) -> bool {
 	operation.attributes().contains_key("backend.http.method")
 		&& operation.attributes().contains_key("backend.http.path")
+}
+
+fn is_cron_entry(operation: &TypeScriptOperation) -> bool {
+	operation.attributes().contains_key("backend.cron.schedule")
+}
+
+fn is_generated_entry(operation: &TypeScriptOperation) -> bool {
+	is_http_entry(operation) || is_cron_entry(operation)
 }
 
 fn reachable_operations(
@@ -862,6 +870,9 @@ fn render_linear_function_body(
 					source.push_str("  const ");
 					source.push_str(&operation_variable(operation.id));
 					source.push_str(" = request;\n");
+				} else if is_cron_entry(operation) {
+					// Cron entries activate the function; they do not produce a
+					// value or invoke a generated operation themselves.
 				} else {
 					render_named_operation(source, operation, name, data_inputs, output_arities);
 				}
@@ -1168,6 +1179,17 @@ fn http_request_parameter(function: &TypeScriptFunction) -> String {
 }
 
 fn http_response_type(function: &TypeScriptFunction) -> String {
+	if function
+		.operations
+		.iter()
+		.any(|operation| is_cron_entry(operation))
+		&& !function
+			.operations
+			.iter()
+			.any(|operation| matches!(operation.kind(), TypeScriptOperationKind::RETURN))
+	{
+		return "void".to_string();
+	}
 	function
 		.operations
 		.iter()
@@ -1189,7 +1211,7 @@ fn operation_declarations(function: &TypeScriptFunction) -> BTreeMap<String, Str
 			match operation.kind() {
 				TypeScriptOperationKind::ENTRY { name }
 				| TypeScriptOperationKind::OPERATION { name }
-					if !is_http_entry(operation) =>
+					if !is_http_entry(operation) && !is_cron_entry(operation) =>
 				{
 					Some((
 						operation.id.as_u32().to_string(),
@@ -2237,6 +2259,61 @@ mod tests {
 		assert!(source.contains("return operation_1;"));
 		assert!(source.contains("return operation_3;"));
 		assert!(!source.contains("declare function krunt_backend_http_route"));
+	}
+
+	#[test]
+	fn partitions_cron_entries_alongside_http_entries() {
+		let mut builder = IRBuilder::new();
+		let entries = [
+			(
+				1,
+				BTreeMap::from([
+					("backend.http.method".to_string(), "GET".to_string()),
+					("backend.http.path".to_string(), "/health".to_string()),
+				]),
+			),
+			(
+				2,
+				BTreeMap::from([(
+					"backend.cron.schedule".to_string(),
+					"*/5 * * * *".to_string(),
+				)]),
+			),
+		];
+		for (id, attributes) in entries {
+			builder
+				.add_node(IRNode {
+					id: krunt_ir::IrNodeId(id),
+					op: IROp::ENTRY {
+						name: OperationId::new("backend.entry").unwrap(),
+					},
+					input_types: Vec::new(),
+					output_types: Vec::new(),
+					async_kind: AsyncKind::SYNC,
+					effects: Vec::new(),
+					attributes,
+					returns: false,
+					source: SourceMap::node(GraphNodeId(id as u64)),
+				})
+				.unwrap();
+		}
+
+		let program = TypeScriptBackend::lower_graph(&builder.build().unwrap()).unwrap();
+		assert_eq!(
+			program.modules()[0]
+				.functions()
+				.iter()
+				.map(TypeScriptFunction::name)
+				.collect::<Vec<_>>(),
+			["execute_1", "execute_2"]
+		);
+		let source = TypeScriptSourceRenderer::render_program(&program)
+			.unwrap()
+			.remove("generated.ts")
+			.unwrap();
+		assert!(source.contains("export function execute_1(request: unknown = undefined): unknown"));
+		assert!(source.contains("export function execute_2(): void"));
+		assert!(!source.contains("krunt_backend_entry"));
 	}
 
 	#[test]

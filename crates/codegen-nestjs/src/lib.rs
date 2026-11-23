@@ -27,6 +27,7 @@ pub struct NestJsProgram {
 	entities: Vec<NestJsEntity>,
 	repositories: Vec<NestJsRepository>,
 	routes: Vec<NestJsRoute>,
+	crons: Vec<NestJsCron>,
 }
 
 /// Response semantics preserved by the NestJS framework lowering boundary.
@@ -62,6 +63,10 @@ impl NestJsProgram {
 
 	pub fn routes(&self) -> &[NestJsRoute] {
 		&self.routes
+	}
+
+	pub fn crons(&self) -> &[NestJsCron] {
+		&self.crons
 	}
 }
 
@@ -284,6 +289,38 @@ impl NestJsRoute {
 	}
 }
 
+/// One framework-level scheduled entry binding.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+pub struct NestJsCron {
+	operation_id: u32,
+	schedule: String,
+	source: String,
+	execution_name: String,
+	requires_runtime: bool,
+}
+
+impl NestJsCron {
+	pub fn operation_id(&self) -> u32 {
+		self.operation_id
+	}
+
+	pub fn schedule(&self) -> &str {
+		&self.schedule
+	}
+
+	pub fn source(&self) -> &str {
+		&self.source
+	}
+
+	pub fn execution_name(&self) -> &str {
+		&self.execution_name
+	}
+
+	pub fn requires_runtime(&self) -> bool {
+		self.requires_runtime
+	}
+}
+
 /// The first NestJS backend implementation for Krunt.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct NestJsBackend;
@@ -418,6 +455,7 @@ fn lower_nestjs_program(
 	let entities = lower_entities(program)?;
 	let repositories = lower_repositories(program);
 	let routes = lower_routes(program, &entities)?;
+	let crons = lower_crons(program);
 	Ok(NestJsProgram {
 		version: NestJsProgram::CURRENT_VERSION,
 		fallback_execution_name,
@@ -429,6 +467,7 @@ fn lower_nestjs_program(
 		entities,
 		repositories,
 		routes,
+		crons,
 	})
 }
 
@@ -780,6 +819,29 @@ fn lower_routes(
 	Ok(routes)
 }
 
+fn lower_crons(program: &TypeScriptProgram) -> Vec<NestJsCron> {
+	let mut crons = program
+		.modules()
+		.iter()
+		.flat_map(|module| module.functions())
+		.flat_map(|function| {
+			function.operations().iter().filter_map(|operation| {
+				let schedule = operation.attributes().get("backend.cron.schedule")?;
+				Some(NestJsCron {
+					operation_id: operation.id().as_u32(),
+					schedule: schedule.clone(),
+					source: source_marker(operation.source()),
+					execution_name: function.name().to_string(),
+					requires_runtime: function.requires_runtime(),
+				})
+			})
+		})
+		.collect::<Vec<_>>();
+	crons.sort();
+	crons.dedup();
+	crons
+}
+
 fn return_operation(function: &TypeScriptFunction) -> Option<&TypeScriptOperation> {
 	function
 		.operations()
@@ -807,7 +869,7 @@ fn static_project_files(program: &NestJsProgram) -> Vec<(String, String)> {
 		("src/app.controller.ts".to_string(), app_controller(program)),
 		("src/app.module.ts".to_string(), app_module(program)),
 		("src/main.ts".to_string(), main_module()),
-		("package.json".to_string(), package_json()),
+		("package.json".to_string(), package_json(program)),
 		("README.md".to_string(), project_readme(program)),
 		("tsconfig.json".to_string(), tsconfig()),
 		("tsconfig.build.json".to_string(), tsconfig_build()),
@@ -829,6 +891,9 @@ fn static_project_files(program: &NestJsProgram) -> Vec<(String, String)> {
 			),
 			repository_provider(repository),
 		));
+	}
+	if !program.crons().is_empty() {
+		files.push(("src/app.scheduler.ts".to_string(), app_scheduler(program)));
 	}
 	if needs_runtime_file(program) {
 		files.push(("src/krunt-runtime.ts".to_string(), krunt_runtime(program)));
@@ -857,6 +922,9 @@ fn needs_runtime_file(program: &NestJsProgram) -> bool {
 }
 
 fn app_controller(program: &NestJsProgram) -> String {
+	if program.routes().is_empty() && !program.crons().is_empty() {
+		return "export class AppController {}\n".to_string();
+	}
 	let has_error_routes = program
 		.routes()
 		.iter()
@@ -1498,7 +1566,16 @@ fn is_typescript_keyword(value: &str) -> bool {
 }
 
 fn app_module(program: &NestJsProgram) -> String {
-	let mut source = "import { Module } from '@nestjs/common';\nimport { AppController } from './app.controller';\n".to_string();
+	let has_controller =
+		program.routes().is_empty() && program.crons().is_empty() || !program.routes().is_empty();
+	let mut source = "import { Module } from '@nestjs/common';\n".to_string();
+	if has_controller {
+		source.push_str("import { AppController } from './app.controller';\n");
+	}
+	if !program.crons().is_empty() {
+		source.push_str("import { ScheduleModule } from '@nestjs/schedule';\n");
+		source.push_str("import { AppScheduler } from './app.scheduler';\n");
+	}
 	if program.requires_runtime() {
 		source.push_str("import { KruntRuntimeService } from './krunt-runtime';\n");
 	}
@@ -1509,18 +1586,68 @@ fn app_module(program: &NestJsProgram) -> String {
 		source.push_str(&repository_class_name(repository));
 		source.push_str(".repository';\n");
 	}
-	source.push_str("\n@Module({\n  controllers: [AppController],\n");
+	source.push_str("\n@Module({\n");
+	if has_controller {
+		source.push_str("  controllers: [AppController],\n");
+	}
+	if !program.crons().is_empty() {
+		source.push_str("  imports: [ScheduleModule.forRoot()],\n");
+	}
 	let mut providers = Vec::new();
 	if program.requires_runtime() {
 		providers.push("KruntRuntimeService".to_string());
 	}
 	providers.extend(program.repositories().iter().map(repository_class_name));
+	if !program.crons().is_empty() {
+		providers.push("AppScheduler".to_string());
+	}
 	if !providers.is_empty() {
 		source.push_str("  providers: [");
 		source.push_str(&providers.join(", "));
 		source.push_str("],\n");
 	}
 	source.push_str("})\nexport class AppModule {}\n");
+	source
+}
+
+fn app_scheduler(program: &NestJsProgram) -> String {
+	let mut execution_names = program
+		.crons()
+		.iter()
+		.map(|cron| cron.execution_name().to_string())
+		.collect::<Vec<_>>();
+	execution_names.sort();
+	execution_names.dedup();
+	let mut source = String::from(
+		"import { Injectable } from '@nestjs/common';\nimport { Cron } from '@nestjs/schedule';\n",
+	);
+	source.push_str("import { ");
+	source.push_str(&execution_names.join(", "));
+	source.push_str(" } from './generated';\n");
+	if program.crons().iter().any(NestJsCron::requires_runtime) {
+		source.push_str("import { KruntRuntimeService } from './krunt-runtime';\n");
+	}
+	source.push_str("\n@Injectable()\nexport class AppScheduler {\n");
+	if program.crons().iter().any(NestJsCron::requires_runtime) {
+		source.push_str("  constructor(private readonly runtime: KruntRuntimeService) {}\n\n");
+	}
+	for cron in program.crons() {
+		source.push_str("  // krunt:source=");
+		source.push_str(cron.source());
+		source.push('\n');
+		source.push_str("  @Cron('");
+		source.push_str(&escape_single_quoted(cron.schedule()));
+		source.push_str("')\n  async run_");
+		source.push_str(&cron.operation_id().to_string());
+		source.push_str("(): Promise<void> {\n    await ");
+		source.push_str(cron.execution_name());
+		source.push('(');
+		if cron.requires_runtime() {
+			source.push_str("this.runtime");
+		}
+		source.push_str(");\n  }\n");
+	}
+	source.push_str("}\n");
 	source
 }
 
@@ -1539,8 +1666,8 @@ void bootstrap();
 	.to_string()
 }
 
-fn package_json() -> String {
-	r#"{
+fn package_json(program: &NestJsProgram) -> String {
+	let mut source = r#"{
   "name": "krunt-generated-backend",
   "version": "0.1.0",
   "private": true,
@@ -1562,7 +1689,14 @@ fn package_json() -> String {
   }
 }
 "#
-	.to_string()
+	.to_string();
+	if !program.crons().is_empty() {
+		source = source.replace(
+			"    \"@nestjs/core\": \"11.0.11\",\n",
+			"    \"@nestjs/core\": \"11.0.11\",\n    \"@nestjs/schedule\": \"5.0.1\",\n",
+		);
+	}
+	source
 }
 
 fn project_readme(program: &NestJsProgram) -> String {
@@ -1570,6 +1704,11 @@ fn project_readme(program: &NestJsProgram) -> String {
 		"\n`src/krunt-runtime.ts` is the generated runtime adapter. Repository providers use a deterministic in-memory store so the generated project can run immediately; replace that provider implementation with the application's database integration before production deployment.\n"
 	} else {
 		""
+	};
+	let cron_note = if program.crons().is_empty() {
+		""
+	} else {
+		"\n`src/app.scheduler.ts` contains the generated NestJS scheduled entry points. Each `@Cron` decorator preserves the schedule and source-node marker from the graph.\n"
 	};
 	let mut readme = r#"# Generated Krunt NestJS backend
 
@@ -1592,6 +1731,7 @@ comments. Route handlers preserve the declared success or error HTTP status.
 "#
 	.to_string();
 	readme.push_str(runtime_note);
+	readme.push_str(cron_note);
 	readme
 }
 
@@ -2292,6 +2432,29 @@ mod tests {
 				})
 				.unwrap();
 		}
+		TypeScriptBackend::lower_graph(&builder.build().unwrap()).unwrap()
+	}
+
+	fn cron_program() -> TypeScriptProgram {
+		let mut builder = IRBuilder::new();
+		builder
+			.add_node(IRNode {
+				id: krunt_ir::IrNodeId(1),
+				op: IROp::ENTRY {
+					name: OperationId::new("backend.cron").unwrap(),
+				},
+				input_types: Vec::new(),
+				output_types: Vec::new(),
+				async_kind: AsyncKind::SYNC,
+				effects: Vec::new(),
+				attributes: BTreeMap::from([(
+					"backend.cron.schedule".to_string(),
+					"*/5 * * * *".to_string(),
+				)]),
+				returns: false,
+				source: SourceMap::node(GraphNodeId(70)),
+			})
+			.unwrap();
 		TypeScriptBackend::lower_graph(&builder.build().unwrap()).unwrap()
 	}
 
@@ -3631,6 +3794,7 @@ mod tests {
   export function Post(path?: string): MethodDecorator;
   export function Put(path?: string): MethodDecorator;
   export function Req(): ParameterDecorator;
+  export function Injectable(): ClassDecorator;
   export function Module(metadata: unknown): ClassDecorator;
   export class BadRequestException extends Error {
     constructor(response: unknown);
@@ -3638,6 +3802,13 @@ mod tests {
   export class HttpException extends Error {
     constructor(response: unknown, status: number);
   }
+}
+
+declare module '@nestjs/schedule' {
+  export function Cron(expression: string): MethodDecorator;
+  export const ScheduleModule: {
+    forRoot(): unknown;
+  };
 }
 
 declare module '@nestjs/core' {
@@ -3861,6 +4032,40 @@ void main().catch((error: unknown) => {
 			.unwrap()
 			.contains("krunt:source=node:10"));
 		assert!(first.file("package.json").unwrap().contains("@nestjs/core"));
+	}
+
+	#[test]
+	fn generates_a_nestjs_scheduler_for_cron_entries() {
+		let first = NestJsBackend::generate_project(&cron_program()).unwrap();
+		let second = NestJsBackend::generate_project(&cron_program()).unwrap();
+
+		assert_eq!(first, second);
+		let framework_program = NestJsBackend::lower_program(&cron_program()).unwrap();
+		assert_eq!(framework_program.crons().len(), 1);
+		assert_eq!(framework_program.crons()[0].schedule(), "*/5 * * * *");
+		assert_eq!(framework_program.crons()[0].source(), "node:70");
+		assert!(first.file("src/app.scheduler.ts").is_some());
+		assert!(first
+			.file("src/app.scheduler.ts")
+			.unwrap()
+			.contains("@Cron('*/5 * * * *')"));
+		assert!(first
+			.file("src/app.scheduler.ts")
+			.unwrap()
+			.contains("// krunt:source=node:70"));
+		assert!(first
+			.file("src/app.module.ts")
+			.unwrap()
+			.contains("ScheduleModule.forRoot()"));
+		assert!(first
+			.file("package.json")
+			.unwrap()
+			.contains("@nestjs/schedule"));
+		assert!(first
+			.file("README.md")
+			.unwrap()
+			.contains("generated NestJS scheduled entry points"));
+		assert_generated_project_typechecks(&first, "cron");
 	}
 
 	#[test]
