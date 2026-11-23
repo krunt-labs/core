@@ -109,6 +109,14 @@ pub struct NodeDescriptor {
 	inputs: Vec<PortDescriptor>,
 	outputs: Vec<PortDescriptor>,
 	properties: Vec<PropertyDescriptor>,
+	#[serde(skip_serializing_if = "Vec::is_empty")]
+	capabilities: Vec<String>,
+	#[serde(skip_serializing_if = "Vec::is_empty")]
+	effects: Vec<String>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	documentation: Option<String>,
+	#[serde(skip_serializing_if = "std::ops::Not::not")]
+	deprecated: bool,
 }
 
 impl NodeDescriptor {
@@ -127,7 +135,37 @@ impl NodeDescriptor {
 			inputs: inputs.into_iter().collect(),
 			outputs: outputs.into_iter().collect(),
 			properties: properties.into_iter().collect(),
+			capabilities: Vec::new(),
+			effects: Vec::new(),
+			documentation: None,
+			deprecated: false,
 		}
+	}
+
+	/// Attach deterministic capability labels for editor and AI clients.
+	pub fn with_capabilities(mut self, capabilities: impl IntoIterator<Item = String>) -> Self {
+		self.capabilities = capabilities.into_iter().collect();
+		self.capabilities.sort();
+		self.capabilities.dedup();
+		self
+	}
+
+	/// Attach deterministic side-effect labels for editor and AI clients.
+	pub fn with_effects(mut self, effects: impl IntoIterator<Item = String>) -> Self {
+		self.effects = effects.into_iter().collect();
+		self.effects.sort();
+		self.effects.dedup();
+		self
+	}
+
+	pub fn with_documentation(mut self, documentation: impl Into<String>) -> Self {
+		self.documentation = Some(documentation.into());
+		self
+	}
+
+	pub fn mark_deprecated(mut self, deprecated: bool) -> Self {
+		self.deprecated = deprecated;
+		self
 	}
 }
 

@@ -512,5 +512,10 @@ mod tests {
 		assert!(node_types
 			.iter()
 			.any(|node| node["type_id"] == "backend.http_route"));
+		let http_request = node_types
+			.iter()
+			.find(|node| node["type_id"] == "backend.http_request")
+			.expect("HTTP Request descriptor should be present");
+		assert_eq!(http_request["effects"], json!(["http.request"]));
 	}
 }

@@ -17,7 +17,7 @@ use krunt_plugin_api::{
 	LoweredOperation, LoweredOperationKind, NodeContract, NodeDescriptor as CatalogNodeDescriptor,
 	PluginApiError, PluginCatalogEntry, PluginManifest, PluginRegistry, PortContract,
 	PortDescriptor as CatalogPortDescriptor, PropertyDescriptor as CatalogPropertyDescriptor,
-	PropertyKind as CatalogPropertyKind,
+	PropertyKind as CatalogPropertyKind, SemanticPlugin,
 };
 use krunt_type_system::Type;
 use serde::Serialize;
@@ -843,6 +843,21 @@ impl BackendDslPlugin {
 
 	fn catalog_entry(&self) -> PluginCatalogEntry {
 		let node_types = self.descriptors.iter().map(|descriptor| {
+			let catalog_node = Node::new(
+				NodeId::new(1).expect("static catalog node ID is valid"),
+				descriptor.type_id.clone(),
+			);
+			let catalog_node = descriptor
+				.properties
+				.iter()
+				.try_fold(catalog_node, |node, property| {
+					match property.default.clone() {
+						Some(default) => node.with_property(property.key.clone(), default),
+						None => Ok(node),
+					}
+				})
+				.expect("catalog property defaults should be valid");
+			let contract = self.contract(&catalog_node);
 			let property_descriptors = descriptor.properties.iter().map(|property| {
 				let kind = match &property.kind {
 					BackendPropertyKind::STRING => CatalogPropertyKind::STRING,
@@ -874,6 +889,18 @@ impl BackendDslPlugin {
 				port_descriptors(&descriptor.inputs),
 				port_descriptors(&descriptor.outputs),
 				property_descriptors,
+			)
+			.with_capabilities(
+				contract
+					.capabilities()
+					.iter()
+					.map(|capability| capability.as_str().to_string()),
+			)
+			.with_effects(
+				contract
+					.effects()
+					.iter()
+					.map(|effect| effect.as_str().to_string()),
 			)
 		});
 		PluginCatalogEntry::new(self.manifest.identity(), node_types)

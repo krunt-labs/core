@@ -149,6 +149,10 @@ impl EffectId {
 		}
 		Ok(Self(value))
 	}
+
+	pub fn as_str(&self) -> &str {
+		&self.0
+	}
 }
 
 /// Domain-neutral operation kinds for the initial canonical IR.
